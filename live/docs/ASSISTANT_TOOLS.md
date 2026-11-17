@@ -7,7 +7,7 @@
 
 | 层 | 模型可见工具 | 真正执行方 |
 |---|---|---|
-| GPT-Live `/v1/live/sessions` | 仅 **`delegate(task)`**（`delegation.type=client` 时） | 浏览器 `demoBackend` / 手动 / **本工具包** |
+| GPT-Live `/v1/live/sessions` | 仅 **`delegate(task)`**（`delegation.type=client` 时） | **推荐** `SOPHON_LIVE_ORCH=1`（本机 LLM 选型+工具）；或浏览器 demoBackend / 手动 / 遗留 `BUILTIN` 启发式 |
 | OpenAI Realtime `/v1/realtime` | 客户端传入的 `tools[]`，或 BackOffice 模式下的 **`delegate`** | 客户端 function_call 或 `SOPHON_LIVE_BACKEND` |
 | 引擎 Tag/Flash/E2E | **无内置领域工具**；`extra_body.tools` 透传 | `tool_mode=mock` 本地假结果，或 `client` + HTTP bridge |
 
@@ -26,17 +26,22 @@
 | `device_control` | 模拟设备（可选 `SOPHON_LIVE_DEVICE_HOOK`） |
 | `memory_note` | 本地 JSON 记忆 |
 
-前端仍只调用 `delegate`；网关在 `SOPHON_LIVE_BUILTIN_TOOLS=1` 时用启发式把 `task` 路由到上表，并自动 `commentary` 回灌。
+前端仍只调用 `delegate`。
 
-## 3. 启用
+- **推荐：** `SOPHON_LIVE_ORCH=1` → `orchestrator.py` 调本地 vLLM，用上表 schemas 选型，再 `run_tool` 执行并 `commentary` 回灌（`backend=orch`）。  
+- **遗留演示：** `SOPHON_LIVE_BUILTIN_TOOLS=1` → 启发式 `run_task`（**不是**正式架构）。
+
+## 3. 启用（路径 1 共置编排）
 
 ```bash
-export SOPHON_LIVE_BUILTIN_TOOLS=1
-# 可选：SOPHON_LIVE_MEMORY_PATH=/path/mem.json
+# 先起本地编排 LLM，例如 :8101 served-model-name=qwen3.8-27b-bo
+export SOPHON_LIVE_ORCH=1
+export SOPHON_LIVE_ORCH_URL=http://127.0.0.1:8101/v1/chat/completions
+export SOPHON_LIVE_ORCH_MODEL=qwen3.8-27b-bo
 BUILD=tag PORT=8000 LIVE_PORT=8780 bash start_live.sh
 ```
 
-测试页收到 `delegation.backend === "builtin"` 时不再跑浏览器 demoBackend，避免双回。
+测试页收到 `delegation.backend === "orch"`（或 `"builtin"`）时不再跑浏览器 demoBackend。总方案见 deplux `docs/sophon-path1-colocated-backend.md`。
 
 ## 4. 架构选择（通用助手）
 

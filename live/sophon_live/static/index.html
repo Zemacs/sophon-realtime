@@ -197,8 +197,9 @@ async function onDelegation(d) {
   card.innerHTML = `<div>🔀 委派 <b></b></div><div class="t">delegation_id ${d.id}</div><div class="r">后端处理中…</div>`;
   card.querySelector("b").textContent = d.task || "（未带任务文本）"; $("#chat").appendChild(card); $("#chat").scrollTop = 1e9;
   const setR = t => card.querySelector(".r").textContent = t;
-  // Server-side assistant_tools pack (SOPHON_LIVE_BUILTIN_TOOLS=1) marks backend=builtin and injects commentary itself.
-  if (d.backend === "builtin") { setR("内置工具处理中…"); return; }
+  // GPU-side backends inject commentary themselves; the page only displays the card.
+  if (d.backend === "orch") { setR("GPU 编排（文本 LLM + 工具）处理中…"); return; }
+  if (d.backend === "builtin") { setR("内置启发式工具处理中…"); return; }
   if ($("#be").value === "manual") { pendingDeleg = {id: d.id, setR}; $("#manual").style.display = ""; $("#mtask").textContent = d.task || d.id; $("#mtext").focus(); setR("等你手动回答…"); return; }
   let r = null;
   try { r = await demoBackend(d.task || (curUser && curUser.textContent) || ""); } catch (e) { r = null; }

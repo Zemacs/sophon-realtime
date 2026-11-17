@@ -521,17 +521,40 @@ class LiveSession:
         self.deleg[did] = {"call_id": e["call_id"], "chunks": [], "timer": None, "task": what, "t0": time.monotonic()}
         if DELEG_MODE == "model":
             self.deleg[did]["idle_timer"] = asyncio.get_running_loop().call_later(IDLE_UPDATE_S, lambda: asyncio.ensure_future(self._idle_update(did)))
-        use_builtin = os.environ.get("SOPHON_LIVE_BUILTIN_TOOLS", "").strip().lower() in ("1", "true", "yes", "on")
+        use_orch = os.environ.get("SOPHON_LIVE_ORCH", "").strip().lower() in ("1", "true", "yes", "on")
+        use_builtin = (not use_orch) and os.environ.get("SOPHON_LIVE_BUILTIN_TOOLS", "").strip().lower() in ("1", "true", "yes", "on")
         deleg_body = {"id": did, "type": "delegation", "target": "client", "task": what}
-        if use_builtin:
+        if use_orch:
+            deleg_body["backend"] = "orch"
+        elif use_builtin:
             deleg_body["backend"] = "builtin"
         await self.send({"type": "session.delegation.created", "offset_ms": self.timeline_ms, "delegation": deleg_body})
-        log.info("session %s delegation %s task=%r builtin=%s", self.id, did, what, use_builtin)
-        if use_builtin:
+        log.info("session %s delegation %s task=%r orch=%s builtin=%s", self.id, did, what, use_orch, use_builtin)
+        if use_orch:
+            asyncio.create_task(self._orch_resolve(did, what))
+        elif use_builtin:
             asyncio.create_task(self._builtin_resolve(did, what))
 
+    async def _orch_resolve(self, did: str, what: str | None) -> None:
+        """Path-1 co-located orchestrator: local text LLM selects tools; tools run on this host."""
+        try:
+            from .assistant_tools import resolve_task_orch
+            text = await resolve_task_orch(what or "", instructions=self.instructions or "")
+        except Exception as e:  # noqa: BLE001
+            log.warning("session %s orch error: %s", self.id, e)
+            text = "后台编排出错了，请稍后再试。"
+        d = self.deleg.get(did)
+        if d is None:
+            return
+        await self.send({"type": "session.commentary.appended", "start_ms": self.timeline_ms, "end_ms": self.timeline_ms,
+                         "client_event_id": "orch"})
+        d["chunks"].append(("commentary", text))
+        if d.get("timer"):
+            d["timer"].cancel()
+        await self._flush_deleg(did)
+
     async def _builtin_resolve(self, did: str, what: str | None) -> None:
-        """Optional in-process tool pack (assistant_tools) for general voice-assistant demos."""
+        """Legacy heuristic tool pack (demo). Prefer SOPHON_LIVE_ORCH for production Path-1."""
         try:
             from .assistant_tools import run_task
             text = await run_task(what or "")

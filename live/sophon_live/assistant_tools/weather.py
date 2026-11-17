@@ -60,14 +60,26 @@ def _desc(day: dict[str, Any], *, zh: bool) -> str:
     return "多云" if zh else "cloudy"
 
 
-def _http_get_json(url: str) -> dict[str, Any]:
-    req = urllib.request.Request(url, headers={"User-Agent": _UA, "Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=12) as resp:
+def _http_get_json(url: str, *, timeout: float = 20.0) -> dict[str, Any]:
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": _UA, "Accept": "application/json", "Accept-Language": "zh-CN,en;q=0.8"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode())
 
 
 async def _fetch_json(url: str) -> dict[str, Any]:
-    return await asyncio.to_thread(_http_get_json, url)
+    last: Exception | None = None
+    for attempt, timeout in enumerate((12.0, 20.0, 25.0), start=1):
+        try:
+            return await asyncio.to_thread(_http_get_json, url, timeout=timeout)
+        except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as e:
+            last = e
+            if attempt < 3:
+                await asyncio.sleep(0.4 * attempt)
+    assert last is not None
+    raise last
 
 
 async def run(args: dict[str, Any] | None = None) -> str:

@@ -14,6 +14,11 @@ from .runner import run_tool, run_task
 __all__ = ["TOOL_SCHEMAS", "list_tool_names", "run_tool", "run_task", "resolve_task_orch"]
 
 
-async def resolve_task_orch(task: str, *, instructions: str = "") -> str:
+async def resolve_task_orch(
+    task: str,
+    *,
+    instructions: str = "",
+    history: list | None = None,
+) -> str:
     from .orchestrator import resolve_task
-    return await resolve_task(task, instructions=instructions)
+    return await resolve_task(task, instructions=instructions, history=history)

@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from typing import Any
 
 import aiohttp
@@ -25,10 +26,20 @@ _DEFAULT_TIMEOUT = 120.0
 
 SYS = (
     "You are the back-office agent behind a voice assistant on a live call. "
-    "The voice front already heard the caller; you only see the task text it relayed. "
-    "Use tools when you need facts or actions. When done, reply with ONLY the short spoken "
-    "answer for the caller (one or two natural sentences). No markdown, no tool names, "
-    "no 'SAY:' prefix."
+    "The voice front already heard the caller; you only see the task text it relayed "
+    "(plus optional recent turn history). "
+    "Use tools when you need facts or device/memory actions. "
+    "Rules:\n"
+    "- Weather: call get_weather with an explicit city. If the task has no city, ask which city "
+    "in one short sentence; do NOT call memory_note for preferred_city unless the history shows "
+    "the user already saved one.\n"
+    "- Time/date: call get_datetime.\n"
+    "- Device: call device_control.\n"
+    "- Chat / jokes / chit-chat with no tool need: answer directly. If history shows a previous "
+    "joke the caller disliked, tell a different one.\n"
+    "- If a tool returns an error JSON or '暂时/不可用', apologize briefly and stop retrying the same tool.\n"
+    "When done, reply with ONLY the short spoken answer for the caller (one or two natural sentences). "
+    "No markdown, no tool names, no 'SAY:' prefix."
 )
 
 
@@ -67,6 +78,8 @@ def _say(text: str) -> str:
     i = t.upper().rfind("SAY:")
     if i >= 0:
         t = t[i + 4:].strip()
+    # strip common reasoning wrappers if a model leaks them
+    t = re.sub(r"^<think>[\s\S]*?</think>", "", t, flags=re.I).strip()
     return t.strip().strip('"') or "好的，我查过了。"
 
 
@@ -82,21 +95,51 @@ def _parse_args(raw: Any) -> dict:
     return args if isinstance(args, dict) else {}
 
 
-async def resolve_task(task: str, *, instructions: str = "") -> str:
+def _history_block(history: list[dict[str, str]] | None) -> str:
+    if not history:
+        return ""
+    lines = []
+    for h in history[-6:]:
+        task = (h.get("task") or "").strip()
+        ans = (h.get("answer") or "").strip()
+        if task or ans:
+            lines.append(f"- task: {task}\n  answer: {ans}")
+    if not lines:
+        return ""
+    return "Recent turns in this call:\n" + "\n".join(lines)
+
+
+async def resolve_task(
+    task: str,
+    *,
+    instructions: str = "",
+    history: list[dict[str, str]] | None = None,
+) -> str:
     """Run LLM tool loop for one Path-1 delegation task; return commentary text for the front."""
     task = (task or "").strip()
     if not task:
         return "我这边没有收到具体任务，请再说一次。"
     url, model, key, max_steps, timeout = _cfg()
+    hist = _history_block(history)
+    user = f"Front relayed this task from the caller:\n{task}"
+    if hist:
+        user = hist + "\n\n" + user
     msgs: list[dict[str, Any]] = [
         {"role": "system", "content": SYS + (("\n\nExtra policy:\n" + instructions) if instructions else "")},
-        {"role": "user", "content": f"Front relayed this task from the caller:\n{task}"},
+        {"role": "user", "content": user},
     ]
     tools = _openai_tools()
     headers = {"Authorization": "Bearer " + key, "Content-Type": "application/json"}
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as cs:
         for step in range(max_steps):
-            body = {"model": model, "messages": msgs, "temperature": 0.2, "tools": tools}
+            body: dict[str, Any] = {
+                "model": model,
+                "messages": msgs,
+                "temperature": 0.2,
+                "tools": tools,
+            }
+            # Prefer non-thinking for low-latency spoken answers when the server supports it.
+            body["chat_template_kwargs"] = {"enable_thinking": False}
             try:
                 async with cs.post(url, json=body, headers=headers) as r:
                     status = r.status
@@ -107,8 +150,18 @@ async def resolve_task(task: str, *, instructions: str = "") -> str:
                         log.warning("orch LLM bad JSON HTTP %s: %r body=%s", status, e, raw[:300])
                         return "后台模型暂时不可用，请稍后再试。"
                 if status >= 400:
-                    log.warning("orch LLM HTTP %s: %s", status, str(j)[:300])
-                    return "后台模型暂时不可用，请稍后再试。"
+                    # retry once without chat_template_kwargs if rejected
+                    if status == 400 and "chat_template_kwargs" in body:
+                        body.pop("chat_template_kwargs", None)
+                        async with cs.post(url, json=body, headers=headers) as r2:
+                            status = r2.status
+                            j = await r2.json(content_type=None)
+                        if status >= 400:
+                            log.warning("orch LLM HTTP %s: %s", status, str(j)[:300])
+                            return "后台模型暂时不可用，请稍后再试。"
+                    else:
+                        log.warning("orch LLM HTTP %s: %s", status, str(j)[:300])
+                        return "后台模型暂时不可用，请稍后再试。"
                 choices = j.get("choices") if isinstance(j, dict) else None
                 if not choices:
                     log.warning("orch LLM empty choices: %s", str(j)[:300])
@@ -134,4 +187,12 @@ async def resolve_task(task: str, *, instructions: str = "") -> str:
                     out[:160],
                 )
                 msgs.append({"role": "tool", "tool_call_id": tc.get("id") or name, "content": out})
+                # stop hammering a failing network tool in the same turn
+                if name in ("get_weather", "web_search", "get_news") and (
+                    '"ok": false' in out or "暂时" in out or "unavailable" in out.lower() or "不可用" in out
+                ):
+                    msgs.append({
+                        "role": "user",
+                        "content": "The tool failed. Tell the caller briefly without calling the same tool again.",
+                    })
     return "我还在查，请稍等一下再问一次。"

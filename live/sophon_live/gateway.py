@@ -519,10 +519,11 @@ class LiveSession:
         did = "item_" + uuid.uuid4().hex[:16]
         what = (e.get("arguments") or {}).get("task")
         self.deleg[did] = {"call_id": e["call_id"], "chunks": [], "timer": None, "task": what, "t0": time.monotonic()}
-        if DELEG_MODE == "model":
-            self.deleg[did]["idle_timer"] = asyncio.get_running_loop().call_later(IDLE_UPDATE_S, lambda: asyncio.ensure_future(self._idle_update(did)))
         use_orch = os.environ.get("SOPHON_LIVE_ORCH", "").strip().lower() in ("1", "true", "yes", "on")
         use_builtin = (not use_orch) and os.environ.get("SOPHON_LIVE_BUILTIN_TOOLS", "").strip().lower() in ("1", "true", "yes", "on")
+        # Orch returns one final spoken result; skip the 7s empty idle nudge (it races long tools).
+        if DELEG_MODE == "model" and not use_orch:
+            self.deleg[did]["idle_timer"] = asyncio.get_running_loop().call_later(IDLE_UPDATE_S, lambda: asyncio.ensure_future(self._idle_update(did)))
         deleg_body = {"id": did, "type": "delegation", "target": "client", "task": what}
         if use_orch:
             deleg_body["backend"] = "orch"
@@ -539,10 +540,17 @@ class LiveSession:
         """Path-1 co-located orchestrator: local text LLM selects tools; tools run on this host."""
         try:
             from .assistant_tools import resolve_task_orch
-            text = await resolve_task_orch(what or "", instructions=self.instructions or "")
+            hist = getattr(self, "orch_history", None) or []
+            text = await resolve_task_orch(what or "", instructions=self.instructions or "", history=hist)
         except Exception as e:  # noqa: BLE001
             log.warning("session %s orch error: %s", self.id, e)
             text = "后台编排出错了，请稍后再试。"
+        text = (text or "").strip() or "好的，我这边查过了。"
+        if not hasattr(self, "orch_history"):
+            self.orch_history = []
+        self.orch_history.append({"task": what or "", "answer": text})
+        if len(self.orch_history) > 12:
+            self.orch_history = self.orch_history[-12:]
         d = self.deleg.get(did)
         if d is None:
             return

@@ -1,4 +1,4 @@
-"""Recent headlines via public Google News RSS (no API key)."""
+"""Recent headlines via public RSS (Google News with people.cn fallback for CN GPU boxes)."""
 from __future__ import annotations
 
 import asyncio
@@ -10,6 +10,11 @@ import xml.etree.ElementTree as ET
 from typing import Any
 
 _RSS_BASE = "https://news.google.com/rss/search"
+_FALLBACK_ZH = (
+    "http://www.people.com.cn/rss/politics.xml",
+    "http://www.people.com.cn/rss/world.xml",
+    "http://www.people.com.cn/rss/finance.xml",
+)
 _UA = "sophon-live-assistant/1.0"
 
 
@@ -44,19 +49,27 @@ def _titles_from_rss(xml_bytes: bytes) -> list[str]:
             continue
         title = (title_el.text or "").strip()
         if " - " in title:
-            title = title.split(" - ", 1)[-1].strip()
+            title = title.rsplit(" - ", 1)[0].strip() or title
         titles.append(title)
     return titles
 
 
 def _urlopen(url: str) -> bytes:
     req = urllib.request.Request(url, headers={"User-Agent": _UA})
-    with urllib.request.urlopen(req, timeout=20) as resp:
+    with urllib.request.urlopen(req, timeout=12) as resp:
         return resp.read()
 
 
 async def _fetch_rss(url: str) -> bytes:
     return await asyncio.to_thread(_urlopen, url)
+
+
+def _filter_topic(titles: list[str], topic: str) -> list[str]:
+    keys = [k for k in re.split(r"[\s,，、]+", topic) if len(k) >= 2]
+    if not keys:
+        return titles
+    hit = [t for t in titles if any(k.lower() in t.lower() for k in keys)]
+    return hit or titles
 
 
 async def run(args: dict[str, Any] | None = None) -> str:
@@ -74,19 +87,27 @@ async def run(args: dict[str, Any] | None = None) -> str:
     if max_items >= 2:
         speak_n = max(2, speak_n)
 
-    url = _rss_url(topic, lang)
+    titles: list[str] = []
     try:
-        raw = await _fetch_rss(url)
+        raw = await _fetch_rss(_rss_url(topic, lang))
         titles = _titles_from_rss(raw)
     except (OSError, urllib.error.URLError, ET.ParseError, UnicodeDecodeError):
-        if lang == "zh":
-            return "新闻源暂时连不上，稍后再帮你看看头条吧。"
-        return "News feeds are unreachable right now. Try again in a moment."
+        titles = []
+
+    if not titles and lang == "zh":
+        for fb in _FALLBACK_ZH:
+            try:
+                raw = await _fetch_rss(fb)
+                titles = _filter_topic(_titles_from_rss(raw), topic)
+                if titles:
+                    break
+            except (OSError, urllib.error.URLError, ET.ParseError, UnicodeDecodeError):
+                continue
 
     if not titles:
         if lang == "zh":
-            return f"暂时没有查到关于「{topic}」的最新头条。"
-        return f"No recent headlines found for '{topic}'."
+            return "新闻源暂时连不上，稍后再帮你看看头条吧。"
+        return "News feeds are unreachable right now. Try again in a moment."
 
     picked = titles[:speak_n]
     if lang == "zh":

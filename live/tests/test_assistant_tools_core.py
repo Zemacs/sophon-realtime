@@ -58,23 +58,25 @@ class DatetimeToolTests(unittest.IsolatedAsyncioTestCase):
 
 class WeatherToolTests(unittest.IsolatedAsyncioTestCase):
     async def test_weather_today_zh_mocked(self) -> None:
-        geo = {"results": [{"latitude": 39.9, "longitude": 116.4, "name": "Beijing"}]}
-        fc = {
-            "current": {"temperature_2m": 18.2},
-            "daily": {
-                "weather_code": [0, 3],
-                "temperature_2m_min": [5, 6],
-                "temperature_2m_max": [12, 14],
-                "precipitation_probability_max": [10, 30],
-            },
+        payload = {
+            "current_condition": [{"temp_C": "18"}],
+            "weather": [
+                {
+                    "mintempC": "5",
+                    "maxtempC": "12",
+                    "hourly": [
+                        {"chanceofrain": "10", "lang_zh": [{"value": "晴"}], "weatherDesc": [{"value": "Sunny"}]},
+                        {"chanceofrain": "10", "lang_zh": [{"value": "晴"}], "weatherDesc": [{"value": "Sunny"}]},
+                        {"chanceofrain": "10", "lang_zh": [{"value": "晴"}], "weatherDesc": [{"value": "Sunny"}]},
+                        {"chanceofrain": "10", "lang_zh": [{"value": "晴"}], "weatherDesc": [{"value": "Sunny"}]},
+                        {"chanceofrain": "10", "lang_zh": [{"value": "晴"}], "weatherDesc": [{"value": "Sunny"}]},
+                    ],
+                },
+                {"mintempC": "6", "maxtempC": "14", "hourly": [{"chanceofrain": "30", "lang_zh": [{"value": "多云"}]}]},
+            ],
         }
 
-        async def fake_fetch(url: str) -> dict:
-            if "geocoding" in url:
-                return geo
-            return fc
-
-        with mock.patch.object(weather, "_fetch_json", side_effect=fake_fetch):
+        with mock.patch.object(weather, "_fetch_json", return_value=payload):
             out = await weather.run({"city": "北京", "when": "today"})
 
         self.assertIn("北京", out)
@@ -82,8 +84,8 @@ class WeatherToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("晴", out)
         self.assertIn("现在18度", out)
 
-    async def test_weather_no_geocode(self) -> None:
-        with mock.patch.object(weather, "_fetch_json", return_value={"results": []}):
+    async def test_weather_empty_days(self) -> None:
+        with mock.patch.object(weather, "_fetch_json", return_value={"weather": []}):
             out = await weather.run({"city": "Nowhereville", "when": "today", "lang": "en"})
         self.assertIn("No weather data", out)
 

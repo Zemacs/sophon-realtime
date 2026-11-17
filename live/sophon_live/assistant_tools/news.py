@@ -88,13 +88,8 @@ async def run(args: dict[str, Any] | None = None) -> str:
         speak_n = max(2, speak_n)
 
     titles: list[str] = []
-    try:
-        raw = await _fetch_rss(_rss_url(topic, lang))
-        titles = _titles_from_rss(raw)
-    except (OSError, urllib.error.URLError, ET.ParseError, UnicodeDecodeError):
-        titles = []
-
-    if not titles and lang == "zh":
+    # On CN GPU boxes Google News often times out; prefer reachable CN feeds first for zh.
+    if lang == "zh":
         for fb in _FALLBACK_ZH:
             try:
                 raw = await _fetch_rss(fb)
@@ -103,6 +98,12 @@ async def run(args: dict[str, Any] | None = None) -> str:
                     break
             except (OSError, urllib.error.URLError, ET.ParseError, UnicodeDecodeError):
                 continue
+    if not titles:
+        try:
+            raw = await _fetch_rss(_rss_url(topic, lang))
+            titles = _titles_from_rss(raw)
+        except (OSError, urllib.error.URLError, ET.ParseError, UnicodeDecodeError):
+            titles = []
 
     if not titles:
         if lang == "zh":

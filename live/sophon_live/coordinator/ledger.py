@@ -54,7 +54,7 @@ class Ledger:
                 n += 1
         return n
 
-    def create(self, objective: str, *, constraints: list | None = None) -> TaskRecord:
+    def create(self, objective: str, *, constraints: list | None = None, require_tools: list | None = None, tool_judgment: str = "model") -> TaskRecord:
         tid = _new_id()
         rec = TaskRecord(
             task_id=tid,
@@ -62,6 +62,8 @@ class Ledger:
             objective=objective,
             status=TaskStatus.QUEUED,
             constraints=list(constraints or []),
+            require_tools=list(require_tools or []),
+            tool_judgment=tool_judgment,
         )
         self.tasks[tid] = rec
         self.order.append(tid)
@@ -87,6 +89,8 @@ class Ledger:
             objective=objective,
             status=TaskStatus.QUEUED,
             constraints=list(rec.constraints),
+            require_tools=list(rec.require_tools),
+            tool_judgment=rec.tool_judgment,
         )
         self.tasks[task_id] = new  # same id, current version in place
         return new

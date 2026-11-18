@@ -45,9 +45,12 @@ class SpeakPlan:
 # The only sentences a *failed* WorkerResult may carry to the user's ears (besides a failed required tool's own sentence,
 # which the Worker records as evidence ``failure_text``). Model free text is never spoken for a failed job (Critic I-5).
 NO_TOOL_ANSWER = "这个我这边没查到准确结果，你再问我一次吧。"
+# v0.1.0-rc2 number-containment: a spoken number that no tool result of the job contains is replaced by this one fixed sentence.
+NUMBERS_UNVERIFIED = "这个数字我没能核实，先不报给你，你再问我一次吧。"
 FAILED_GENERIC = "这个我这边没办成，你再问我一次吧。"
 FIXED_FAILURES = frozenset({
     NO_TOOL_ANSWER,
+    NUMBERS_UNVERIFIED,
     FAILED_GENERIC,
     "后台模型暂时不可用，请稍后再试。",
     "后台模型连接失败，请稍后再试。",
@@ -109,6 +112,9 @@ class WorkerJob:
     # Tool-backed request (weather / time / news / device / search / memory): the answer MUST come from a tool result.
     # Set by the Coordinator (coordinator.intent); the Worker forces the first call, finish_job rejects a tool-less answer.
     require_tools: list[str] = field(default_factory=list)
+    # Who decided ``require_tools``: "model" (the router answered; [] = it said no tool) or "unknown" (the router was unavailable or
+    # gave a non-option answer). With "unknown" nothing is forced, but the number-containment check covers every answer of the job.
+    tool_judgment: str = "model"
 
 
 @dataclass
@@ -152,4 +158,6 @@ class TaskRecord:
     spoken_answer: str = ""
     constraints: list[dict[str, Any]] = field(default_factory=list)
     slots: dict[str, str] = field(default_factory=dict)  # task-scoped slots (this task version only; never long-term)
+    require_tools: list[str] = field(default_factory=list)   # what the router said this task needs (a REFINE inherits it)
+    tool_judgment: str = "model"
     interrupted: int = 0  # how many times playback of the answer was cut off (answer stays re-playable)

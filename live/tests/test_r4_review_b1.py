@@ -64,7 +64,7 @@ class Q3ThroughEveryLayerTests(unittest.IsolatedAsyncioTestCase):
         led, rec = _ledger("明天上海会下雨吗", status=TaskStatus.COMPLETED)
         job = _refine_job(led, rec)
         res = WorkerResult(task_id=job.task_id, version=job.version, status="completed", spoken_answer=Q3_FAKE, evidence=[], freshness_token=job.freshness_token)
-        with mock.patch.object(api, "_ungrounded", return_value=False):
+        with mock.patch.object(api, "_ungrounded", return_value=False), mock.patch.object(api, "_unverified_numbers", return_value=[]):
             out = finish_job(led, job, res)
         self.assertEqual(out.text, Q3_FAKE)
 
@@ -74,6 +74,7 @@ class Q3ThroughEveryLayerTests(unittest.IsolatedAsyncioTestCase):
 
         session = _session()
         led, rec = _ledger("明天上海会下雨吗", status=TaskStatus.COMPLETED)
+        rec.require_tools = ["get_weather"]
         session.coord_ledger = led
         sess = _FakeSession([_FakeResp(200, _say(Q3_FAKE)), _FakeResp(200, _say(Q3_FAKE))])
         _arm(session, "d2", "明天北京会下雨吗")

@@ -321,7 +321,7 @@ async def run_job(
                     # tool's own 没搜到 sentence, the model does not get to improvise one from its head
                     or (name == "web_search" and ("没有搜到" in out or "couldn't find useful snippets" in out))
                 )
-                evidence.append({"tool": name, "args": args, "ok": not failed, "ms": tool_ms, **tool_meta})
+                evidence.append({"tool": name, "args": args, "ok": not failed, "ms": tool_ms, "out": out[:4000], **tool_meta})   # "out": the number-containment source (coordinator.grounding)
                 if failed and name in required:
                     # A tool-backed job whose tool failed: say so plainly. The model never gets to word it, it could
                     # "recover" with numbers of its own (Critic B-1).

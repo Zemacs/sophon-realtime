@@ -32,11 +32,16 @@ def _ledger(objective: str = "明天上海会下雨吗", status: TaskStatus = Ta
     return led, rec
 
 
-def _jev(route: str, control: str | None):
+def _jev(route: str, control: str | None, tool: str | None = None, faithful: str | None = None):
+    """A scripted router: the test says what the MODEL answers (route / control / which tool / is the front's wording faithful)."""
     async def fake(state, questions, **kw):  # noqa: ANN001
         ans = {"route": {"type": "choice", "choice": route}}
         if control is not None:
             ans["control"] = {"type": "choice", "choice": control}
+        if tool is not None:
+            ans["tool"] = {"type": "choice", "choice": tool}
+        if faithful is not None:
+            ans["task_faithful"] = {"type": "choice", "choice": faithful}
         return {"answers": ans}
 
     return fake

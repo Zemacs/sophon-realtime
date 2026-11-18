@@ -21,6 +21,14 @@ _last: dict = {}
 real_system_one = api.jev_client.system_one   # the production client, for tests that exercise it
 
 
+TOOL = {"choice": "NONE"}       # what the fake router answers to the tool question; a test sets it per case (scripted model answer)
+FAITHFUL = {"choice": "SAME"}
+
+
+def tool_is(choice: str) -> None:
+    TOOL["choice"] = choice
+
+
 def _build_state(text, ledger, **kw):  # noqa: ANN001
     _last["args"] = (text, ledger)
     return _real_build_state(text, ledger, **kw)
@@ -30,6 +38,10 @@ async def fake_system_one(state, questions, **kw):  # noqa: ANN001
     text, ledger = _last["args"]
     route = heuristic_route(text, ledger)
     ans: dict = {"route": {"type": "choice", "choice": route}}
+    if "tool" in questions:
+        ans["tool"] = {"type": "choice", "choice": TOOL["choice"]}
+    if "task_faithful" in questions:
+        ans["task_faithful"] = {"type": "choice", "choice": FAITHFUL["choice"]}
     if route == "CONTROL":
         d = heuristic_control(text, ledger)
         if d is not None:

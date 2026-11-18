@@ -96,6 +96,7 @@ RESULT_FMT = {"zh": ("后端结果（只能根据这段内容回答，用你自�
 PROGRESS_FMT = {"zh": "后端还在处理（这是进度，不是结果）。用一句很短的口语让用户稍等，不要重复你刚说过的话，不要编结果：\n{c}",
                 "en": "The backend is still working (progress, not the result). Say one very short phrase asking the user to hold on; don't repeat "
                       "what you just said and don't invent a result:\n{c}"}
+NET_FILLER_MAX_CHARS = int(os.environ.get("SOPHON_LIVE_NET_FILLER_MAX", "16"))   # a turn this short is a lead-in, not an answer (structural size, not a reading of words)
 NET_GRACE_S = float(os.environ.get("SOPHON_LIVE_NET_GRACE", "0.8"))   # wait this long after "done" for a trailing tool call before the safety net acts
 DELEG_MODE = os.environ.get("SOPHON_LIVE_DELEG_MODE", "model")   # model: every backend update goes to the model, which decides to speak or <wait>; rules: gateway heuristics
 IDLE_UPDATE_S = float(os.environ.get("SOPHON_LIVE_IDLE_UPDATE", "7.0"))   # model mode: no backend news by then -> tell the model once, it may say a short "hold on"
@@ -607,9 +608,11 @@ class LiveSession:
                     await self.error("server_error", "engine connection lost"); await self.close("server_error"); return
 
     async def _no_delegate_net(self, rid: str) -> None:
-        """v0.1.0 safety net. The voice front sometimes says only its lead-in ("我帮你查一下") and ends the turn without calling
-        delegate (live: zh_memory 2 of 4, zh_light 1 of 6 on c88195c). For a request the Coordinator knows is tool-backed that means
-        a fabricated or empty answer, so the gateway delegates it itself. Never when the front did call delegate in that turn."""
+        """v0.1.0 safety net, structural trigger only. The voice front sometimes says only its lead-in ("我帮你查一下") and ends the
+        turn without calling delegate (live: zh_memory 2 of 4, zh_light 1 of 6 on c88195c). The TRIGGER is a state-machine fact, not a
+        reading of the user's words: the response is done, the front called no delegate in that turn, and what it said is lead-in sized
+        (<= NET_FILLER_MAX_CHARS, i.e. it never answered). Whether the request needs a tool is then decided by the router MODEL
+        (``coordinator.api.judge_tools``); only a model answer naming a tool makes the gateway delegate the user's own words itself."""
         try:
             r = self.resp.get(rid)
             if r is None:
@@ -623,14 +626,19 @@ class LiveSession:
             await asyncio.sleep(NET_GRACE_S)                       # a tool call can trail the done event
             if self.closed or self.deleg_calls != r.get("deleg_n0"):
                 return
+            if len((r.get("text") or "").strip()) > NET_FILLER_MAX_CHARS:
+                return                                             # the front answered by itself: not a filler-only turn
             lu = getattr(self, "last_user", None)
             if not lu or lu[1] < r.get("t0", 0) - 10 or lu[1] <= self.last_deleg_asr_t:   # no fresh transcript, or it was already delegated
                 return
             text = (lu[0] or "").strip()
-            from .coordinator import intent as _intent
-            if not text or not _intent.required_tools(text):
+            if not text:
                 return
-            log.warning("session %s front ended the turn without delegate for a tool-backed request; delegating %r", self.id, text)
+            from .coordinator.api import judge_tools
+            tools = await judge_tools(text)
+            if not tools or self.closed or self.deleg_calls != r.get("deleg_n0"):
+                return                                             # the model says no tool (or is unavailable): nothing to add
+            log.warning("session %s front ended the turn with a filler only; router says %s -> delegating %r", self.id, tools, text)
             self.deleg_calls += 1
             await self._delegate({"call_id": None, "arguments": {"task": text}, "net": "no_delegate"})
         except Exception:  # noqa: BLE001
@@ -862,8 +870,8 @@ class LiveSession:
                             orig_source=ev.get("orig_source"), age_s=ev.get("age_s"),
                             city=ev.get("city"), tmin=ev.get("tmin"), tmax=ev.get("tmax"), now=ev.get("now"))
         outcome = finish_job(ledger, job, result)    # the Coordinator decides what gets said; stale results are dropped
-        if tr is not None and job.require_tools:
-            tr.set(require=",".join(job.require_tools), **({"guard": outcome.rejected} if outcome.rejected else {}))
+        if tr is not None and (job.require_tools or outcome.rejected or job.tool_judgment != "model"):
+            tr.set(require=",".join(job.require_tools), judged=job.tool_judgment, **({"guard": outcome.rejected} if outcome.rejected else {}))
         if outcome.kind == "stale":                  # cancelled or superseded while running
             await self._ack_delegation(did, "这个任务已被取消或改口，不用再说什么。")
             return

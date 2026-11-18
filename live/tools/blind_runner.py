@@ -21,7 +21,8 @@ Output, one JSON object per sentence, written ONLY to OUT.jsonl (which must not 
      "decision" (NEW / REFINE / CANCEL / STATUS / the route), "jev_route", "jev_control" (what the JEV answered, even if a guard overrode it),
      "via" (jev | guard | heuristic: the production label), "control_via" (who picked the CONTROL target, or null),
      "degraded" (JEV was expected but something else decided), "degraded_reason", "degraded_exc" (class name of the JEV exception, else null),
-     "handled_by" (fast | clarify | control | worker | stop),
+     "handled_by" (fast | clarify | control | worker | stop; the ADMIT stage's handler. It stays "worker" when the Worker's result is later turned into
+                   a clarification or dropped as stale -- read "outcome_kind" (answer | clarify | stale) for what happened to the job),
      "required_tools" (what ``intent.required_tools`` -- a regex table in production -- told the Worker it must call; null when no job),
      "clarify_slots" (RETURN VALUES of ``clarify.missing_slots_for_text`` -- a keyword test in production -- one slot list per call, null if it was
                       not called), "memory_gate_explicit" (return values of ``memory_gate.has_explicit_save_intent`` -- a keyword table -- one bool per
@@ -47,7 +48,9 @@ Who decided (all derived from structure, never from the sentence)
   degraded_reason  the JEV call raised (chosen by exception CLASS and cause only, never the message; ``degraded_exc`` has the class name):
                 timeout | conn | http_status (aiohttp.ClientResponseError) | bad_json (RuntimeError with a cause: the unparsable body) |
                 runtime_error (a RuntimeError without a cause: jev_client's >=400 answer -- and any other plain RuntimeError, the class cannot
-                tell them apart) | jev_error (anything else);  or, without an exception: no_usable_route | invalid_route | control_no_target | null
+                tell them apart) | jev_error (anything else). With the current production ``jev_client``: ``runtime_error`` is the JEV returning
+                >=400 (or any other plain RuntimeError); ``http_status`` NEVER occurs (jev_client does not use ``raise_for_status``, so no
+                ``ClientResponseError`` arises) -- it is kept only in case production starts raising it;  or, without an exception: no_usable_route | invalid_route | control_no_target | null
 
 Fidelity: what differs from the production path (every row lists the codes that apply to this run)
   fake_jev, fake_worker      nothing real was asked
@@ -70,7 +73,8 @@ Modes
   gateway URL     NOT available: the GPT-Live gateway and the Realtime face take speech only (text items are ignored), so there is no text
                   turn interface to drive. ``--mode gateway`` exits with code 3 and says so.
 
-Exit codes: 0 done; 2 bad arguments, an unreadable input file, or an output that cannot be created (e.g. no such directory); 3 gateway mode;
+Exit codes: 0 done; 2 bad arguments, an unreadable or invalid input file (bad JSON / empty text / duplicate ids / bad history line: one line on
+stderr naming the line NUMBER, never its content), or an output that cannot be created (e.g. no such directory); 3 gateway mode;
 4 real mode refused; 5 output refused (exists / is the input); 6 the run finished but OUT.jsonl.done could not be created (it appeared during the run).
 A run that finished also writes ``OUT.jsonl.done`` (counts only); a run that was interrupted has none.
 
@@ -444,6 +448,11 @@ def main(argv: list[str] | None = None) -> int:
     except OSError as e:
         print(f"blind_runner: cannot read an input file ({type(e).__name__})", file=sys.stderr)
         return EXIT_BAD_ARGS
+    except SystemExit as e:                      # the readers' own one-line messages ("input line N: ...", duplicate ids, bad history): never the line itself
+        if isinstance(e.code, str):
+            print("blind_runner: " + e.code, file=sys.stderr)
+            return EXIT_BAD_ARGS
+        raise
     try:
         with quiet_and_sealed(a.mode == "real", a.orch_url, a.orch_model):
             n = asyncio.run(run(sents, a.out, mode=a.mode, fake_route=a.fake_route, jev_url=a.jev_url, shared_ledger=a.shared_ledger,

@@ -125,15 +125,32 @@ M = [
  ("S5b an unreadable input is a traceback", "    except OSError as e:\n        print(f\"blind_runner: cannot read", "    except ZeroDivisionError as e:\n        print(f\"blind_runner: cannot read"),
  ("S5c an unwritable output is a traceback", "    except OSError as e:                         # e.g.", "    except ZeroDivisionError as e:                         # e.g."),
  ("S5d the exit code for a lost race is not 5", "    except FileExistsError:                      # lost a race for the output file itself\n        print(\"blind_runner: refusing to write the output: it already exists (nothing was changed)\", file=sys.stderr)\n        return EXIT_OUT_REFUSED", "    except FileExistsError:                      # lost a race for the output file itself\n        return 0"),
+ # --- I-1' Critic's bypasses of the AST guard (865bb78 re-check): found by the runtime probe and/or the metamorphic test ------------
+ ("G1 alias then compare, no output effect (probe)", WRITE, "                t = s.text; _ = 'x' in t\n" + WRITE),
+ ("G2 async helper(q).startswith, no output effect (probe)", WRITE, "                await _chk(s.text)\n" + WRITE),
+ ("G8 len(s.text) alias compare (probe)", WRITE, "                n_ = len(s.text); _ = n_ > 5\n" + WRITE),
+ ("G9 slice s.text[:3] (probe)", WRITE, "                _ = s.text[:3]\n" + WRITE),
+ ("G10 getattr(s, 'text').find (probe)", WRITE, "                _ = getattr(s, 'text').find('x')\n" + WRITE),
+ ("H1 alias: handled_by changes when the text contains x", WRITE, "                t = s.text\n                if 'x' in t: row['handled_by'] = 'fast'\n" + WRITE),
+ ("H5 async helper(q) changes via", WRITE, "                if await _chk(s.text): row['via'] = 'guard'\n" + WRITE),
+ ("H6 sys.modules['re'].search changes required_tools (C-level: only the metamorphic test sees it)", WRITE, "                if sys.modules['re'].search('a', s.text): row['required_tools'] = []\n" + WRITE),
+ # --- S-2' invalid input exits 2 ------------------------------------------------------------------------------------------------------
+ ("S2'a invalid input JSON is not mapped to exit 2", "        if isinstance(e.code, str):\n            print(\"blind_runner: \" + e.code, file=sys.stderr)\n            return EXIT_BAD_ARGS\n", "        if False:\n            return EXIT_BAD_ARGS\n"),
 ]
 # Mutants that are equivalent to the unmutated runner BY CONSTRUCTION (the tests cannot, and must not, see them). They must survive.
 EQUIVALENT = [
  ("M14 ERROR-level log of the sentence in the error branch (Critic's original: invisible under logging.disable(CRITICAL))", EXC, EXC + '\n        logging.getLogger().error("x %s", text)'),
 ]
+# G2 / H5 need the helper that Critic's bypass used (a renamed parameter)
+ANCHOR = "\nALLOW_REAL_ENV"
+HELPER_G2 = "\nasync def _chk(q):\n    return q.startswith('x')\n"
+HELPER_H5 = "\nasync def _chk(q):\n    return q.startswith('a')\n"
 # M14 needs the weaker seal to be observable (see the module docstring)
 COMBO = {"M14w ERROR-level log of the sentence in the error branch (with the seal at WARNING)": ("    logging.disable(logging.CRITICAL)\n", "    logging.disable(logging.WARNING)\n")}
 # M9b needs the warning itself
-EXTRA = {"M9b warnings not ignored and warn(sentence)": (WRITE, "                warnings.warn(s.text)\n" + WRITE)}
+EXTRA = {"M9b warnings not ignored and warn(sentence)": (WRITE, "                warnings.warn(s.text)\n" + WRITE),
+         "G2 async helper(q).startswith, no output effect (probe)": (ANCHOR, HELPER_G2 + ANCHOR),
+         "H5 async helper(q) changes via": (ANCHOR, HELPER_H5 + ANCHOR)}
 
 
 WORK = tempfile.mkdtemp(prefix="blind_runner_mut_")      # the cwd of every pytest run; deleted at the end

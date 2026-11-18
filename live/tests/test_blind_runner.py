@@ -499,29 +499,125 @@ class Behaviour(_Base):
                 self.assertEqual(br.main([inp, out]), 5)
             self.assertEqual(open(out).read(), "THEIRS")
 
-    # ---- S-4: a metamorphic test (independent of how the runner's code names things) ---------------------------------------------
-    def test_two_batches_of_unrelated_random_sentences_give_identical_rows_apart_from_reply_and_required_tools(self) -> None:
-        import random
+    # ---- S-4 / I-1': metamorphic tests (independent of how the runner's code names things) ---------------------------------------
+    BASELINE = "占位占位"
+
+    @staticmethod
+    def _char_sentences(full_cjk: bool) -> list[str]:
         import string
-        def batch(seed: int) -> list[str]:
-            rnd = random.Random(seed)
-            pool = [chr(c) for c in range(0x4E00, 0x9FFF)] + list(string.ascii_letters + string.digits)
-            return ["".join(rnd.choice(pool) for _ in range(rnd.randint(1, 60))) for _ in range(40)]
-        a, b = batch(1), batch(2)
-        self.assertTrue(set(a).isdisjoint(b)); self.assertNotEqual([len(x) % 2 for x in a], [len(x) % 2 for x in b])
+        ascii_chars = [c for c in string.printable if not c.isspace() and c != "{"]           # a line starting with { is read as JSON
+        cjk = [chr(c) for c in range(0x4E00, 0xA000)]
+        return ascii_chars + (cjk if full_cjk else cjk[::16])
+
+    @staticmethod
+    def _corpus_sentences() -> list[str]:
+        from tests import intent_cases as ic                       # the repo's own labelled utterances: real words, Chinese and English
+        out = []
+        for name in ("OFFICIAL_REALTIME", "OFFICIAL_FREE", "CRITIC_REALTIME", "CRITIC_FREE", "HARDER_REALTIME", "HARDER_FREE", "HELDOUT_REALTIME", "HELDOUT_FREE",
+                     "CONVERSION_REALTIME", "CONVERSION_FREE"):
+            out += [x for x in getattr(ic, name, ()) if isinstance(x, str) and x.strip() and not x.lstrip().startswith("{")]
+        return list(dict.fromkeys(out))
+
+    def _rows_for(self, sents: list[str], route: str) -> list[dict]:
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "o.jsonl")
+            so = io.StringIO()
+            with mock.patch("sys.stdout", so):
+                self.assertEqual(br.main([_write(d, sents), out, "--fake-route", route]), 0)
+            return _rows(out)
+
+    def test_every_single_character_and_every_corpus_sentence_is_treated_exactly_like_a_neutral_sentence(self) -> None:
+        """The runner must not fork on WHAT the sentence says. Every single character of the character set (so any 'contains X' / 'starts with X' /
+        'ends with X' fork on a one-character X fires), and every sentence of the repo's labelled corpus (so forks on a word the corpus has fire), gets a
+        row that equals the row of a neutral sentence in every column except ``reply``, ``required_tools`` and ``clarify_slots`` -- the three that
+        legitimately carry the production keyword functions' answers. ``required_tools`` must equal ``intent.required_tools`` of the same sentence,
+        and a fake Worker's reply is constant. A fork on a multi-character word the corpus does not contain is NOT found; code review remains the backstop."""
+        from sophon_live.coordinator import intent
         from sophon_live.coordinator.route import ROUTE_CRITERIA
+        corpus = self._corpus_sentences()
+        self.assertGreater(len(corpus), 150)
         for route in sorted(ROUTE_CRITERIA):
-            outs = []
-            for sents in (a, b):
-                with tempfile.TemporaryDirectory() as d:
-                    out = os.path.join(d, "o.jsonl")
-                    self.assertEqual(br.main([_write(d, sents), out, "--fake-route", route]), 0)
-                    outs.append(_rows(out))
-            self.assertEqual(len(outs[0]), len(outs[1]))
-            for x, y in zip(*outs):
-                for r in (x, y):
-                    r.pop("reply"); r.pop("required_tools")
-                self.assertEqual(x, y, route)
+            sents = self._char_sentences(full_cjk=route == "WORKER") + corpus
+            self.assertEqual(len(set(sents)), len(sents))
+            base, *rows = self._rows_for([self.BASELINE] + sents, route)
+            self.assertEqual(len(rows), len(sents))
+            for sent, r in zip(sents, rows):
+                if route == "WORKER":
+                    self.assertEqual(r["reply"], br.FAKE_REPLY, sent)
+                    self.assertEqual(r["required_tools"], intent.required_tools(sent), sent)
+                for key in set(r) - {"id", "reply", "required_tools", "clarify_slots"}:
+                    self.assertEqual(r[key], base[key], f"{route} {key} differs for {sent!r}")
+
+    def test_the_metamorphic_test_can_see_a_character_fork(self) -> None:
+        """Not vacuous: a runner that forks on one character gives a different row for exactly that character."""
+        orig_run_one = br.run_one
+        async def run_one(sid, text, **kw):   # noqa: ANN001
+            row = await orig_run_one(sid, text, **kw)
+            if "x" in text:                                            # a planted judgment (in the TEST, never in the runner)
+                row["handled_by"] = "fast"
+            return row
+        with mock.patch.object(br, "run_one", run_one):
+            rows = self._rows_for([self.BASELINE, "x", "y"], "WORKER")
+        self.assertEqual([r["handled_by"] for r in rows], ["worker", "fast", "worker"])
+
+    # ---- I-1': a runtime probe: does the runner's OWN code touch the sentence? ---------------------------------------------------
+    @staticmethod
+    def _probe_type(hits: list):
+        """A str subclass whose every method records a call made FROM a frame of tools/blind_runner.py (production modules are ignored)."""
+        runner = os.path.realpath(br.__file__)
+        names = ["__contains__", "__getitem__", "__len__", "__eq__", "__ne__", "__lt__", "__le__", "__gt__", "__ge__", "__iter__", "__add__", "__radd__",
+                 "__mod__", "__mul__", "__format__", "__str__", "__repr__", "find", "rfind", "index", "rindex", "count", "startswith", "endswith", "lower",
+                 "upper", "casefold", "split", "rsplit", "splitlines", "partition", "rpartition", "strip", "lstrip", "rstrip", "replace", "translate",
+                 "encode", "isascii", "isdigit", "isalpha", "isalnum", "isspace", "title", "swapcase", "removeprefix", "removesuffix", "format", "zfill",
+                 "ljust", "rjust", "center", "expandtabs"]
+        def mk(name):
+            base = getattr(str, name)
+            def m(self, *a, **k):
+                f = sys._getframe(1)
+                if os.path.realpath(f.f_code.co_filename) == runner:
+                    hits.append(name)
+                return base(self, *a, **k)
+            m.__name__ = name
+            return m
+        ns = {n: mk(n) for n in names if hasattr(str, n)}
+        ns["__hash__"] = str.__hash__
+        return type("TouchProbe", (str,), ns)
+
+    def test_the_probe_is_not_vacuous_it_sees_a_touch_from_runner_code_and_ignores_other_code(self) -> None:
+        hits: list = []
+        T = self._probe_type(hits)
+        t = T("abc")
+        _ = "x" in t; _ = t.startswith("a"); _ = t[:1]; _ = len(t)                      # this test file is not the runner: no hits
+        self.assertEqual(hits, [])
+        ns: dict = {}
+        exec(compile("def touch(t):\n    return ('x' in t, t.find('a'), t[:2], len(t), t == 'q', t.startswith('a'))\n", os.path.realpath(br.__file__), "exec"), ns)
+        ns["touch"](t)
+        self.assertEqual(sorted(set(hits)), sorted({"__contains__", "find", "__getitem__", "__len__", "__eq__", "startswith"}))
+
+    def test_the_runners_own_code_never_touches_the_sentence_in_any_route_ledger_mode_or_error_path(self) -> None:
+        from sophon_live.coordinator.route import ROUTE_CRITERIA
+        hits: list = []
+        T = self._probe_type(hits)
+        real_fake = br._fake_worker
+        async def bad_worker(job, **kw):   # noqa: ANN001
+            raise ValueError("x")
+        async def fake_jev_failing(route):   # noqa: ANN001, ARG001
+            return _jev_raising(RuntimeError("down"))
+        async def go(route, shared, worker, jev_factory=None):
+            sents = [br.Sentence("a", T("今天天气怎么样 zq"), None), br.Sentence("b", T("好的谢谢"), T("改写后的任务")), br.Sentence("c", T("取消吧"), None)]
+            with tempfile.TemporaryDirectory() as d:
+                with mock.patch.object(br, "_fake_worker", worker):
+                    if jev_factory is not None:
+                        with mock.patch.object(br, "_fake_jev", jev_factory):
+                            return await br.run(sents, os.path.join(d, "o.jsonl"), fake_route=route, shared_ledger=shared)
+                    return await br.run(sents, os.path.join(d, "o.jsonl"), fake_route=route, shared_ledger=shared)
+        with br.quiet_and_sealed(False):
+            for route in sorted(ROUTE_CRITERIA):
+                for shared in (False, True):
+                    self.assertEqual(asyncio.run(go(route, shared, real_fake)), 3)
+                    self.assertEqual(asyncio.run(go(route, shared, bad_worker)), 3)
+            self.assertEqual(asyncio.run(go("WORKER", True, real_fake, fake_jev_failing)), 3)
+        self.assertEqual(hits, [], "the runner's own code touched the sentence text")
 
     # ---- S-2: input handling --------------------------------------------------------------------------------------------------
     def test_input_handling_bom_null_text_bad_ids_bad_route_and_bad_history(self) -> None:
@@ -545,6 +641,29 @@ class Behaviour(_Base):
             with mock.patch("sys.stderr", se):
                 self.assertEqual(br.main([_write(d, ["x"]), os.path.join(d, "o.jsonl"), "--fake-route", "BOGUS"]), 2)
             self.assertFalse(os.path.exists(os.path.join(d, "o.jsonl")))
+
+    def test_invalid_input_exits_2_with_one_line_naming_the_line_number_and_never_the_content(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            cases = {"bad json": ['{"id": "a", "text": "ZQXV7731"', ], "null text": [json.dumps({"id": "a", "text": None})],
+                     "dup ids": [json.dumps({"id": "a", "text": "ZQXV7731"}), json.dumps({"id": "a", "text": "y"})]}
+            for name, lines in cases.items():
+                out = os.path.join(d, name.replace(" ", "_") + ".jsonl")
+                se = io.StringIO()
+                with mock.patch("sys.stderr", se):
+                    self.assertEqual(br.main([_write(d, lines, "in_" + name.replace(" ", "_") + ".jsonl"), out]), 2, name)
+                err = se.getvalue()
+                self.assertEqual(len(err.strip().splitlines()), 1, err)
+                self.assertNotIn("ZQXV7731", err); self.assertNotIn("Traceback", err)
+                self.assertFalse(os.path.exists(out) or os.path.exists(out + ".done"))
+            se = io.StringIO()
+            with mock.patch("sys.stderr", se):
+                br.main([_write(d, ["ok", json.dumps({"text": ""})], "second.jsonl"), os.path.join(d, "o9.jsonl")])
+            self.assertTrue(se.getvalue().startswith("blind_runner: input line"))
+            h = _write(d, ['{"task": 1, "answer": "ZQXV7731"}'], "h.jsonl")
+            se = io.StringIO()
+            with mock.patch("sys.stderr", se):
+                self.assertEqual(br.main([_write(d, ["ok"], "okin.txt"), os.path.join(d, "o10.jsonl"), "--history-jsonl", h]), 2)
+            self.assertNotIn("ZQXV7731", se.getvalue()); self.assertEqual(len(se.getvalue().strip().splitlines()), 1)
 
     def test_duplicate_ids_and_bad_json_are_refused_without_echoing_the_line(self) -> None:
         with tempfile.TemporaryDirectory() as d:

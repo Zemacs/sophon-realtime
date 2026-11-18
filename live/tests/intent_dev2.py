@@ -27,3 +27,17 @@ DEV2_FREE = (
     "what time should we have dinner", "why do birds sing in the morning", "write a short poem about the subway", "how do airplanes fly",
     "what does GDP stand for", "can you help me plan my day", "do you like football", "how many days are in a leap year",
 )
+
+# English-only second round (written after the first English results, before the English broadening below): 16 realtime / 16 free
+DEV2_EN_REALTIME = (
+    "is the train to Boston running on time", "are the shops on high street open now", "what's the current price of silver", "what's the flight status at JFK right now",
+    "is the concert still on tonight", "any updates on the election results", "are there tickets left for tonight's game", "is the ferry cancelled today",
+    "what's the score in the cricket match", "is the server status page showing an outage", "what is the dollar worth against the yen today", "is the festival sold out yet",
+    "how are the markets reacting to the news", "are the trains disrupted this morning", "which team is winning the match right now", "has the bus been delayed again",
+)
+DEV2_EN_FREE = (
+    "can you explain how a stock works", "tell me a joke about trains", "what is the capital of Australia", "I'm running late for work, any tips to wake up faster",
+    "write me a haiku about the ocean", "how do I cancel a subscription politely", "is it better to rent or buy a house", "what's your favorite season",
+    "remind me what a bond is", "how do I open a bank account", "why is the ocean salty", "help me plan a trip to Rome next summer",
+    "what should I cook tonight", "is it healthy to skip breakfast", "describe a football match in one sentence", "who wrote Hamlet",
+)

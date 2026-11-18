@@ -80,6 +80,13 @@ DELEGATE = {
 SPOKEN_RULE = {"zh": "\n\n你的回复会被直接合成为语音说出来：用自然的口语，一般一两句；只写要说出口的话，不要写括号说明、表情或格式符号。",
                "en": "\n\nYour reply is spoken aloud: use natural spoken language, usually one or two sentences; write only the words to be "
                      "spoken, no parenthetical notes, emoji or markdown."}
+# The Tag plugin's built-in tool preamble (vLLM :8000, not ours to change) says "say 我帮你查一下 first" for every tool, which is
+# why the lead-in was the same for jokes and the time. The session system prompt is ours: it overrides that per request type.
+FILLER_RULE = {"zh": "\n\n调用 delegate 之前只说一句很短的过渡语，并且按类型：查天气、新闻、搜索、记忆，说「我帮你查一下」；控制设备，说「好的，马上」；"
+                     "问时间或日期、讲笑话，不要说任何过渡语，直接调用 delegate（这条优先于其他关于过渡语的举例）。",
+               "en": "\n\nBefore calling delegate say at most one very short lead-in, chosen by type: for weather, news, search, memory \"Let me check\"; "
+                     "for device control \"Sure, on it\"; for the time or date, or a joke, say nothing and call delegate right away "
+                     "(this overrides any other example of a lead-in)."}
 RESULT_FMT = {"zh": ("后端结果（只能根据这段内容回答，用你自己的口语自然地告诉用户，不要提到后端或工具；内容里没有的信息绝对不要自己编。"
                      "如果它说没查到、想不起来或请用户再说一遍，就照这个意思告诉用户）：\n{c}",
                      "背景信息（不要照读，只在需要时用自己的话简短回应；不要编造其中没有的事实）：\n{c}"),
@@ -253,7 +260,7 @@ class LiveSession:
         return True
 
     def _sys(self) -> str:
-        return (self.instructions or "") + SPOKEN_RULE[self.lang]
+        return (self.instructions or "") + SPOKEN_RULE[self.lang] + FILLER_RULE[self.lang]
 
     # ------------------------------------------------------------- client events
     async def on_event(self, ev: dict) -> None:

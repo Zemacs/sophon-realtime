@@ -282,11 +282,11 @@ class FailureTextWhitelistTests(unittest.TestCase):
 
         for text in (web_search._network_error(True), web_search._network_error(False), web_search._no_results("美元兑人民币", zh=True),
                      web_search._no_results("usd cny", zh=False)):
-            self.assertTrue(is_tool_failure_sentence(text, {"args": {"query": "美元兑人民币 usd cny"}}), text)
+            self.assertTrue(is_tool_failure_sentence(text, {"tool": "web_search"}, "美元兑人民币 usd cny"), text)
         src = Path(news.__file__).read_text(encoding="utf-8")
         for text in ("新闻源暂时连不上，稍后再帮你看看头条吧。", "News feeds are unreachable right now. Try again in a moment."):
             self.assertIn(text, src)
-            self.assertTrue(is_tool_failure_sentence(text, {}), text)
+            self.assertTrue(is_tool_failure_sentence(text, {"tool": "get_news"}), text)
 
 
 class MutationFakeNeverSpokenTests(unittest.TestCase):

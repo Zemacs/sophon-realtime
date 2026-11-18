@@ -1,4 +1,4 @@
-"""Local JSON memory for short user preferences and facts."""
+"""Local JSON memory for short user preferences and facts (store only; policy lives in coordinator.memory_gate)."""
 from __future__ import annotations
 
 import json
@@ -35,38 +35,18 @@ def _save_store(store: dict[str, str]) -> None:
     path.write_text(json.dumps(store, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+class _JsonStore:
+    """PrefStore over the local JSON file (path resolved on every call, so tests and env overrides stay honest)."""
+
+    def load(self) -> dict[str, str]:
+        return _load_store()
+
+    def save(self, store: dict[str, str]) -> None:
+        _save_store(store)
+
+
 async def run(args: dict[str, Any] | None = None) -> str:
-    args = args or {}
-    op = (args.get("op") or "").strip().lower()
-    key = (args.get("key") or "").strip()
-    value = args.get("value")
+    """memory_note tool. Every op goes through the C-layer memory_gate (long-term prefs vs task slots)."""
+    from ..coordinator.memory_gate import MemoryGate
 
-    if op == "save":
-        if not key:
-            return "保存记忆需要提供一个键名。"
-        if value is None or str(value).strip() == "":
-            return "要保存什么内容？请再说一下值。"
-        store = _load_store()
-        store[key] = str(value).strip()
-        try:
-            _save_store(store)
-        except OSError:
-            return "记忆文件写入失败，请检查磁盘或权限。"
-        return f"好的，我已经记住「{key}」了。"
-
-    if op == "recall":
-        if not key:
-            return "要回忆哪一条？请说一下键名。"
-        store = _load_store()
-        if key not in store:
-            return f"还没有记录过「{key}」。"
-        return f"「{key}」是：{store[key]}。"
-
-    if op == "list":
-        store = _load_store()
-        if not store:
-            return "目前还没有保存任何记忆。"
-        keys = "、".join(sorted(store.keys()))
-        return f"当前记住了这些项：{keys}。"
-
-    return "不支持的记忆操作，请用 save、recall 或 list。"
+    return MemoryGate(_JsonStore()).handle(args)

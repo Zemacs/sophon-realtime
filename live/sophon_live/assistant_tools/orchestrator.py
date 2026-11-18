@@ -11,12 +11,14 @@ import json
 import logging
 import os
 import re
+import time
 from typing import Any
 
 import aiohttp
 
 from ..coordinator.clarify import clarify_for_slots
 from ..coordinator.schemas import WorkerJob, WorkerResult
+from . import toolmeta
 from .registry import TOOL_SCHEMAS
 from .runner import run_tool
 
@@ -220,7 +222,11 @@ async def run_job(
                     log.info("orch step=%d tool=%s missing=%s -> needs_input", step, name, missing)
                     evidence.append({"tool": name, "args": args, "ok": False, "missing": missing})
                     return _result(job, "needs_input", "", evidence, missing)
+                t_tool = time.monotonic()
+                toolmeta.take()
                 out = await run_tool(name, args)
+                tool_ms = round((time.monotonic() - t_tool) * 1000)
+                tool_meta = toolmeta.take()
                 log.info(
                     "orch step=%d tool=%s args=%s out=%s",
                     step,
@@ -238,7 +244,7 @@ async def run_job(
                     or "unavailable" in out.lower()
                     or "不可用" in out
                 )
-                evidence.append({"tool": name, "args": args, "ok": not failed})
+                evidence.append({"tool": name, "args": args, "ok": not failed, "ms": tool_ms, **tool_meta})
                 news_ok = name == "get_news" and ("第1条" in out or "Headlines on" in out) and not failed
                 weather_ok = name == "get_weather" and ("度" in out or "°" in out or "°C" in out) and not failed
                 if news_ok or weather_ok:

@@ -443,6 +443,12 @@ class LiveSession:
             self.delivery = DeliveryTracker()
         return self.delivery
 
+    def _trace(self):
+        from .coordinator.trace import TraceBook
+        if not hasattr(self, "trace_book"):
+            self.trace_book = TraceBook(self.id)
+        return self.trace_book
+
     def _apply_receipts(self, receipts) -> None:
         from .coordinator import on_playback_receipt
         ledger = getattr(self, "coord_ledger", None)
@@ -457,6 +463,7 @@ class LiveSession:
 
     def _delivery_armed(self, did: str) -> None:
         """A tracked result was just handed to the front: the next response that starts carries it."""
+        self._trace().posted(did)                    # handed to the front: from here the next response carries it
         d = self.deleg.get(did)
         track = d.pop("track", None) if d else None
         if track:
@@ -467,6 +474,7 @@ class LiveSession:
         for r in self.resp.values():
             r["text"] = r["text"][: r["released"]]; r["done"] = True; r["dropped"] = True
         self._apply_receipts(self._delivery().on_interrupted())     # 打断 ≠ 取消：只记回执，任务与结果原样保留
+        self._trace().cut()
         log.info("session %s %s: playback dropped", self.id, why)
 
     def _cut_user(self) -> asyncio.Task | None:
@@ -515,6 +523,7 @@ class LiveSession:
                     lead = ("。" if self.lang == "zh" else ". ") if prev and prev[-1] not in "。！？.!?，,～…" else ""
                     self.resp[rid] = {"text": lead, "released": 0, "audio_s": 0.0, "played_s": 0.0, "start_ms": None, "done": False, "asr": task}
                     self._delivery().attach(rid)
+                    self._trace().response_started(rid)
                 r = self.resp[rid]
                 if r.get("dropped"):
                     continue
@@ -552,6 +561,8 @@ class LiveSession:
         did = "item_" + uuid.uuid4().hex[:16]
         what = (e.get("arguments") or {}).get("task")
         self.deleg[did] = {"call_id": e["call_id"], "chunks": [], "timer": None, "task": what, "t0": time.monotonic()}
+        tr = self._trace().start(did)
+        tr.set(task=(what or "")[:40], asr_ago_ms=round((time.monotonic() - self.last_user[1]) * 1000) if getattr(self, "last_user", None) else None)
         use_coord = os.environ.get("SOPHON_LIVE_COORD", "").strip().lower() in ("1", "true", "yes", "on")
         use_orch = (not use_coord) and os.environ.get("SOPHON_LIVE_ORCH", "").strip().lower() in ("1", "true", "yes", "on")
         use_builtin = (not use_coord) and (not use_orch) and os.environ.get("SOPHON_LIVE_BUILTIN_TOOLS", "").strip().lower() in ("1", "true", "yes", "on")
@@ -586,11 +597,16 @@ class LiveSession:
             await self.engine.tool_result(d["call_id"], note, speak=False)
         except Exception as e:  # noqa: BLE001
             log.warning("session %s ack delegation %s failed: %s", self.id, did, e)
+        self._trace().silent(did)
 
     async def _coord_say(self, did: str, text: str, track: tuple[str, int] | None = None) -> None:
         d = self.deleg.get(did)
         if d is None:
             return
+        tr = self._trace().get(did)
+        if tr is not None:
+            tr.mark("say")
+            tr.set(say_chars=len(text))
         if track is not None:
             d["track"] = track                       # armed for a delivery receipt once the result is handed to the front
         await self.send({"type": "session.commentary.appended", "start_ms": self.timeline_ms, "end_ms": self.timeline_ms,
@@ -637,6 +653,11 @@ class LiveSession:
         if result is None:
             await self._orch_resolve(did, what)
             return
+        tr = self._trace().get(did)
+        if tr is not None:
+            tr.mark("route")
+            tr.set(route=result.route, decision=result.control.op if result.control else ("NEW" if result.job else result.route),
+                   via=result.via, jev_ms=None if result.jev_ms is None else round(result.jev_ms))
         # CANCEL / REFINE: the old (task_id, version) must stop now; its result is never spoken.
         stale = getattr(result, "stale_task", None)
         if stale is not None:
@@ -670,6 +691,9 @@ class LiveSession:
                 run_worker_job(job, instructions=self.instructions or "", history=getattr(self, "orch_history", None) or [])
             )
         self.coord_workers[job.task_id] = worker
+        if tr is not None:
+            tr.mark("worker_start")
+            tr.set(task_id=job.task_id, version=job.version)
         try:
             result = await worker                    # a WorkerResult: status + answer or missing slots, nothing else
         except asyncio.CancelledError:
@@ -686,6 +710,11 @@ class LiveSession:
         finally:
             if self.coord_workers.get(job.task_id) is worker:
                 self.coord_workers.pop(job.task_id, None)
+        if tr is not None:
+            tr.mark("worker_done")
+            tr.set(worker=result.status)
+            for ev in result.evidence:
+                tr.add_tool(ev.get("tool", "?"), ev.get("ms"), bool(ev.get("ok")), source=ev.get("source"), fallbacks=ev.get("fallbacks"))
         outcome = finish_job(ledger, job, result)    # the Coordinator decides what gets said; stale results are dropped
         if outcome.kind == "stale":                  # cancelled or superseded while running
             await self._ack_delegation(did, "这个任务已被取消或改口，不用再说什么。")
@@ -786,6 +815,7 @@ class LiveSession:
                     self.resp.pop(rid, None)
                     if not r.get("dropped"):
                         self._receipt_played(rid)                # heard to the end
+                        self._trace().response_played(rid)
                 continue
             if r.get("asr") is not None and not r["asr"].done():
                 continue                                          # the user's words go out before the reply's
@@ -815,6 +845,7 @@ class LiveSession:
             return
         self.closed = True
         self._apply_receipts(self._delivery().on_close())
+        self._trace().cut(close=True)
         for w in list(getattr(self, "coord_workers", {}).values()):
             w.cancel()
         for t in self.tasks:

@@ -64,7 +64,9 @@ class RunJobTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(res, WorkerResult)
         self.assertEqual((res.task_id, res.version, res.status), ("t1", 2, "completed"))
         self.assertEqual(res.spoken_answer, "北京明天多云，12度。")
-        self.assertEqual(res.evidence, [{"tool": "get_weather", "args": {"city": "北京", "when": "tomorrow"}, "ok": True}])
+        ev = res.evidence[0]
+        self.assertEqual((ev["tool"], ev["args"], ev["ok"]), ("get_weather", {"city": "北京", "when": "tomorrow"}, True))
+        self.assertIsInstance(ev["ms"], int)  # latency of the tool call is part of the evidence
         # the job objective is the only task text the model sees
         self.assertIn("北京明天天气", sess.posts[0]["json"]["messages"][1]["content"])
 

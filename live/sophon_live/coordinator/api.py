@@ -27,6 +27,7 @@ class AdmitResult:
     control: ControlDecision | None = None  # set when a CONTROL op was applied (or refused)
     stale_task: tuple[str, int] | None = None  # (task_id, version) whose in-flight worker must stop
     via: str = "heuristic"  # who decided: guard | jev | heuristic
+    jev_ms: float | None = None  # Karpo round trip, when JEV was asked
 
 
 def _clarify_text(text: str) -> str:
@@ -60,6 +61,7 @@ async def admit(req: AdmitRequest, ledger: Ledger) -> AdmitResult:
     t0 = time.monotonic()
     res = await _admit(req, ledger, meta)
     res.via = meta["via"]
+    res.jev_ms = meta["jev_ms"]
     log.info(
         "coord admit session=%s utt=%r route=%s decision=%s via=%s admit_ms=%d jev_ms=%s",
         req.session_id, (req.delegate_task or req.text or "")[:60], res.route, _decision_label(res), res.via,

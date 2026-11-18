@@ -338,4 +338,8 @@ async def run_detailed(args: dict[str, Any] | None = None) -> tuple[str, dict[st
 
 
 async def run(args: dict[str, Any] | None = None) -> str:
-    return (await run_detailed(args))[0]
+    text, meta = await run_detailed(args)
+    from . import toolmeta
+
+    toolmeta.note(source=meta.get("source"), fallbacks=len(meta.get("notes") or []) or None)
+    return text

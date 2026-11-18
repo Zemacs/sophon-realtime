@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import sys
 import unittest
 from pathlib import Path
@@ -39,6 +40,44 @@ class IntentTests(unittest.TestCase):
     def test_chitchat_jokes_and_knowledge_need_no_tool(self) -> None:
         for text in ("讲个笑话", "讲一个不一样的笑话", "你好", "谁发明了电灯", "北京是中国的首都吗", "灯为什么会亮", ""):
             self.assertEqual(intent.required_tools(text), [], text)
+
+    # Critic I-8: realtime facts without the words 搜索 / 汇率 / 股价. Each one must be tool-backed (web_search), so the guard in
+    # finish_job applies: no successful tool evidence -> honest failure, never an answer from the model's head.
+    REALTIME_FACT_QUESTIONS = (
+        "今天美元兑人民币是多少", "比特币现在多少钱", "A股开盘了吗",                       # the three the review found classified as []
+        "现在金价多少", "今天油价多少", "上证指数今天涨了吗", "昨晚湖人比分是多少", "这周末英超有什么比赛", "现在日元汇率",
+        "一百美元能换多少人民币", "特斯拉股价", "今天的票房冠军是谁", "北京到上海的航班晚点吗", "现在堵车吗", "现任美国总统是谁",
+        "纳斯达克收盘了没有", "iPhone 17 多少钱", "苹果最新市值多少", "今天有什么热搜", "港股今天开市吗", "明天限行吗",
+        "今天欧元兑人民币多少", "美元现在对人民币什么价", "黄金今天跌了没有", "茅台现在股价", "最新一任奥运冠军是谁",
+        "what's the bitcoin price", "dollar to yuan exchange rate today", "did the Lakers win, what's the score",
+    )
+    NOT_REALTIME_FACTS = (
+        "讲个笑话", "你好", "你叫什么名字", "给我唱首歌", "现在心情怎么样", "今天过得怎么样", "帮我翻译一下这句话", "一加一等于几",
+        "李白是哪个朝代的", "水的沸点是多少度", "光速是多少", "地球到月亮多远", "帮我写首诗", "你会做什么", "谢谢你", "再说一遍",
+        "谁发明了电灯", "北京是中国的首都吗", "灯为什么会亮",
+    )
+
+    def test_realtime_fact_questions_are_tool_backed(self) -> None:
+        for text in self.REALTIME_FACT_QUESTIONS:
+            self.assertEqual(intent.required_tools(text)[:1], ["web_search"], text)
+            self.assertEqual(intent.pad_for(text), "我帮你查一下。", text)
+
+    def test_chitchat_and_stable_knowledge_stay_tool_free(self) -> None:
+        for text in self.NOT_REALTIME_FACTS:
+            self.assertEqual(intent.required_tools(text), [], text)
+
+    def test_realtime_fact_without_the_tool_is_never_answered(self) -> None:
+        """End to end through admit + finish_job: 「今天美元兑人民币是多少」, the Worker answers a number with no tool call."""
+        async def go():
+            led = Ledger()
+            with mock.patch.object(api, "USE_JEV", True), mock.patch.object(api.jev_client, "system_one", new=_jev("WORKER", None)):
+                res = await admit(AdmitRequest(session_id="s", utterance_id="u", text="今天美元兑人民币是多少", delegate_task="今天美元兑人民币是多少"), led)
+            self.assertEqual(res.job.require_tools, ["web_search"])
+            led.mark_running(res.job.task_id)
+            fake = WorkerResult(task_id=res.job.task_id, version=res.job.version, status="completed", spoken_answer="今天美元兑人民币大约七点二。", freshness_token=res.job.freshness_token)
+            return finish_job(led, res.job, fake)
+        out = asyncio.run(go())
+        self.assertEqual((out.text, out.rejected), (NO_TOOL_ANSWER, "no_tool_result"))
 
     def test_tool_names_exist(self) -> None:
         known = set(list_tool_names())

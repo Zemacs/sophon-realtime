@@ -18,6 +18,7 @@ _LIVE_ROOT = Path(__file__).resolve().parents[1]
 if str(_LIVE_ROOT) not in sys.path:
     sys.path.insert(0, str(_LIVE_ROOT))
 
+from tests import jev_standin  # noqa: E402  (scripted JEV for control-flow tests)
 from sophon_live.coordinator import AdmitRequest, AdmitResult, Ledger, SpeakPlan, WorkerJob, admit
 from sophon_live.coordinator import api
 from sophon_live.coordinator import jev_client
@@ -46,7 +47,7 @@ def _req(text: str, *, uid: str) -> AdmitRequest:
 
 class InvariantTests(unittest.IsolatedAsyncioTestCase):
     async def test_stale_result_dropped_and_cancel_is_versioned(self) -> None:
-        with mock.patch.object(api, "USE_JEV", False):
+        with jev_standin.standin():
             led = Ledger()
             first = await admit(_req("现在几点了", uid="t1"), led)
         self.assertIsNotNone(first.job)
@@ -97,7 +98,7 @@ class InvariantTests(unittest.IsolatedAsyncioTestCase):
 
 class ControlStatusTargetTests(unittest.IsolatedAsyncioTestCase):
     async def test_cancel_keeps_one_task_and_does_not_start_worker(self) -> None:
-        with mock.patch.object(api, "USE_JEV", False):
+        with jev_standin.standin():
             led = Ledger()
             started = await admit(_req("北京明天天气", uid="w"), led)
             self.assertEqual(started.route, "WORKER")
@@ -117,7 +118,7 @@ class ControlStatusTargetTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(actual["statuses"], ["CANCELLED"])
 
     async def test_status_answers_from_existing_result_without_new_task(self) -> None:
-        with mock.patch.object(api, "USE_JEV", False):
+        with jev_standin.standin():
             led = Ledger()
             started = await admit(_req("北京明天天气", uid="w"), led)
             assert started.job is not None
@@ -241,7 +242,7 @@ class GatewayBoundaryTests(unittest.IsolatedAsyncioTestCase):
         _arm(left, "a", "现在几点了")
         _arm(right, "b", "科技新闻")
         with (
-            mock.patch.object(api, "USE_JEV", False),
+            jev_standin.standin(),
             mock.patch.object(tools, "run_worker_job", as_worker(fake_orch)),
         ):
             await left._coord_resolve("a", "现在几点了")

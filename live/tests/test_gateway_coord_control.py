@@ -15,6 +15,7 @@ _LIVE_ROOT = Path(__file__).resolve().parents[1]
 if str(_LIVE_ROOT) not in sys.path:
     sys.path.insert(0, str(_LIVE_ROOT))
 
+from tests import jev_standin  # noqa: E402  (scripted JEV for control-flow tests)
 from sophon_live.coordinator import AdmitResult, SpeakPlan, api
 from sophon_live.coordinator.schemas import TaskStatus
 from tests.worker_stub import as_worker
@@ -101,7 +102,7 @@ class GatewayCoordControlTests(unittest.IsolatedAsyncioTestCase):
 
         _arm(session, "d1", "北京明天天气")
         _arm(session, "d2", "取消刚才那个")
-        with mock.patch.object(api, "USE_JEV", False), mock.patch.object(tools, "run_worker_job", as_worker(slow_orch)):
+        with jev_standin.standin(), mock.patch.object(tools, "run_worker_job", as_worker(slow_orch)):
             t1 = asyncio.create_task(session._coord_resolve("d1", "北京明天天气"))
             await asyncio.wait_for(started.wait(), 5)
             await session._coord_resolve("d2", "取消刚才那个")
@@ -130,7 +131,7 @@ class GatewayCoordControlTests(unittest.IsolatedAsyncioTestCase):
 
         _arm(session, "d1", "上海明天天气")
         _arm(session, "d2", "改成北京的")
-        with mock.patch.object(api, "USE_JEV", False), mock.patch.object(tools, "run_worker_job", as_worker(orch)):
+        with jev_standin.standin(), mock.patch.object(tools, "run_worker_job", as_worker(orch)):
             t1 = asyncio.create_task(session._coord_resolve("d1", "上海明天天气"))
             await asyncio.wait_for(started.wait(), 5)
             await session._coord_resolve("d2", "改成北京的")

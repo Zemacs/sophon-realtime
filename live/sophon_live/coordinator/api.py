@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from . import intent, jev_client
 from .clarify import clarify_for_slots, missing_slots_for_text
 from .ledger import Ledger
-from .route import build_route_questions, build_state, heuristic_control, heuristic_route, slot_edit
+from .route import build_route_questions, build_state, heuristic_control, slot_edit
 from .schemas import AdmitRequest, ControlDecision, PlaybackReceipt, SpeakPlan, TaskStatus, WorkerJob, WorkerResult, freshness_token_for
 from .schemas import FAILED_GENERIC, FIXED_FAILURES, NO_TOOL_ANSWER, is_tool_failure_sentence, tool_succeeded
 
@@ -27,8 +27,10 @@ class AdmitResult:
     ledger: Ledger | None = None
     control: ControlDecision | None = None  # set when a CONTROL op was applied (or refused)
     stale_task: tuple[str, int] | None = None  # (task_id, version) whose in-flight worker must stop
-    via: str = "heuristic"  # who decided: guard | jev | heuristic
+    via: str = "heuristic"  # who decided: guard | jev | secondary | degraded | heuristic (heuristic = heuristic_control only, frozen)
     jev_ms: float | None = None  # Karpo round trip, when JEV was asked
+    jev_state: str = "-"  # breaker state when this utterance was decided: closed | open | half_open | disabled
+    degraded_reason: str | None = None  # why JEV did not decide (typed: timeout | refused | http_5xx | bad_json | not_choice:<type> | breaker_open | jev_disabled | ...)
 
 
 def _clarify_text(text: str) -> str:
@@ -58,17 +60,71 @@ def _decision_label(res: "AdmitResult") -> str:
 
 async def admit(req: AdmitRequest, ledger: Ledger) -> AdmitResult:
     """Frontend → Coordinator. Wraps the routing with one structured, per-utterance decision log line."""
-    meta: dict = {"via": "heuristic", "jev_ms": None}
+    meta: dict = {"via": "heuristic", "jev_ms": None, "reason": None}
     t0 = time.monotonic()
     res = await _admit(req, ledger, meta)
     res.via = meta["via"]
     res.jev_ms = meta["jev_ms"]
+    res.degraded_reason = meta.get("reason")
+    res.jev_state = "disabled" if not USE_JEV else jev_client.breaker.state
     log.info(
-        "coord admit session=%s utt=%r route=%s decision=%s via=%s admit_ms=%d jev_ms=%s",
+        "coord admit session=%s utt=%r route=%s decision=%s via=%s admit_ms=%d jev_ms=%s%s %s",
         req.session_id, (req.delegate_task or req.text or "")[:60], res.route, _decision_label(res), res.via,
         (time.monotonic() - t0) * 1000, "-" if meta["jev_ms"] is None else int(meta["jev_ms"]),
+        f" reason={res.degraded_reason}" if res.degraded_reason else "", jev_client.stats.line(),
     )
     return res
+
+
+# What the user hears when JEV cannot tell a follow-up from a new request and a task is already running (fixed text, no rule).
+DEGRADED_ASK = "我这边判断模块暂时不可用，你是想改刚才那个，还是问个新的？"
+# Neutral pad for a degraded new task (never chosen from the user's words).
+DEGRADED_PAD = "稍等，我看一下。"
+
+
+async def _ask_jev(text: str, req: AdmitRequest, ledger: Ledger, questions: dict, meta: dict) -> tuple[dict | None, str | None]:
+    """Ask JEV for the route. Returns (response, None) if it gave a usable ``route`` choice, else (None, typed reason)."""
+    if not USE_JEV:
+        jev_client.note_fail("jev_disabled")
+        return None, "jev_disabled"
+    state = build_state(text, ledger, playback_active=req.playback_active)
+    t_jev = time.monotonic()
+    try:
+        resp = await jev_client.system_one(state, questions)
+    except Exception as e:  # noqa: BLE001
+        meta["jev_ms"] = (time.monotonic() - t_jev) * 1000
+        reason = e.reason if isinstance(e, jev_client.JevError) else "error"
+        log.warning("jev unavailable (%s): %s", reason, getattr(e, "detail", "") or repr(e)[:160])
+        return None, reason
+    meta["jev_ms"] = (time.monotonic() - t_jev) * 1000
+    types = jev_client.record_answers(resp, tuple(questions))
+    if jev_client.choice_answer(resp, "route") is None:
+        log.warning("jev answered but route is not a choice (type=%s); degraded, not routed by any rule", types.get("route"))
+        jev_client.note_fail(jev_client.NOT_CHOICE)
+        return None, f"{jev_client.NOT_CHOICE}:{types.get('route')}"
+    jev_client.note_ok()
+    meta["via"] = "jev"
+    return resp, None
+
+
+def _degraded(text: str, req: AdmitRequest, ledger: Ledger, meta: dict, reason: str) -> AdmitResult:
+    """JEV (and any secondary) did not decide. No keyword rule runs here:
+    - nothing running: it is a new task for the orchestrator (the front already chose to delegate it);
+    - a task is running or waiting for input: this layer cannot tell a follow-up from a new request, so it asks once, with a fixed sentence.
+    Either way the log line and TRACE say via=degraded and why. Stage 1: replace with a declared-kind answer_directly / secondary model."""
+    meta["via"], meta["reason"] = "degraded", reason
+    jev_client.note_degraded(reason)
+    if ledger.snapshot_for_jev():
+        log.warning("jev degraded (%s): task active -> fixed clarification, no routing guess", reason)
+        return AdmitResult(speak=SpeakPlan(kind="clarify", text=DEGRADED_ASK), route="CLARIFY", ledger=ledger)
+    log.warning("jev degraded (%s): no active task -> new task for the orchestrator", reason)
+    job = _new_job(ledger, text, language=req.language)
+    return AdmitResult(
+        speak=SpeakPlan(kind="pad", text=DEGRADED_PAD, task_id=job.task_id, version=job.version),
+        job=job,
+        route="WORKER",
+        ledger=ledger,
+    )
 
 
 async def _admit(req: AdmitRequest, ledger: Ledger, meta: dict) -> AdmitResult:
@@ -83,22 +139,23 @@ async def _admit(req: AdmitRequest, ledger: Ledger, meta: dict) -> AdmitResult:
             log.info("refine guard: %r edits %s v%s", text[:60], edit.task_id, edit.version)
             return _apply_control(edit, text, req, ledger)
 
-    if USE_JEV:
+    # Who decides the route. JEV (or a registered secondary with the same contract) answers; if neither gives a usable
+    # ``route`` choice the utterance is DEGRADED (see _degraded): no keyword rule is consulted (stage 0 / I-12).
+    questions = build_route_questions(ledger)
+    resp, reason = await _ask_jev(text, req, ledger, questions, meta)
+    if resp is None and jev_client.SECONDARY is not None:
         try:
-            state = build_state(text, ledger, playback_active=req.playback_active)
-            questions = build_route_questions(ledger)
-            t_jev = time.monotonic()
-            resp = await jev_client.system_one(state, questions)
-            meta["jev_ms"] = (time.monotonic() - t_jev) * 1000
-            route = jev_client.choice_answer(resp, "route") or heuristic_route(text, ledger)
-            control_key = jev_client.choice_answer(resp, "control")
-            meta["via"] = "jev"
-            log.info("jev route=%s control=%s utterance=%r", route, control_key, text[:80])
+            alt = await jev_client.SECONDARY(build_state(text, ledger, playback_active=req.playback_active), questions)
+            if jev_client.choice_answer(alt, "route"):
+                resp, meta["via"] = alt, "secondary"
+                log.warning("jev degraded (%s): secondary decided route=%s", reason, jev_client.choice_answer(alt, "route"))
         except Exception as e:  # noqa: BLE001
-            log.warning("jev unavailable, heuristic: %r", e)
-            route = heuristic_route(text, ledger)
-    else:
-        route = heuristic_route(text, ledger)
+            log.warning("secondary decision hook failed: %r", e)
+    if resp is None:
+        return _degraded(text, req, ledger, meta, reason or "error")
+    route = jev_client.choice_answer(resp, "route") or "WORKER"
+    control_key = jev_client.choice_answer(resp, "control")
+    log.info("jev route=%s control=%s utterance=%r", route, control_key, text[:80])
 
     if route == "STOP_SPEAKING":
         return AdmitResult(
@@ -133,7 +190,15 @@ async def _admit(req: AdmitRequest, ledger: Ledger, meta: dict) -> AdmitResult:
         decision = _parse_control_key(control_key)
         # JEV said CONTROL but named no usable target (or NEW): the Ledger decides what exists.
         if decision is None and control_key != "NEW":
+            # JEV said CONTROL but gave no usable target. Existing (frozen) heuristic_control stays for now; it is made
+            # visible, not extended. Stage-1 work: replace it with the same degraded handling as a missing route.
+            ctype = jev_client.answer_type(resp, "control")
+            log.warning("jev route=CONTROL but control answer is %s; falling back to heuristic_control (frozen rule)", ctype)
+            jev_client.note_degraded(f"control_not_choice:{ctype}")
+            meta["reason"] = f"control_not_choice:{ctype}"
             decision = heuristic_control(text, ledger)
+            if decision is not None:
+                meta["via"] = "heuristic"
         if decision is not None:
             return _apply_control(decision, text, req, ledger)
 

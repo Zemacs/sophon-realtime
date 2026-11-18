@@ -12,6 +12,7 @@ _LIVE_ROOT = Path(__file__).resolve().parents[1]
 if str(_LIVE_ROOT) not in sys.path:
     sys.path.insert(0, str(_LIVE_ROOT))
 
+from tests import jev_standin  # noqa: E402  (scripted JEV for control-flow tests)
 from sophon_live.assistant_tools import toolmeta
 from sophon_live.coordinator import AdmitRequest, Ledger, WorkerResult, api
 from sophon_live.coordinator.trace import TraceBook
@@ -131,14 +132,14 @@ class GatewayTraceTests(unittest.IsolatedAsyncioTestCase):
         session._trace().start("d1").set(task="北京明天天气")
         _arm(session, "d1", "北京明天天气")
         with self.assertLogs("sophon_live.trace", "INFO") as cm, \
-                mock.patch.object(api, "USE_JEV", False), mock.patch.object(tools, "run_worker_job", worker):
+                jev_standin.standin(), mock.patch.object(tools, "run_worker_job", worker):
             await session._coord_resolve("d1", "北京明天天气")
             session._delivery_armed("d1")              # what _post_update does once the engine took the result
             session._trace().response_started("r1")
             session._trace().response_played("r1")
         (t,) = _lines(cm)
         self.assertEqual(list(t["stages"]), ["deleg", "route", "worker_start", "worker_done", "say", "posted", "speech_start", "speech_end"])
-        self.assertEqual((t["route"], t["decision"], t["via"], t["worker"]), ("WORKER", "NEW", "heuristic", "completed"))
+        self.assertEqual((t["route"], t["decision"], t["via"], t["worker"]), ("WORKER", "NEW", "jev", "completed"))
         self.assertEqual(t["tools"], [{"tool": "get_weather", "ms": 812, "ok": True, "source": "sojson"}])
         self.assertEqual(t["say_chars"], len("北京明天晴。"))
 
@@ -146,11 +147,56 @@ class GatewayTraceTests(unittest.IsolatedAsyncioTestCase):
         session = _session()
         session._trace().start("f")
         _arm(session, "f", "谢谢")
-        with self.assertLogs("sophon_live.trace", "INFO") as cm, mock.patch.object(api, "USE_JEV", False):
+        with self.assertLogs("sophon_live.trace", "INFO") as cm, jev_standin.standin():
             await session._coord_resolve("f", "谢谢")
         (t,) = _lines(cm)
         self.assertIn("silent", t["stages"])
         self.assertEqual(t["decision"], "FAST")
+
+    async def test_degraded_turn_trace_has_jev_state_and_degraded_reason(self) -> None:
+        import sophon_live.assistant_tools as tools
+        from sophon_live.coordinator import jev_client
+
+        session = _session()
+
+        async def worker(job, instructions="", history=None):
+            return WorkerResult(job.task_id, job.version, "completed", "北京明天晴。",
+                                evidence=[{"tool": "get_weather", "args": {}, "ok": True, "ms": 5}], freshness_token=job.freshness_token)
+
+        async def refused(state, questions):  # noqa: ANN001
+            raise jev_client.JevError("refused", "connection refused")
+
+        session._trace().start("d1").set(task="北京明天天气")
+        _arm(session, "d1", "北京明天天气")
+        with self.assertLogs("sophon_live.trace", "INFO") as cm, mock.patch.object(api, "USE_JEV", True), \
+                mock.patch.object(api, "REFINE_GUARD", False), mock.patch.object(jev_client, "system_one", refused), \
+                mock.patch.object(tools, "run_worker_job", worker):
+            await session._coord_resolve("d1", "北京明天天气")
+            session._delivery_armed("d1")
+            session._trace().response_started("r1")
+            session._trace().response_played("r1")
+        (t,) = _lines(cm)
+        self.assertEqual((t["route"], t["decision"], t["via"], t["degraded_reason"], t["jev_state"]), ("WORKER", "NEW", "degraded", "refused", "closed"))
+        self.assertEqual(t["worker"], "completed")
+
+    async def test_normal_turn_trace_has_state_and_no_degraded_reason(self) -> None:
+        import sophon_live.assistant_tools as tools
+
+        session = _session()
+
+        async def worker(job, instructions="", history=None):
+            return WorkerResult(job.task_id, job.version, "completed", "好。", evidence=[], freshness_token=job.freshness_token)
+
+        session._trace().start("d1").set(task="讲个笑话")
+        _arm(session, "d1", "讲个笑话")
+        with self.assertLogs("sophon_live.trace", "INFO") as cm, jev_standin.standin(), mock.patch.object(tools, "run_worker_job", worker):
+            await session._coord_resolve("d1", "讲个笑话")
+            session._delivery_armed("d1")
+            session._trace().response_started("r1")
+            session._trace().response_played("r1")
+        (t,) = _lines(cm)
+        self.assertEqual((t["via"], t["jev_state"]), ("jev", "closed"))
+        self.assertNotIn("degraded_reason", t)
 
 
 if __name__ == "__main__":

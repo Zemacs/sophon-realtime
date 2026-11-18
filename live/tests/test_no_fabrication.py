@@ -163,8 +163,21 @@ class FinishJobGuardTests(unittest.TestCase):
         self.assertEqual((out.kind, out.rejected, out.text), ("answer", "", "北京晴，零下三到十一度。"))
         self.assertEqual(led.tasks[rec.task_id].status, TaskStatus.COMPLETED)
 
-    def test_failed_tool_with_honest_apology_is_allowed(self) -> None:
-        _, _, out = self._run([{"tool": "get_weather", "ok": False}])
+    def test_failed_tool_call_is_not_evidence_either(self) -> None:
+        # Critic B-1 (r4): "successful tool evidence". After a failed tool the model only guesses, so even an
+        # apologetic-looking completed answer is replaced by the plain failure sentence. (Replaces the r1 test that
+        # let a completed answer through when the tool had failed: a deliberate tightening, not a relaxed expectation.)
+        led, rec, out = self._run([{"tool": "get_weather", "ok": False}])
+        self.assertEqual((out.text, out.rejected), (NO_TOOL_ANSWER, "tool_failed"))
+        self.assertEqual(led.tasks[rec.task_id].status, TaskStatus.FAILED)
+
+    def test_refused_or_slot_less_call_is_not_evidence(self) -> None:
+        for ev in ({"tool": "get_weather", "ok": False, "refused": "out_of_scope"}, {"tool": "get_weather", "missing": ["city"]}):
+            _, _, out = self._run([ev])
+            self.assertEqual(out.text, NO_TOOL_ANSWER, ev)
+
+    def test_failed_then_successful_call_is_enough(self) -> None:
+        _, _, out = self._run([{"tool": "get_weather", "ok": False}, {"tool": "get_weather", "ok": True}])
         self.assertEqual(out.rejected, "")
 
     def test_jobs_with_no_requirement_are_untouched(self) -> None:

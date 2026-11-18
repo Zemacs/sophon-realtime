@@ -740,7 +740,8 @@ class LiveSession:
             tr.set(worker=result.status)
             for ev in result.evidence:
                 tr.add_tool(ev.get("tool", "?"), ev.get("ms"), bool(ev.get("ok")), source=ev.get("source"), fallbacks=ev.get("fallbacks"),
-                            orig_source=ev.get("orig_source"), age_s=ev.get("age_s"))
+                            orig_source=ev.get("orig_source"), age_s=ev.get("age_s"),
+                            city=ev.get("city"), tmin=ev.get("tmin"), tmax=ev.get("tmax"), now=ev.get("now"))
         outcome = finish_job(ledger, job, result)    # the Coordinator decides what gets said; stale results are dropped
         if tr is not None and job.require_tools:
             tr.set(require=",".join(job.require_tools), **({"guard": outcome.rejected} if outcome.rejected else {}))

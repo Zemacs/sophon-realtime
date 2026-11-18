@@ -143,9 +143,18 @@ def _ungrounded_city(name: str, args: dict, msgs: list[dict[str, Any]]) -> bool:
 
 
 def _evidence_has_required(job: WorkerJob, evidence: list[dict]) -> bool:
-    """True when the job needs no tool, or at least one of its required tools was actually called."""
+    """True when the job needs no tool, or at least one of its required tools was called AND succeeded (``ok``)."""
     req = [t for t in (job.require_tools or []) if _in_scope(job, t)]
-    return not req or any(ev.get("tool") in req for ev in evidence)
+    return not req or any(ev.get("tool") in req and ev.get("ok") is not False and not ev.get("missing") for ev in evidence)
+
+
+def _tool_failure_text(out: str) -> str:
+    """What to say when a required tool ran and failed: the tool's own plain sentence (it is honest by construction),
+    never model text. Machine-looking output (JSON) falls back to the generic sentence."""
+    t = (out or "").strip()
+    if not t or t.startswith(("{", "[")) or len(t) > 120 or "\n" in t:
+        return NO_TOOL_ANSWER
+    return t
 
 
 def _force_choice(job: WorkerJob) -> Any:
@@ -174,6 +183,7 @@ def _result(job: WorkerJob, status: str, text: str, evidence: list[dict], slots:
         spoken_answer=text,
         evidence=evidence,
         needs_slots=slots or [],
+        freshness_token=job.freshness_token,
     )
 
 
@@ -306,6 +316,11 @@ async def run_job(
                     or "不可用" in out
                 )
                 evidence.append({"tool": name, "args": args, "ok": not failed, "ms": tool_ms, **tool_meta})
+                if failed and name in required:
+                    # A tool-backed job whose tool failed: say so plainly. The model never gets to word it, it could
+                    # "recover" with numbers of its own (Critic B-1).
+                    log.warning("orch step=%d required tool %s failed -> failed with the tool's own sentence", step, name)
+                    return _result(job, "failed", _tool_failure_text(out), evidence)
                 news_ok = name == "get_news" and ("第1条" in out or "Headlines on" in out) and not failed
                 weather_ok = name == "get_weather" and ("度" in out or "°" in out or "°C" in out) and not failed
                 if news_ok or weather_ok:

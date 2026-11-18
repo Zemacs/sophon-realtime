@@ -310,6 +310,13 @@ async def _first_ok(query_name: str, display_name: str, idx: int, zh: bool) -> t
     return None, "", notes
 
 
+def _facts(data: dict[str, Any] | None, name: str) -> dict[str, Any]:
+    """What the spoken text is made of (city + temperatures): kept in the trace so a spoken answer can be checked against it."""
+    if not data:
+        return {}
+    return {"city": name, "tmin": data.get("tmin"), "tmax": data.get("tmax"), "now": data.get("now")}
+
+
 async def run_detailed(args: dict[str, Any] | None = None) -> tuple[str, dict[str, Any]]:
     """Spoken weather text plus metadata (source, latency) for tracing. Never invents data."""
     args = args or {}
@@ -336,10 +343,10 @@ async def run_detailed(args: dict[str, Any] | None = None) -> tuple[str, dict[st
     hit = CACHE.get(ckey)
     age_s = (time.time() - hit[0]) if hit else None
     if hit and age_s is not None and age_s <= _cache_ttl():
-        return _compose(hit[1], name, when, idx, zh), {"source": "cache", "ms": 0, "notes": [], "age_s": round(age_s), "orig_source": hit[2]}
+        return _compose(hit[1], name, when, idx, zh), {"source": "cache", "ms": 0, "notes": [], "age_s": round(age_s), "orig_source": hit[2], **_facts(hit[1], name)}
 
     data, source, notes = await _first_ok(query_name, name, idx, zh)
-    meta = {"source": source or None, "ms": round((time.monotonic() - t0) * 1000), "notes": notes}
+    meta = {"source": source or None, "ms": round((time.monotonic() - t0) * 1000), "notes": notes, **_facts(data, name)}
     if data is None and notes and all(n.endswith(":no_data") for n in notes):
         # every source answered but none knows this city/day: not an outage
         return (f"找不到{display_name}的天气信息。" if zh else f"No weather data for {display_name}."), meta
@@ -350,7 +357,7 @@ async def run_detailed(args: dict[str, Any] | None = None) -> tuple[str, dict[st
             old = {**hit[1], "now": None}  # a "current temperature" that old is not current
             body = _compose(old, name, when, idx, zh)
             lead = f"网络不太好，这是{mins}分钟前查到的：" if zh else f"The network is poor; this is from {mins} min ago: "
-            meta.update(source="cache-stale", age_s=round(age_s), orig_source=hit[2])
+            meta.update(source="cache-stale", age_s=round(age_s), orig_source=hit[2], **_facts(old, name))
             return lead + body, meta
         if zh:
             return f"暂时查不到{display_name}的天气，请稍后再试。", meta
@@ -382,5 +389,6 @@ async def run(args: dict[str, Any] | None = None) -> str:
     from . import toolmeta
 
     toolmeta.note(source=meta.get("source"), fallbacks=len(meta.get("notes") or []) or None,
-                  orig_source=meta.get("orig_source"), age_s=meta.get("age_s"))
+                  orig_source=meta.get("orig_source"), age_s=meta.get("age_s"),
+                  city=meta.get("city"), tmin=meta.get("tmin"), tmax=meta.get("tmax"), now=meta.get("now"))
     return text

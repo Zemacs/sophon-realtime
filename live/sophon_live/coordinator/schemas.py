@@ -41,6 +41,11 @@ class SpeakPlan:
     version: int | None = None
 
 
+def freshness_token_for(task_id: str, version: int) -> str:
+    """The one place that spells the token: it names exactly one (task_id, version) of the Ledger."""
+    return f"{task_id}:{version}"
+
+
 @dataclass
 class WorkerJob:
     task_id: str
@@ -63,6 +68,7 @@ class WorkerResult:
     spoken_answer: str
     evidence: list[dict[str, Any]] = field(default_factory=list)
     needs_slots: list[str] = field(default_factory=list)
+    freshness_token: str = ""  # the Worker echoes the job's token; the Coordinator refuses a result whose token is not the job's
 
 
 @dataclass

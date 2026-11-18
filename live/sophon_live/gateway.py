@@ -976,15 +976,34 @@ def runtime_banner(env=None) -> tuple[str, bool]:  # noqa: ANN001
             f"Set SOPHON_LIVE_COORD=1 (see docs/runbook-path1-coord.md); ORCH={int(orch)}"), False
 
 
-def main() -> None:
+def _default_host() -> str:
+    """Bind address when --host is not given (Critic S-25): loopback. The gateway has no auth of its own, so exposing it is an explicit
+    decision: ``--host 0.0.0.0`` or ``SOPHON_LIVE_HOST=0.0.0.0`` (docs/runbook-path1-coord.md §4). Everything in this repo reaches it through
+    127.0.0.1 (SSH tunnel from the web client, or on-box scripts)."""
+    return os.environ.get("SOPHON_LIVE_HOST", "").strip() or "127.0.0.1"
+
+
+def _build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--host", default="0.0.0.0"); ap.add_argument("--port", type=int, default=8780)
+    ap.add_argument("--host", default=_default_host()); ap.add_argument("--port", type=int, default=8780)
     ap.add_argument("--engine", default="ws://127.0.0.1:8000/v1/realtime")
     ap.add_argument("--bridge", default="http://127.0.0.1:8700")
     ap.add_argument("--asr", default=os.environ.get("SOPHON_LIVE_ASR", "Qwen/Qwen3-ASR-0.6B-hf"))
     ap.add_argument("--path", default="/v1/live/sessions")
-    args = ap.parse_args()
+    return ap
+
+
+def _exposure_note(host: str) -> str:
+    """Startup line about who can connect: loopback is quiet, anything wider says so (the gateway has no authentication)."""
+    if host in ("127.0.0.1", "localhost", "::1"):
+        return f"gateway bound to loopback {host} (reach it through an SSH tunnel / on-box clients)"
+    return f"gateway bound to {host}: reachable from every network this machine is on; the gateway has NO authentication, rely on the firewall"
+
+
+def main() -> None:
+    args = _build_parser().parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    (log.info if args.host in ("127.0.0.1", "localhost", "::1") else log.warning)("%s", _exposure_note(args.host))
     asr = ASR(args.asr) if args.asr else None
     if asr is not None:
         asr(np.zeros(16000, np.float32))                         # warm up

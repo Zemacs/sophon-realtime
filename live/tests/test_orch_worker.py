@@ -81,6 +81,28 @@ class RunJobTests(unittest.IsolatedAsyncioTestCase):
         rt.assert_not_awaited()
         self.assertEqual(len(sess.posts), 1)  # stopped at once, no second LLM round
 
+    async def test_invented_city_is_a_missing_slot_not_a_forecast(self) -> None:
+        sess = _FakeSession([_FakeResp(200, _tool_call("get_weather", '{"city":"上海","when":"tomorrow"}'))])
+        rt = mock.AsyncMock(return_value="should not run")
+        with mock.patch.object(orch.aiohttp, "ClientSession", return_value=sess), mock.patch.object(orch, "run_tool", new=rt):
+            res = await orch.run_job(_job("明天天气怎么样"))
+        self.assertEqual((res.status, res.needs_slots), ("needs_input", ["city"]))
+        rt.assert_not_awaited()
+
+    async def test_city_from_the_request_history_or_translation_is_fine(self) -> None:
+        cases = [
+            ("上海明天天气", None, '{"city":"上海"}'),
+            ("那明天呢", [{"task": "北京今天天气", "answer": "北京今天晴"}], '{"city":"北京"}'),
+            ("北京明天天气", None, '{"city":"Beijing"}'),   # the model may translate a city the user did say
+        ]
+        for obj, hist, args in cases:
+            sess = _FakeSession([_FakeResp(200, _tool_call("get_weather", args)), _FakeResp(200, _say("好"))])
+            rt = mock.AsyncMock(return_value="ok")
+            with mock.patch.object(orch.aiohttp, "ClientSession", return_value=sess), mock.patch.object(orch, "run_tool", new=rt):
+                res = await orch.run_job(_job(obj), history=hist)
+            self.assertEqual(res.status, "completed", obj)
+            rt.assert_awaited_once()
+
     async def test_tool_outside_job_scope_is_refused(self) -> None:
         sess = _FakeSession([
             _FakeResp(200, _tool_call("device_control", '{"op":"x"}')),
@@ -171,6 +193,9 @@ class GatewayWorkerTests(unittest.IsolatedAsyncioTestCase):
             tid = session.coord_ledger.order[0]
             self.assertEqual(session.coord_ledger.tasks[tid].status, TaskStatus.NEEDS_INPUT)
             self.assertEqual(len(_commentary(session)), 1)  # exactly one thing was said: the C-worded question
+            said = "".join(c for _, c in session.deleg["d1"]["chunks"])
+            self.assertIn("请问您想查哪个城市的天气？", said)
+            self.assertIn("问出口", said)  # the front is told to voice it as a question, not to paraphrase it away
             await session._coord_resolve("d2", "北京的")
         self.assertEqual(len(seen), 2)
         self.assertIn("用户补充：北京的", seen[1])

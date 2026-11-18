@@ -16,6 +16,7 @@ from typing import Any
 
 import aiohttp
 
+from ..coordinator import slots
 from ..coordinator.clarify import clarify_for_slots
 from ..coordinator.schemas import WorkerJob, WorkerResult
 from . import toolmeta
@@ -124,6 +125,23 @@ def _missing_required(name: str, args: dict) -> list[str]:
     return []
 
 
+def _ungrounded_city(name: str, args: dict, msgs: list[dict[str, Any]]) -> bool:
+    """True when the model made up a weather city: not in what the user said, the recent turns, or a tool result.
+
+    "明天天气怎么样" must not become 上海 because the model likes Shanghai. Lenient on purpose: if any known city is
+    mentioned anywhere (the model may translate 北京 to Beijing), the argument is treated as grounded."""
+    if name != "get_weather":
+        return False
+    city = str(args.get("city") or "").strip()
+    if not city:
+        return False
+    seen = "\n".join(str(m.get("content") or "") for m in msgs if m.get("role") in ("user", "tool"))
+    bare = city.rstrip("市")
+    if city in seen or (bare and bare in seen):
+        return False
+    return not any(c in seen for c in slots.CITY_NAMES)
+
+
 def _in_scope(job: WorkerJob, name: str) -> bool:
     scope = job.tool_scope or ["*"]
     return "*" in scope or name in scope
@@ -217,6 +235,9 @@ async def run_job(
                     msgs.append({"role": "tool", "tool_call_id": tc.get("id") or name, "content": out})
                     continue
                 missing = _missing_required(name, args)
+                if not missing and _ungrounded_city(name, args, msgs):
+                    log.info("orch step=%d get_weather city=%r is not grounded in the request -> needs_input", step, args.get("city"))
+                    missing = ["city"]
                 if missing:
                     # the Worker never asks the caller: report the gap, the C layer words the CLARIFY
                     log.info("orch step=%d tool=%s missing=%s -> needs_input", step, name, missing)

@@ -81,6 +81,7 @@ UPDATE_FMT = {
            "progress, background, or repeats what you already said: if you spoke less than 6 s ago, output only <wait> and say nothing; if the "
            "user has been waiting a while, you may say one very short, natural line (not a repeat) asking them to hold on."),
 }
+ASK_PREFIX = {"zh": "（这是要向用户追问的问题，请直接把这个问题问出口，不要改成陈述句）", "en": "(This is a question to ask the user: ask it out loud, do not turn it into a statement) "}
 UPDATE_PARTS = {"zh": ("要转达给用户的内容：", "后端的进度 / 思考（不用照读）：", "（还没有新内容）"),
                 "en": ("Content to pass on to the user: ", "Backend progress / thinking (don't read it out): ", "(nothing new yet)")}
 RESULT_MIN_CHARS = int(os.environ.get("SOPHON_LIVE_RESULT_MIN_CHARS", "15"))    # shorter commentary = a progress line
@@ -599,10 +600,12 @@ class LiveSession:
             log.warning("session %s ack delegation %s failed: %s", self.id, did, e)
         self._trace().silent(did)
 
-    async def _coord_say(self, did: str, text: str, track: tuple[str, int] | None = None) -> None:
+    async def _coord_say(self, did: str, text: str, track: tuple[str, int] | None = None, ask: bool = False) -> None:
         d = self.deleg.get(did)
         if d is None:
             return
+        if ask:                                      # a C-layer question: the front must voice the question itself, not paraphrase it away
+            text = ASK_PREFIX[self.lang] + text
         tr = self._trace().get(did)
         if tr is not None:
             tr.mark("say")
@@ -678,7 +681,8 @@ class LiveSession:
                 and ledger.tasks.get(result.speak.task_id) is not None
                 and result.speak.text == ledger.tasks[result.speak.task_id].spoken_answer
             )
-            await self._coord_say(did, result.speak.text, (result.speak.task_id, result.speak.version) if replay else None)  # type: ignore[arg-type]
+            await self._coord_say(did, result.speak.text, (result.speak.task_id, result.speak.version) if replay else None,  # type: ignore[arg-type]
+                                  ask=result.speak.kind == "clarify")
             return
         job = result.job
         if job is None:
@@ -720,7 +724,7 @@ class LiveSession:
             await self._ack_delegation(did, "这个任务已被取消或改口，不用再说什么。")
             return
         if outcome.kind == "clarify":                # Worker reported missing slots; C layer words the question
-            await self._coord_say(did, outcome.text)
+            await self._coord_say(did, outcome.text, ask=True)
             return
         text = outcome.text
         if not hasattr(self, "orch_history"):

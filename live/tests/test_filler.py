@@ -54,6 +54,7 @@ class SystemPromptTests(unittest.TestCase):
         self.assertIn("我帮你查一下", p)
         self.assertIn("好的，马上", p)
         self.assertIn("讲笑话，不要说任何过渡语", p)
+        self.assertIn("绝不能只说过渡语就结束", p)         # v0.1.0: lead-in alone must never end the turn (zh_memory / zh_light regression)
         s.lang = "en"
         self.assertIn("a joke, say nothing", s._sys())
 

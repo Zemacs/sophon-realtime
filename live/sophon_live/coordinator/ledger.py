@@ -107,6 +107,24 @@ class Ledger:
         rec.status = TaskStatus.CANCELLED
         return True
 
+    def mark_delivered(self, task_id: str, version: int) -> bool:
+        """The answer was heard to the end. Only a completed task at this version can become DELIVERED."""
+        rec = self.tasks.get(task_id)
+        if rec is None or rec.version != version:
+            return False
+        if rec.status == TaskStatus.COMPLETED:
+            rec.status = TaskStatus.DELIVERED
+            return True
+        return rec.status == TaskStatus.DELIVERED
+
+    def note_interrupted(self, task_id: str, version: int) -> bool:
+        """Playback was cut off (barge-in / dropped). The task keeps its status: not cancelled, still re-playable."""
+        rec = self.tasks.get(task_id)
+        if rec is None or rec.version != version:
+            return False
+        rec.interrupted += 1
+        return True
+
     def snapshot_for_jev(self) -> list[dict]:
         out = []
         for rec in self.active()[-5:]:

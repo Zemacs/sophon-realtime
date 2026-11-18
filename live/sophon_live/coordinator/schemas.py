@@ -90,3 +90,4 @@ class TaskRecord:
     status: TaskStatus = TaskStatus.QUEUED
     spoken_answer: str = ""
     constraints: list[dict[str, Any]] = field(default_factory=list)
+    interrupted: int = 0  # how many times playback of the answer was cut off (answer stays re-playable)

@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from . import jev_client
 from .ledger import Ledger
 from .route import build_route_questions, build_state, heuristic_control, heuristic_route
-from .schemas import AdmitRequest, ControlDecision, SpeakPlan, TaskStatus, WorkerJob
+from .schemas import AdmitRequest, ControlDecision, PlaybackReceipt, SpeakPlan, TaskStatus, WorkerJob
 
 log = logging.getLogger("sophon_live.coordinator")
 
@@ -215,3 +215,13 @@ def complete_job(ledger: Ledger, job: WorkerJob, answer: str) -> bool:
         log.info("drop stale worker result %s v%s (task now v%s %s)", job.task_id, job.version, rec.version, rec.status.value)
         return False
     return ledger.mark_completed(job.task_id, answer)
+
+
+def on_playback_receipt(ledger: Ledger, receipt: PlaybackReceipt) -> bool:
+    """Delivery → Coordinator. 听完 = DELIVERED; 打断 / 放弃 never cancel anything and keep the answer re-playable.
+
+    Returns True when the receipt matched a live (task_id, version).
+    """
+    if receipt.outcome == "delivered":
+        return ledger.mark_delivered(receipt.task_id, receipt.version)
+    return ledger.note_interrupted(receipt.task_id, receipt.version)

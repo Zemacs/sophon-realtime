@@ -4,7 +4,8 @@ Frontend (Tag/Live) admits utterances here; Worker (assistant_tools) only runs W
 See deplux docs/sophon-jarvis-frontend-backend-architecture.md.
 """
 
-from .api import AdmitResult, admit, complete_job
+from .api import AdmitResult, admit, complete_job, on_playback_receipt
+from .delivery import DeliveryTracker
 from .ledger import Ledger
 from .schemas import (
     AdmitRequest,
@@ -30,4 +31,6 @@ __all__ = [
     "WorkerResult",
     "admit",
     "complete_job",
+    "on_playback_receipt",
+    "DeliveryTracker",
 ]

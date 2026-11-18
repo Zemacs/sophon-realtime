@@ -303,6 +303,8 @@ class LiveSession:
         out = UPDATE_FMT[self.lang].format(t=time.monotonic() - d["t0"], gap=gap_s, body=body, last=(self.last_said or "")[-80:])
         d["posted_any"] = True
         ok = await self.engine.tool_result(d["call_id"], out, speak=True)
+        if ok:
+            self._delivery_armed(did)
         log.info("delegation %s -> update posted ok=%s (%d commentary chars, %d thinking chars)", did, ok, len(com), len(thk))
 
     async def _idle_update(self, did: str) -> None:
@@ -400,6 +402,8 @@ class LiveSession:
         else:
             out = "\n\n".join(x for x in (fmt_c.format(c=com) if com else "", fmt_t.format(c=thk) if thk else "") if x)
         ok = await self.engine.tool_result(d["call_id"], out, speak=True)
+        if ok:
+            self._delivery_armed(did)
         log.info("delegation %s -> %s posted ok=%s (%d commentary chars, %d thinking chars)", did, "progress" if progress else "result", ok, len(com), len(thk))
 
     # ------------------------------------------------------------- input transcript
@@ -432,10 +436,37 @@ class LiveSession:
                 self.bi_voiced = 0
                 self._drop_playback("barge-in (gateway VAD)")
 
+    # ------------------------------------------------------------- delivery receipts (D layer glue; logic in coordinator/delivery.py)
+    def _delivery(self):
+        from .coordinator import DeliveryTracker
+        if not hasattr(self, "delivery"):
+            self.delivery = DeliveryTracker()
+        return self.delivery
+
+    def _apply_receipts(self, receipts) -> None:
+        from .coordinator import on_playback_receipt
+        ledger = getattr(self, "coord_ledger", None)
+        for rc in receipts:
+            ok = on_playback_receipt(ledger, rc) if ledger is not None else False
+            log.info("session %s receipt %s task=%s v%s applied=%s", self.id, rc.outcome, rc.task_id, rc.version, ok)
+
+    def _receipt_played(self, rid: str) -> None:
+        rc = self._delivery().on_played(rid)
+        if rc is not None:
+            self._apply_receipts([rc])
+
+    def _delivery_armed(self, did: str) -> None:
+        """A tracked result was just handed to the front: the next response that starts carries it."""
+        d = self.deleg.get(did)
+        track = d.pop("track", None) if d else None
+        if track:
+            self._delivery().arm(*track)
+
     def _drop_playback(self, why: str) -> None:
         self.play.clear(); self.play_buf = np.zeros(0, np.int16)
         for r in self.resp.values():
             r["text"] = r["text"][: r["released"]]; r["done"] = True; r["dropped"] = True
+        self._apply_receipts(self._delivery().on_interrupted())     # 打断 ≠ 取消：只记回执，任务与结果原样保留
         log.info("session %s %s: playback dropped", self.id, why)
 
     def _cut_user(self) -> asyncio.Task | None:
@@ -482,6 +513,7 @@ class LiveSession:
                     prev = self.last_text.rstrip()
                     lead = ("。" if self.lang == "zh" else ". ") if prev and prev[-1] not in "。！？.!?，,～…" else ""
                     self.resp[rid] = {"text": lead, "released": 0, "audio_s": 0.0, "played_s": 0.0, "start_ms": None, "done": False, "asr": task}
+                    self._delivery().attach(rid)
                 r = self.resp[rid]
                 if r.get("dropped"):
                     continue
@@ -554,10 +586,12 @@ class LiveSession:
         except Exception as e:  # noqa: BLE001
             log.warning("session %s ack delegation %s failed: %s", self.id, did, e)
 
-    async def _coord_say(self, did: str, text: str) -> None:
+    async def _coord_say(self, did: str, text: str, track: tuple[str, int] | None = None) -> None:
         d = self.deleg.get(did)
         if d is None:
             return
+        if track is not None:
+            d["track"] = track                       # armed for a delivery receipt once the result is handed to the front
         await self.send({"type": "session.commentary.appended", "start_ms": self.timeline_ms, "end_ms": self.timeline_ms,
                          "client_event_id": "coord"})
         d["chunks"].append(("commentary", text))
@@ -606,7 +640,16 @@ class LiveSession:
             await self._ack_delegation(did, "已停止播报，不需要再说什么。")
             return
         if result.speak.kind in ("clarify", "answer") and result.speak.text and result.job is None:
-            await self._coord_say(did, result.speak.text)
+            replay = (
+                result.speak.kind == "answer"
+                and result.control is not None
+                and result.control.op == "STATUS"
+                and result.speak.task_id is not None
+                and result.speak.version is not None
+                and ledger.tasks.get(result.speak.task_id) is not None
+                and result.speak.text == ledger.tasks[result.speak.task_id].spoken_answer
+            )
+            await self._coord_say(did, result.speak.text, (result.speak.task_id, result.speak.version) if replay else None)  # type: ignore[arg-type]
             return
         job = result.job
         if job is None:
@@ -641,7 +684,7 @@ class LiveSession:
         self.orch_history.append({"task": job.objective, "answer": text})
         if len(self.orch_history) > 12:
             self.orch_history = self.orch_history[-12:]
-        await self._coord_say(did, text)
+        await self._coord_say(did, text, (job.task_id, job.version))
 
     async def _orch_resolve(self, did: str, what: str | None) -> None:
         """Path-1 co-located orchestrator: local text LLM selects tools; tools run on this host."""
@@ -726,6 +769,8 @@ class LiveSession:
             if r["start_ms"] is None or r["released"] >= len(r["text"]):
                 if r["done"] and r["start_ms"] is not None and r["released"] >= len(r["text"]) and not self.play and self.play_buf.size == 0:
                     self.resp.pop(rid, None)
+                    if not r.get("dropped"):
+                        self._receipt_played(rid)                # heard to the end
                 continue
             if r.get("asr") is not None and not r["asr"].done():
                 continue                                          # the user's words go out before the reply's
@@ -754,6 +799,9 @@ class LiveSession:
         if self.closed:
             return
         self.closed = True
+        self._apply_receipts(self._delivery().on_close())
+        for w in list(getattr(self, "coord_workers", {}).values()):
+            w.cancel()
         for t in self.tasks:
             t.cancel()
         try:

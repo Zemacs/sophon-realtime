@@ -314,8 +314,20 @@ class LiveSession:
             return
         await self._post_update(did, chunks)
 
-    async def _post_update(self, did: str, chunks: list, *, pad: bool = False) -> None:
+    async def _post_update(self, did: str, chunks: list, *, pad: bool = False) -> bool:
         d = self.deleg[did]
+        # One delegation posts one update at a time, in order. A pad takes its turn only while no result has been handed
+        # over and it has not been cancelled; checked HERE, under the lock, right before the engine call (Critic I-6), so a
+        # Worker that finishes while the pad waits or posts can never put the pad behind the result.
+        async with d.setdefault("post_lock", asyncio.Lock()):
+            if pad and (d.get("said_result") or d.get("pad_cancelled")):
+                return False
+            await self._post_update_locked(did, d, chunks, pad=pad)
+            if pad:
+                d["pad_sent"] = True
+            return True
+
+    async def _post_update_locked(self, did: str, d: dict, chunks: list, *, pad: bool) -> None:
         if d.get("idle_timer") is not None:
             d["idle_timer"].cancel(); d["idle_timer"] = None
         pc, pt, pn = UPDATE_PARTS[self.lang]
@@ -619,7 +631,8 @@ class LiveSession:
             return
         self._cancel_pad(d)
         try:
-            await self.engine.tool_result(d["call_id"], note, speak=False)
+            async with d.setdefault("post_lock", asyncio.Lock()):      # after any pad already on its way
+                await self.engine.tool_result(d["call_id"], note, speak=False)
         except Exception as e:  # noqa: BLE001
             log.warning("session %s ack delegation %s failed: %s", self.id, did, e)
         self._trace().silent(did)
@@ -647,9 +660,14 @@ class LiveSession:
 
     @staticmethod
     def _cancel_pad(d: dict) -> None:
-        t = d.pop("pad_task", None)
-        if t is not None and not t.done():
-            t.cancel()
+        """No pad from now on. Also stops a pad still sleeping; one already inside its post is left to finish (cancelling a
+        half-sent request is worse) and, because posts are serialized, the result goes out after it, never before."""
+        d["pad_cancelled"] = True
+        t = d.get("pad_task")
+        if t is not None and not d.get("pad_posting"):
+            d.pop("pad_task", None)
+            if not t.done():
+                t.cancel()
 
     async def _coord_pad(self, did: str, text: str) -> None:
         """Deliver the Coordinator's SpeakPlan(kind="pad") while the Worker runs (Critic I-2).
@@ -672,9 +690,13 @@ class LiveSession:
         if heard and time.monotonic() - heard < PAD_FRONT_QUIET_S:
             self._trace_pad(did, text, "front_spoke")
             return
-        d.pop("pad_task", None)                        # past the point of cancellation: the post below is atomic enough
-        await self._post_update(did, [("commentary", text)], pad=True)
-        self._trace_pad(did, text, "posted")
+        d["pad_posting"] = True                        # from here cancel() leaves the task alone; _post_update re-checks under its lock
+        try:
+            sent = await self._post_update(did, [("commentary", text)], pad=True)
+        finally:
+            d["pad_posting"] = False
+            d.pop("pad_task", None)
+        self._trace_pad(did, text, "posted" if sent else "skipped_result_first")
 
     def _trace_pad(self, did: str, text: str, outcome: str) -> None:
         tr = self._trace().get(did)

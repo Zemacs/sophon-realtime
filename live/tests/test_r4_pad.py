@@ -143,6 +143,99 @@ class PadTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(s.deleg["p1"].get("pad_task"))
 
 
+class _SlowPadEngine(_Engine):
+    """tool_result takes `delay` s when the update carries the pad text: models the HTTP round trip (the await in which a Worker can finish)."""
+
+    def __init__(self, delay: float) -> None:
+        super().__init__()
+        self.delay = delay
+
+    async def tool_result(self, call_id, output, speak=True):  # noqa: ANN001
+        if "要转达给用户的内容：我帮你查一下。" in output:
+            await asyncio.sleep(self.delay)
+        return await super().tool_result(call_id, output, speak)
+
+
+def _kinds(session) -> list[str]:
+    return ["pad" if "我帮你查一下。" in o and "1到8度" not in o else "answer" if "1到8度" in o else "other" for _, o, _ in session.engine.results]
+
+
+class PadRaceTests(unittest.IsolatedAsyncioTestCase):
+    """Critic I-6: the Worker finishing while the pad is on its way (past the point where cancel still works)."""
+
+    async def _go(self, session, worker_delay: float, did="r1"):
+        import sophon_live.assistant_tools as tools
+        import sophon_live.coordinator as coord
+
+        _arm(session, did, "北京明天天气")
+        session._trace().start(did)
+        with mock.patch.object(coord, "admit", _admit("我帮你查一下。")), mock.patch.object(tools, "run_worker_job", _worker(worker_delay)), \
+                mock.patch.object(gw, "PAD_GRACE_S", 0.05), mock.patch.object(gw, "DELEG_MODE", "model"):
+            await session._coord_resolve(did, "北京明天天气")
+        for _ in range(40):                                        # let a pad still in flight settle, then judge the order
+            await asyncio.sleep(0.02)
+            if not session.deleg[did].get("pad_posting"):
+                break
+        await asyncio.sleep(0.05)
+
+    async def test_worker_finishing_during_the_pad_post_never_puts_the_pad_behind_the_result(self) -> None:
+        s = _session()
+        s.engine = _SlowPadEngine(0.30)                            # pad starts at 0.05 s and is still in flight when the Worker ends at 0.15 s
+        await self._go(s, 0.15)
+        self.assertEqual(_kinds(s), ["pad", "answer"])             # in order: the result waited for the pad's turn, it did not overtake it
+        self.assertEqual(s._trace().get("r1").as_dict()["pad"], "posted")
+
+    async def test_critics_probe_shape_delay_before_the_post_the_pad_is_dropped(self) -> None:
+        """runs/incr-1/pad_race_probe2.py: the pad's _post_update is held back 0.25 s, the Worker ends at 0.12 s."""
+        s = _session()
+        real = s._post_update
+
+        async def held_back(did, chunks, pad=False):  # noqa: ANN001
+            if pad:
+                await asyncio.sleep(0.25)
+            return await real(did, chunks, pad=pad)
+
+        s._post_update = held_back
+        await self._go(s, 0.12)
+        kinds = _kinds(s)
+        self.assertEqual(kinds, ["answer"])                        # the late pad is dropped, it never lands after the result
+        self.assertEqual(s._trace().get("r1").as_dict()["pad"], "skipped_result_first")
+
+    async def test_pad_never_appears_after_the_result_whatever_the_timing(self) -> None:
+        for worker_delay in (0.0, 0.04, 0.06, 0.10, 0.20, 0.34, 0.50):
+            for pad_http in (0.0, 0.1, 0.3):
+                s = _session()
+                s.engine = _SlowPadEngine(pad_http)
+                await self._go(s, worker_delay)
+                kinds = _kinds(s)
+                self.assertEqual(kinds.count("answer"), 1, (worker_delay, pad_http, kinds))
+                if "pad" in kinds:
+                    self.assertLess(kinds.index("pad"), kinds.index("answer"), (worker_delay, pad_http, kinds))
+
+    async def test_pad_post_after_cancel_or_result_is_refused_under_the_lock(self) -> None:
+        for how in ("said_result", "cancelled"):
+            s = _session()
+            _arm(s, "c1", "北京明天天气")
+            d = s.deleg["c1"]
+            if how == "said_result":
+                d["said_result"] = True
+            else:
+                gw.LiveSession._cancel_pad(d)
+            sent = await gw.LiveSession._post_update(s, "c1", [("commentary", "我帮你查一下。")], pad=True)
+            self.assertFalse(sent, how)
+            self.assertEqual(s.engine.results, [], how)
+
+    async def test_silent_ack_waits_for_a_pad_already_on_its_way(self) -> None:
+        s = _session()
+        s.engine = _SlowPadEngine(0.2)
+        _arm(s, "a1", "北京明天天气")
+        pad = asyncio.ensure_future(gw.LiveSession._post_update(s, "a1", [("commentary", "我帮你查一下。")], pad=True))
+        await asyncio.sleep(0.05)
+        await gw.LiveSession._ack_delegation(s, "a1", "已取消")
+        await pad
+        self.assertEqual([sp for _, _, sp in s.engine.results], [True, False])          # pad first, silent ack after
+
+
 class RuntimeBannerTests(unittest.TestCase):
     """Critic S-6: SOPHON_LIVE_COORD is off by default in code; a restart without it must say so loudly."""
 

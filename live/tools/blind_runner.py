@@ -20,10 +20,18 @@ Output, one JSON object per sentence, written ONLY to OUT.jsonl (which must not 
      "route"  (the Coordinator's route: WORKER|FAST|CLARIFY|CONTROL|STOP_SPEAKING), "route_via" (who decided the route, see below),
      "decision" (NEW / REFINE / CANCEL / STATUS / the route), "jev_route", "jev_control" (what the JEV answered, even if a guard overrode it),
      "via" (jev | guard | heuristic: the production label), "control_via" (who picked the CONTROL target, or null),
-     "degraded" (JEV was expected but something else decided), "degraded_reason", "handled_by" (fast | clarify | control | worker | stop),
+     "degraded" (JEV was expected but something else decided), "degraded_reason", "degraded_exc" (class name of the JEV exception, else null),
+     "handled_by" (fast | clarify | control | worker | stop),
      "required_tools" (what ``intent.required_tools`` -- a regex table in production -- told the Worker it must call; null when no job),
+     "clarify_slots" (RETURN VALUES of ``clarify.missing_slots_for_text`` -- a keyword test in production -- one slot list per call, null if it was
+                      not called), "memory_gate_explicit" (return values of ``memory_gate.has_explicit_save_intent`` -- a keyword table -- one bool per
+                      call; only a REAL Worker's memory tool calls it, so it is null in fake mode),
      "tools" / "tool_ok" (the tools the Worker really called and their ok flags; null in fake mode: nothing was called),
-     "worker_status", "reply", "error" (exception class name only, else null), "error_stage" (admit | worker | finish, else null)}
+     "worker_status", "outcome_kind" (finish_job's answer | clarify | stale; null when no job), "outcome_rejected" (finish_job's ``rejected`` code,
+     e.g. no_tool_result / tool_failed, else null), "reply", "error" (exception class name only, else null), "error_stage" (admit | worker | finish)}
+
+The two keyword functions are wrapped for the duration of one sentence exactly like ``jev_client.system_one`` is: called unchanged, only their
+return values are kept (never their arguments), and restored afterwards.
 
 On an error every field obtained before the failure is kept; only ``error`` / ``error_stage`` are added.
 
@@ -36,8 +44,10 @@ Who decided (all derived from structure, never from the sentence)
                 jev (it said NEW or named a task the Ledger does not have) or heuristic (``heuristic_control`` ran and found nothing)
   degraded      the JEV was expected (SOPHON_LIVE_JEV on) and route_via is heuristic/jev_invalid, or control_via is heuristic, or via is heuristic.
                 A guard decision is NOT degraded (the JEV was never asked) -- read ``route_via``.
-  degraded_reason  timeout | http | conn | jev_error (the JEV call raised: TimeoutError / a non-2xx or bad body from the server / a connection
-                error / anything else; chosen by exception CLASS) | no_usable_route | invalid_route | control_no_target | null
+  degraded_reason  the JEV call raised (chosen by exception CLASS and cause only, never the message; ``degraded_exc`` has the class name):
+                timeout | conn | http_status (aiohttp.ClientResponseError) | bad_json (RuntimeError with a cause: the unparsable body) |
+                runtime_error (a RuntimeError without a cause: jev_client's >=400 answer -- and any other plain RuntimeError, the class cannot
+                tell them apart) | jev_error (anything else);  or, without an exception: no_usable_route | invalid_route | control_no_target | null
 
 Fidelity: what differs from the production path (every row lists the codes that apply to this run)
   fake_jev, fake_worker      nothing real was asked
@@ -45,8 +55,10 @@ Fidelity: what differs from the production path (every row lists the codes that 
                              input the rewrite is supplied by the test author instead: rewrite_from_input (not a real front model)
   no_instructions / instructions_from_file     the front system prompt given to the Worker
   no_history / history_static / history_accumulates     the Worker's recent turns (last 6 are passed). static = from --history-jsonl each
-                             sentence; accumulates = --shared-ledger, each finished job is appended like the gateway does
-  playback_active_fixed, language_fixed   playback_active is always False and the JEV state's language is "zh" in production's build_state
+                             sentence; accumulates = --shared-ledger, each job whose outcome is an answer is appended (a clarify question or a stale result is not,
+                             last 12 kept) like the gateway does
+  playback_active=<bool>, language=<x>,jev_state_language=zh     the ACTUAL values, constant for the whole run (production's follow the call);
+                             ``--language`` only changes the job's language, the JEV state's language is hard-wired "zh" by ``build_state``
   no_asr_transcript          raw_text == text; the Realtime face's speech-transcript grounding (``heard``) is not exercised
   ledger_per_sentence / ledger_shared     a new Ledger for every sentence (the JEV sees no tasks, CONTROL cannot be tested) / one Ledger
 
@@ -58,7 +70,8 @@ Modes
   gateway URL     NOT available: the GPT-Live gateway and the Realtime face take speech only (text items are ignored), so there is no text
                   turn interface to drive. ``--mode gateway`` exits with code 3 and says so.
 
-Exit codes: 0 done; 2 bad arguments; 3 gateway mode; 4 real mode refused; 5 output refused (exists / is the input).
+Exit codes: 0 done; 2 bad arguments, an unreadable input file, or an output that cannot be created (e.g. no such directory); 3 gateway mode;
+4 real mode refused; 5 output refused (exists / is the input); 6 the run finished but OUT.jsonl.done could not be created (it appeared during the run).
 A run that finished also writes ``OUT.jsonl.done`` (counts only); a run that was interrupted has none.
 
 Privacy (what the runner guarantees, and the tests that pin it: ``tests/test_blind_runner.py::Privacy``)
@@ -84,7 +97,8 @@ ALLOW_REAL_ENV = "BLIND_RUNNER_ALLOW_REAL"
 FAKE_REPLY = "[fake worker reply]"
 _HOOK_ENV_NAMES = ("SOPHON_LIVE_DEVICE_HOOK",)
 HISTORY_TURNS = 6          # the Worker prompt uses the last 6 turns (orchestrator._history_block)
-EXIT_BAD_ARGS, EXIT_GATEWAY, EXIT_REAL_REFUSED, EXIT_OUT_REFUSED = 2, 3, 4, 5
+HISTORY_KEEP = 12          # the gateway keeps the last 12 (gateway.py)
+EXIT_BAD_ARGS, EXIT_GATEWAY, EXIT_REAL_REFUSED, EXIT_OUT_REFUSED, EXIT_DONE_FAILED = 2, 3, 4, 5, 6
 
 
 class Sentence(NamedTuple):
@@ -163,14 +177,19 @@ def quiet_and_sealed(real: bool, orch_url: str | None = None, orch_model: str | 
 
 
 def jev_error_kind(e: BaseException) -> str:
-    """Why a JEV call failed, by exception CLASS only (the message may quote the sentence and is never read)."""
+    """Why a JEV call failed, by exception CLASS and cause only (the message may quote the sentence and is never read).
+    timeout | conn | http_status (aiohttp.ClientResponseError) | bad_json (a RuntimeError that has a cause: jev_client raises the unparsable-body
+    error ``from`` the parse error) | runtime_error (a RuntimeError without a cause: what jev_client raises for a >=400 answer, and also any other
+    plain RuntimeError -- the class cannot tell them apart) | jev_error (anything else)."""
     import aiohttp
     if isinstance(e, (TimeoutError, asyncio.TimeoutError)):
         return "timeout"
     if isinstance(e, (aiohttp.ClientConnectionError, OSError)):
         return "conn"
-    if isinstance(e, (RuntimeError, aiohttp.ClientResponseError)):       # jev_client raises RuntimeError for a >=400 answer or an unparsable body
-        return "http"
+    if isinstance(e, aiohttp.ClientResponseError):
+        return "http_status"
+    if isinstance(e, RuntimeError):
+        return "bad_json" if e.__cause__ is not None else "runtime_error"
     return "jev_error"
 
 
@@ -180,6 +199,9 @@ class _Recorder:
         self.route: str | None = None
         self.control: str | None = None
         self.error_kind: str | None = None
+        self.error_exc: str | None = None
+        self.slots: list[list[str]] | None = None        # return values of api.missing_slots_for_text, one per call
+        self.save_intent: list[bool] | None = None       # return values of memory_gate.has_explicit_save_intent, one per call
 
 
 async def _fake_jev(route: str):
@@ -195,8 +217,10 @@ async def _fake_worker(job, *, instructions="", history=None):   # noqa: ANN001,
                         evidence=ev, freshness_token=job.freshness_token)
 
 
-def fidelity_codes(*, mode: str, has_task: bool, instructions: str, history_mode: str, shared_ledger: bool) -> list[str]:
-    codes = ["playback_active_fixed", "language_fixed", "no_asr_transcript"]
+def fidelity_codes(*, mode: str, has_task: bool, instructions: str, history_mode: str, shared_ledger: bool,
+                   playback_active: bool = False, language: str = "zh") -> list[str]:
+    # the ACTUAL values, constant for the whole run (production's change with the call); the JEV state's language is hard-wired "zh" in build_state
+    codes = [f"playback_active={str(bool(playback_active)).lower()}", f"language={language},jev_state_language=zh", "no_asr_transcript"]
     codes.append("rewrite_from_input" if has_task else "no_frontend_rewrite")
     codes.append("instructions_from_file" if instructions else "no_instructions")
     codes.append(history_mode)
@@ -208,8 +232,8 @@ def fidelity_codes(*, mode: str, has_task: bool, instructions: str, history_mode
 
 def _blank_row(sid: str, mode: str, fidelity: list[str]) -> dict[str, Any]:
     return {"id": sid, "mode": mode, "fidelity": fidelity, "route": None, "route_via": None, "decision": None, "jev_route": None,
-            "jev_control": None, "via": None, "control_via": None, "degraded": None, "degraded_reason": None, "handled_by": None,
-            "required_tools": None, "tools": None, "tool_ok": None, "worker_status": None, "reply": "", "error": None, "error_stage": None}
+            "jev_control": None, "via": None, "control_via": None, "degraded": None, "degraded_reason": None, "degraded_exc": None, "handled_by": None,
+            "required_tools": None, "clarify_slots": None, "memory_gate_explicit": None, "tools": None, "tool_ok": None, "worker_status": None, "outcome_kind": None, "outcome_rejected": None, "reply": "", "error": None, "error_stage": None}
 
 
 def _route_via(res, jev_route: str | None, use_jev: bool, enums: set[str]) -> str:   # noqa: ANN001
@@ -238,7 +262,7 @@ async def run_one(sid: str, text: str, *, ledger, jev, worker, language: str = "
                   fidelity: list[str] | None = None, history_sink: list[dict[str, str]] | None = None) -> dict[str, Any]:
     """Run one sentence; ALWAYS returns a row (on an error the fields obtained so far are kept, plus ``error``/``error_stage``)."""
     from sophon_live import coordinator as C
-    from sophon_live.coordinator import api, jev_client
+    from sophon_live.coordinator import api, jev_client, memory_gate
     from sophon_live.coordinator.route import ROUTE_CRITERIA
     rec = _Recorder()
     row = _blank_row(sid, mode, fidelity if fidelity is not None else [])
@@ -248,21 +272,31 @@ async def run_one(sid: str, text: str, *, ledger, jev, worker, language: str = "
         try:
             resp = await jev(state, questions, **kw)
         except Exception as e:   # noqa: BLE001   re-raised unchanged: production behaviour is not altered
-            rec.error_kind = jev_error_kind(e)
+            rec.error_kind, rec.error_exc = jev_error_kind(e), type(e).__name__
             raise
         rec.route = jev_client.choice_answer(resp, "route")
         rec.control = jev_client.choice_answer(resp, "control")
         return resp
 
-    orig = jev_client.system_one
-    jev_client.system_one = spy
+    def recording(fn, sink: str):   # noqa: ANN001   wraps a production keyword function: calls it unchanged, keeps ONLY its return value
+        def wrapper(*a, **k):   # noqa: ANN002, ANN003
+            r = fn(*a, **k)
+            if sink == "slots":
+                rec.slots = (rec.slots or []) + [list(r or [])]
+            else:
+                rec.save_intent = (rec.save_intent or []) + [bool(r)]
+            return r
+        return wrapper
+
+    patches = [(jev_client, "system_one", spy), (api, "missing_slots_for_text", recording(api.missing_slots_for_text, "slots")),
+               (memory_gate, "has_explicit_save_intent", recording(memory_gate.has_explicit_save_intent, "save"))]
+    saved = [(o, n, getattr(o, n)) for o, n, _ in patches]
+    for o, n, f in patches:
+        setattr(o, n, f)
     try:
-        try:
-            delegate = task if task is not None else text
-            res = await C.admit(C.AdmitRequest(session_id="blind", utterance_id=sid, text=delegate, delegate_task=delegate, language=language,
-                                               playback_active=playback_active, raw_text=text), ledger)
-        finally:
-            jev_client.system_one = orig
+        delegate = task if task is not None else text
+        res = await C.admit(C.AdmitRequest(session_id="blind", utterance_id=sid, text=delegate, delegate_task=delegate, language=language,
+                                           playback_active=playback_active, raw_text=text), ledger)
         use_jev = bool(api.USE_JEV)
         row["jev_route"], row["jev_control"] = rec.route, rec.control
         row["route"], row["via"] = res.route, res.via
@@ -277,9 +311,10 @@ async def run_one(sid: str, text: str, *, ledger, jev, worker, language: str = "
                 reason = "invalid_route"
             elif row["control_via"] == "heuristic":
                 reason = "control_no_target"
-        row["degraded_reason"] = reason
+        row["degraded_reason"], row["degraded_exc"] = reason, rec.error_exc
         row["degraded"] = bool(use_jev and (row["route_via"] in ("heuristic", "jev_invalid") or row["control_via"] == "heuristic"
                                             or res.via == "heuristic" or rec.error_kind is not None))
+        row["clarify_slots"] = rec.slots
         if res.job is None:
             row["handled_by"] = {"STOP_SPEAKING": "stop", "FAST": "fast", "CLARIFY": "clarify"}.get(res.route, "control" if res.control else res.route.lower())
             row["reply"] = res.speak.text or ""
@@ -294,13 +329,21 @@ async def run_one(sid: str, text: str, *, ledger, jev, worker, language: str = "
         if mode != "fake":                       # a fake Worker calls nothing: its "evidence" is just the required tools echoed back
             row["tools"] = [str(e.get("tool")) for e in wr.evidence]
             row["tool_ok"] = [e.get("ok") for e in wr.evidence]
+        row["memory_gate_explicit"] = rec.save_intent
         stage = "finish"
         out = C.finish_job(ledger, job, wr)
+        row["outcome_kind"], row["outcome_rejected"] = out.kind, out.rejected or None
         row["reply"] = out.text
-        if history_sink is not None:
+        row["clarify_slots"] = rec.slots
+        if history_sink is not None and out.kind == "answer":      # like gateway.py: a clarify question or a stale result never enters the history
             history_sink.append({"task": job.objective, "answer": out.text})
+            del history_sink[:-HISTORY_KEEP]
     except Exception as e:   # noqa: BLE001   class name only: a message may quote the sentence
         row["error"], row["error_stage"] = type(e).__name__, stage
+        row["clarify_slots"], row["memory_gate_explicit"] = rec.slots, rec.save_intent
+    finally:
+        for o, n, v in saved:
+            setattr(o, n, v)
     return row
 
 
@@ -347,7 +390,7 @@ async def run(sentences: Iterable[Sentence], out_path: str, *, mode: str = "fake
                 if not shared_ledger:
                     ledger = C.Ledger()
                 fid = fidelity_codes(mode=mode, has_task=s.task is not None, instructions=instructions, history_mode=history_mode,
-                                     shared_ledger=shared_ledger)
+                                     shared_ledger=shared_ledger, playback_active=playback_active, language=language)
                 row = await run_one(s.id, s.text, ledger=ledger, jev=jev, worker=worker, language=language, mode=mode, task=s.task,
                                     instructions=instructions, history=run_history, playback_active=playback_active, fidelity=fid,
                                     history_sink=run_history if shared_ledger else None)
@@ -355,7 +398,11 @@ async def run(sentences: Iterable[Sentence], out_path: str, *, mode: str = "fake
                 f.flush()
                 n += 1
                 n_err += 1 if row["error"] else 0
-        with open(os.open(out_path + ".done", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w", encoding="utf-8") as g:
+        try:
+            done_fd = os.open(out_path + ".done", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:                  # someone else created it during the run: it is not ours, so it proves nothing about THIS run
+            raise SystemExit(EXIT_DONE_FAILED)
+        with os.fdopen(done_fd, "w", encoding="utf-8") as g:
             json.dump({"n": n, "errors": n_err, "mode": mode, "complete": True}, g)
     finally:
         api.USE_JEV = prev_use
@@ -387,21 +434,35 @@ def main(argv: list[str] | None = None) -> int:
         if not a.jev_url:
             print("blind_runner: real mode needs --jev-url", file=sys.stderr)
             return EXIT_REAL_REFUSED
-    sents = read_sentences(a.sentences)
-    instructions = ""
-    if a.instructions_file:
-        with open(a.instructions_file, encoding="utf-8-sig") as fh:
-            instructions = fh.read()
-    history = read_history(a.history_jsonl) if a.history_jsonl else []
+    try:
+        sents = read_sentences(a.sentences)
+        instructions = ""
+        if a.instructions_file:
+            with open(a.instructions_file, encoding="utf-8-sig") as fh:
+                instructions = fh.read()
+        history = read_history(a.history_jsonl) if a.history_jsonl else []
+    except OSError as e:
+        print(f"blind_runner: cannot read an input file ({type(e).__name__})", file=sys.stderr)
+        return EXIT_BAD_ARGS
     try:
         with quiet_and_sealed(a.mode == "real", a.orch_url, a.orch_model):
             n = asyncio.run(run(sents, a.out, mode=a.mode, fake_route=a.fake_route, jev_url=a.jev_url, shared_ledger=a.shared_ledger,
                                 instructions=instructions, history=history, language=a.language, playback_active=a.playback_active))
     except SystemExit as e:
         if e.code == EXIT_OUT_REFUSED:
-            print("blind_runner: refusing to write the output: it is the input file or already exists (nothing was changed)", file=sys.stderr)
+            print("blind_runner: refusing to write the output: it already exists (nothing was changed)", file=sys.stderr)
             return EXIT_OUT_REFUSED
+        if e.code == EXIT_DONE_FAILED:
+            print("blind_runner: the run finished and OUT.jsonl is complete, but OUT.jsonl.done could not be created because it appeared during the run;"
+                  " it is not this run's completion marker", file=sys.stderr)
+            return EXIT_DONE_FAILED
         raise
+    except FileExistsError:                      # lost a race for the output file itself
+        print("blind_runner: refusing to write the output: it already exists (nothing was changed)", file=sys.stderr)
+        return EXIT_OUT_REFUSED
+    except OSError as e:                         # e.g. the output directory does not exist, or is not writable
+        print(f"blind_runner: cannot write the output file ({type(e).__name__}); is the output directory there and writable?", file=sys.stderr)
+        return EXIT_BAD_ARGS
     print(f"blind_runner: {n} sentences -> output file ({a.mode} mode)")
     return 0
 

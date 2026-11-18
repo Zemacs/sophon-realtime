@@ -87,12 +87,14 @@ class Behaviour(_Base):
             rows = _rows(out)
         self.assertEqual([r["id"] for r in rows], ["s0001", "s0002", "s0003", "s0004"])          # numbers the sentences, not the file lines
         keys = ("id", "mode", "fidelity", "route", "route_via", "decision", "jev_route", "jev_control", "via", "control_via", "degraded",
-                "degraded_reason", "handled_by", "required_tools", "tools", "tool_ok", "worker_status", "reply", "error", "error_stage")
+                "degraded_reason", "degraded_exc", "handled_by", "required_tools", "clarify_slots", "memory_gate_explicit", "tools", "tool_ok",
+                "worker_status", "outcome_kind", "outcome_rejected", "reply", "error", "error_stage")
         for r in rows:
             self.assertEqual(sorted(r), sorted(keys))
             self.assertEqual((r["mode"], r["route"], r["route_via"], r["via"], r["degraded"], r["jev_route"], r["error"]),
                              ("fake", "WORKER", "jev", "jev", False, "WORKER", None))
-            self.assertEqual(r["reply"], br.FAKE_REPLY)
+            self.assertEqual((r["reply"], r["outcome_kind"], r["outcome_rejected"]), (br.FAKE_REPLY, "answer", None))
+            self.assertIsNone(r["memory_gate_explicit"])                 # only a real Worker's memory tool reaches has_explicit_save_intent
             # B-R6: nothing was really called in fake mode, so the columns that say "what was called" are null, not a copy of required_tools
             self.assertIsNone(r["tools"]); self.assertIsNone(r["tool_ok"])
             self.assertIsInstance(r["required_tools"], list)
@@ -117,11 +119,27 @@ class Behaviour(_Base):
             self.assertNotIn(m, blob)
 
     # ---- B-R1 / B-R7: who decided, and why it is degraded -------------------------------------------------------------------------
-    def test_a_jev_failure_is_recorded_as_degraded_heuristic_with_its_kind(self) -> None:
-        for exc, kind in ((RuntimeError("jev down"), "http"), (asyncio.TimeoutError(), "timeout"), (ConnectionRefusedError(), "conn"), (KeyError("k"), "jev_error")):
+    def test_a_jev_failure_is_recorded_as_degraded_heuristic_with_its_kind_chosen_by_class_and_cause_only(self) -> None:
+        import aiohttp
+        try:
+            try:
+                raise ValueError("not json")
+            except ValueError as v:
+                raise RuntimeError("jev bad json: ...") from v
+        except RuntimeError as bad_json:
+            chained = bad_json
+        status = aiohttp.ClientResponseError(None, (), status=502, message="x")
+        cases = ((RuntimeError("jev HTTP 500: body"), "runtime_error"), (chained, "bad_json"), (status, "http_status"), (asyncio.TimeoutError(), "timeout"),
+                 (TimeoutError(), "timeout"), (ConnectionRefusedError(), "conn"), (aiohttp.ClientConnectionError(), "conn"), (KeyError("k"), "jev_error"))
+        for exc, kind in cases:
             row = self.run_one("现在几点了", jev=_jev_raising(exc))
-            self.assertEqual((row["via"], row["route_via"], row["degraded"], row["degraded_reason"], row["jev_route"], row["error"]),
-                             ("heuristic", "heuristic", True, kind, None, None), exc)
+            self.assertEqual((row["via"], row["route_via"], row["degraded"], row["degraded_reason"], row["degraded_exc"], row["jev_route"], row["error"]),
+                             ("heuristic", "heuristic", True, kind, type(exc).__name__, None, None), exc)
+
+    def test_the_degraded_kind_does_not_depend_on_the_message(self) -> None:
+        a = self.run_one("现在几点了", jev=_jev_raising(RuntimeError("timeout")))
+        b = self.run_one("现在几点了", jev=_jev_raising(RuntimeError("jev bad json: x")))
+        self.assertEqual((a["degraded_reason"], b["degraded_reason"]), ("runtime_error", "runtime_error"))
 
     def test_the_jev_error_message_is_never_read_or_recorded(self) -> None:
         row = self.run_one("现在几点了", jev=_jev_raising(RuntimeError("echo ZQXV7731")))
@@ -238,10 +256,21 @@ class Behaviour(_Base):
             return orig(text, ledger, playback_active=playback_active)
         with mock.patch.object(api, "build_state", spy):
             row = self.run_one("今天", jev=_jev_answering("FAST"), playback_active=True,
-                               fidelity=br.fidelity_codes(mode="fake", has_task=False, instructions="", history_mode="no_history", shared_ledger=False))
+                               fidelity=br.fidelity_codes(mode="fake", has_task=False, instructions="", history_mode="no_history", shared_ledger=False,
+                                                     playback_active=True, language="en"))
         self.assertEqual(got, [True])
-        for code in ("playback_active_fixed", "language_fixed", "no_asr_transcript", "no_frontend_rewrite", "no_instructions", "no_history", "ledger_per_sentence"):
+        for code in ("playback_active=true", "language=en,jev_state_language=zh", "no_asr_transcript", "no_frontend_rewrite", "no_instructions", "no_history", "ledger_per_sentence"):
             self.assertIn(code, row["fidelity"])
+        self.assertNotIn("playback_active=false", row["fidelity"])
+        self.assertIn("playback_active=false", br.fidelity_codes(mode="fake", has_task=False, instructions="", history_mode="no_history", shared_ledger=False))
+        self.assertIn("language=zh,jev_state_language=zh", br.fidelity_codes(mode="fake", has_task=False, instructions="", history_mode="no_history", shared_ledger=False))
+
+    def test_main_records_the_actual_playback_and_language_values_in_fidelity(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "o.jsonl")
+            self.assertEqual(br.main([_write(d, ["一句"]), out, "--playback-active", "--language", "en"]), 0)
+            (r,) = _rows(out)
+        self.assertIn("playback_active=true", r["fidelity"]); self.assertIn("language=en,jev_state_language=zh", r["fidelity"])
 
     def test_main_passes_files_through_static_history_resets_per_sentence_and_shared_history_accumulates(self) -> None:
         seen: list[list] = []
@@ -264,6 +293,114 @@ class Behaviour(_Base):
         self.assertEqual(len(seen[3][1]), 2)                                                      # the first finished job was appended
         self.assertIn("history_static", rows1[0]["fidelity"]); self.assertIn("history_accumulates", rows2[0]["fidelity"])
         self.assertIn("ledger_shared", rows2[0]["fidelity"])
+
+    # ---- I-1: outcome columns and the history only grows on answers, like gateway.py ----------------------------------------------
+    def _needs_input_worker(self, slots=("city",)):
+        from sophon_live.coordinator.schemas import WorkerResult
+        async def w(job, **kw):   # noqa: ANN001
+            return WorkerResult(task_id=job.task_id, version=job.version, status="needs_input", spoken_answer="", needs_slots=list(slots), freshness_token=job.freshness_token)
+        return w
+
+    def test_a_needs_input_outcome_is_recorded_as_clarify(self) -> None:
+        from sophon_live.coordinator.clarify import clarify_for_slots
+        row = self.run_one("今天天气", jev=_jev_answering("WORKER"), worker=self._needs_input_worker())
+        self.assertEqual((row["outcome_kind"], row["worker_status"], row["reply"], row["handled_by"]), ("clarify", "needs_input", clarify_for_slots(["city"]), "worker"))
+
+    def test_a_stale_result_is_recorded_as_stale(self) -> None:
+        from sophon_live.coordinator.schemas import WorkerResult
+        async def w(job, **kw):   # noqa: ANN001
+            return WorkerResult(task_id=job.task_id, version=job.version + 1, status="completed", spoken_answer="x", freshness_token=job.freshness_token)
+        row = self.run_one("好的", jev=_jev_answering("WORKER"), worker=w)
+        self.assertEqual((row["outcome_kind"], row["reply"]), ("stale", ""))
+
+    def test_a_rejected_answer_records_why_finish_job_refused_it(self) -> None:
+        from sophon_live.coordinator.schemas import WorkerResult
+        async def w(job, **kw):   # noqa: ANN001
+            return WorkerResult(task_id=job.task_id, version=job.version, status="completed", spoken_answer="北京今天二十度", evidence=[], freshness_token=job.freshness_token)
+        row = self.run_one("今天北京天气怎么样", jev=_jev_answering("WORKER"), worker=w)
+        self.assertEqual((row["outcome_kind"], row["outcome_rejected"]), ("answer", "no_tool_result"))
+
+    def test_a_needs_input_text_never_reaches_a_later_workers_history_but_an_answer_does(self) -> None:
+        from sophon_live.coordinator.clarify import clarify_for_slots
+        from sophon_live.coordinator.schemas import WorkerResult
+        seen: list[list] = []
+        real_fake = br._fake_worker
+        stale_wanted = {"n": 0}
+        async def w(job, *, instructions="", history=None):   # noqa: ANN001
+            seen.append([dict(h) for h in (history or [])])
+            k = len(seen)
+            if k == 1:
+                return await self._needs_input_worker()(job)
+            if k == 3:                                               # a stale result in the middle
+                return WorkerResult(task_id=job.task_id, version=job.version + 1, status="completed", spoken_answer="STALEANSWER", freshness_token=job.freshness_token)
+            return await real_fake(job)
+        with tempfile.TemporaryDirectory() as d:
+            inp = _write(d, ["第一句", "第二句", "第三句", "第四句"])
+            out = os.path.join(d, "o.jsonl")
+            with mock.patch.object(br, "_fake_worker", w):
+                self.assertEqual(br.main([inp, out, "--shared-ledger"]), 0)
+            rows = _rows(out)
+        self.assertEqual([r["outcome_kind"] for r in rows], ["clarify", "answer", "stale", "answer"])
+        clarify_text = clarify_for_slots(["city"])
+        self.assertEqual(seen[0], [])
+        self.assertEqual(seen[1], [])                                                   # the clarify question was not appended
+        self.assertEqual(len(seen[2]), 1)                                               # the answer of sentence 2 was
+        self.assertEqual(seen[2][0]["answer"], br.FAKE_REPLY)
+        self.assertEqual(len(seen[3]), 1)                                               # the stale result was not
+        self.assertNotIn(clarify_text, json.dumps(seen[1:], ensure_ascii=False))
+        self.assertNotIn("STALEANSWER", json.dumps(seen, ensure_ascii=False))
+
+    def test_the_history_is_capped_at_twelve_like_the_gateway(self) -> None:
+        seen: list[int] = []
+        real_fake = br._fake_worker
+        async def w(job, *, instructions="", history=None):   # noqa: ANN001
+            seen.append(len(history or []))
+            return await real_fake(job)
+        hist = [{"task": f"t{i}", "answer": f"a{i}"} for i in range(11)]
+        sink = list(hist)
+        from sophon_live import coordinator as C
+        async def go():
+            for k in range(3):
+                await br.run_one(f"s{k}", f"句{k}", ledger=C.Ledger(), jev=_jev_answering("WORKER"), worker=br._fake_worker, history=sink, history_sink=sink)
+        with br.quiet_and_sealed(False):
+            asyncio.run(go())
+        self.assertEqual(len(sink), 12)
+        self.assertEqual(sink[-1]["answer"], br.FAKE_REPLY)
+
+    # ---- I-2: the keyword functions' conclusions are recorded, nothing else, and everything is restored -----------------------------
+    def test_the_keyword_functions_return_values_are_recorded_and_the_functions_restored(self) -> None:
+        from sophon_live.coordinator import api, clarify, memory_gate
+        orig_slots, orig_mem = api.missing_slots_for_text, memory_gate.has_explicit_save_intent
+        sent = "今天天气怎么样"
+        row = self.run_one(sent, jev=_jev_answering("CLARIFY"))
+        self.assertEqual(row["clarify_slots"], [clarify.missing_slots_for_text(sent)])
+        self.assertEqual(row["handled_by"], "clarify")
+        self.assertIsNone(self.run_one("好的", jev=_jev_answering("FAST"))["clarify_slots"])                   # not called: null, not []
+        async def mem_worker(job, **kw):   # noqa: ANN001
+            memory_gate.has_explicit_save_intent(job.objective); memory_gate.has_explicit_save_intent("")
+            return await br._fake_worker(job)
+        for sent in ("记住我喜欢咖啡", "随便聊聊"):
+            row = self.run_one(sent, jev=_jev_answering("WORKER"), worker=mem_worker)
+            self.assertEqual(row["memory_gate_explicit"], [orig_mem(sent), False])             # the production function's own answers, as returned
+        self.assertIs(api.missing_slots_for_text, orig_slots); self.assertIs(memory_gate.has_explicit_save_intent, orig_mem)
+
+    def test_the_wrappers_are_restored_even_when_the_run_crashes(self) -> None:
+        from sophon_live.coordinator import api, jev_client, memory_gate
+        before = (api.missing_slots_for_text, memory_gate.has_explicit_save_intent, jev_client.system_one)
+        async def bad(job, **kw):   # noqa: ANN001
+            raise ValueError("x")
+        row = self.run_one("今天", jev=_jev_answering("WORKER"), worker=bad)
+        self.assertEqual(row["error"], "ValueError")
+        self.assertEqual((api.missing_slots_for_text, memory_gate.has_explicit_save_intent, jev_client.system_one), before)
+
+    def test_the_wrapped_functions_pass_everything_through_unchanged(self) -> None:
+        from sophon_live.coordinator import api, memory_gate
+        calls: list = []
+        async def w(job, **kw):   # noqa: ANN001
+            calls.append((api.missing_slots_for_text("天气"), memory_gate.has_explicit_save_intent("记住"), memory_gate.has_explicit_save_intent(None)))
+            return await br._fake_worker(job)
+        self.run_one("x", jev=_jev_answering("WORKER"), worker=w)
+        self.assertEqual(calls, [(["city"], True, False)])
 
     # ---- gates, exit codes ----------------------------------------------------------------------------------------------------
     def test_real_mode_is_refused_without_the_env_gate_and_gateway_mode_is_unavailable(self) -> None:
@@ -324,6 +461,67 @@ class Behaviour(_Base):
             with mock.patch.object(br, "run_one", interrupted), self.assertRaises(KeyboardInterrupt):
                 br.main([inp, out2])
             self.assertTrue(os.path.exists(out2)); self.assertFalse(os.path.exists(out2 + ".done"))   # partial output, no completion marker
+
+    def test_a_missing_output_directory_or_input_is_a_clear_exit_code_not_a_traceback(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            inp = _write(d, SENTENCES)
+            se = io.StringIO()
+            with mock.patch("sys.stderr", se):
+                self.assertEqual(br.main([inp, os.path.join(d, "no_such_dir", "out.jsonl")]), 2)
+                self.assertEqual(br.main([os.path.join(d, "nope.txt"), os.path.join(d, "o.jsonl")]), 2)
+                self.assertEqual(br.main([inp, os.path.join(d, "o2.jsonl"), "--instructions-file", os.path.join(d, "nope")]), 2)
+                self.assertEqual(br.main([inp, os.path.join(d, "o3.jsonl"), "--history-jsonl", os.path.join(d, "nope")]), 2)
+            self.assertIn("FileNotFoundError", se.getvalue()); self.assertNotIn("Traceback", se.getvalue())
+            self.assertFalse(os.path.exists(os.path.join(d, "o.jsonl")))
+
+    def test_a_done_marker_that_appears_during_the_run_fails_clearly_and_is_left_alone(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            inp, out = _write(d, SENTENCES), os.path.join(d, "out.jsonl")
+            real_fake = br._fake_worker
+            async def w(job, **kw):   # noqa: ANN001
+                if not os.path.exists(out + ".done"):
+                    open(out + ".done", "w").write("FOREIGN")
+                return await real_fake(job)
+            se = io.StringIO()
+            with mock.patch.object(br, "_fake_worker", w), mock.patch("sys.stderr", se):
+                self.assertEqual(br.main([inp, out]), 6)
+            self.assertEqual(open(out + ".done").read(), "FOREIGN")                    # not ours: never overwritten, never claimed
+            self.assertEqual(len(_rows(out)), 4)                                       # the output itself is complete
+            self.assertIn("could not be created", se.getvalue()); self.assertNotIn("Traceback", se.getvalue())
+
+    def test_a_lost_race_for_the_output_file_itself_is_a_refusal(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            inp, out = _write(d, SENTENCES), os.path.join(d, "out.jsonl")
+            def racing(path):                                    # the file appears between the early check and the exclusive create
+                open(path, "w").write("THEIRS")
+                return os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with mock.patch.object(br, "open_output", racing):
+                self.assertEqual(br.main([inp, out]), 5)
+            self.assertEqual(open(out).read(), "THEIRS")
+
+    # ---- S-4: a metamorphic test (independent of how the runner's code names things) ---------------------------------------------
+    def test_two_batches_of_unrelated_random_sentences_give_identical_rows_apart_from_reply_and_required_tools(self) -> None:
+        import random
+        import string
+        def batch(seed: int) -> list[str]:
+            rnd = random.Random(seed)
+            pool = [chr(c) for c in range(0x4E00, 0x9FFF)] + list(string.ascii_letters + string.digits)
+            return ["".join(rnd.choice(pool) for _ in range(rnd.randint(1, 60))) for _ in range(40)]
+        a, b = batch(1), batch(2)
+        self.assertTrue(set(a).isdisjoint(b)); self.assertNotEqual([len(x) % 2 for x in a], [len(x) % 2 for x in b])
+        from sophon_live.coordinator.route import ROUTE_CRITERIA
+        for route in sorted(ROUTE_CRITERIA):
+            outs = []
+            for sents in (a, b):
+                with tempfile.TemporaryDirectory() as d:
+                    out = os.path.join(d, "o.jsonl")
+                    self.assertEqual(br.main([_write(d, sents), out, "--fake-route", route]), 0)
+                    outs.append(_rows(out))
+            self.assertEqual(len(outs[0]), len(outs[1]))
+            for x, y in zip(*outs):
+                for r in (x, y):
+                    r.pop("reply"); r.pop("required_tools")
+                self.assertEqual(x, y, route)
 
     # ---- S-2: input handling --------------------------------------------------------------------------------------------------
     def test_input_handling_bom_null_text_bad_ids_bad_route_and_bad_history(self) -> None:
@@ -456,21 +654,36 @@ class Privacy(_Base):
         async def jev(state, questions, **kw):   # noqa: ANN001
             raise RuntimeError(f"jev HTTP 500: {state['utterance']}")
         rows = self.sealed_run(jev=jev)
-        self.assertTrue(all(r["via"] == "heuristic" and r["degraded_reason"] == "http" for r in rows))
+        self.assertTrue(all(r["via"] == "heuristic" and r["degraded_reason"] == "runtime_error" and r["degraded_exc"] == "RuntimeError" for r in rows))
 
     def test_error_and_critical_level_log_calls_with_the_sentence_are_swallowed(self) -> None:
+        real_fake = br._fake_worker
         async def noisy_worker(job, **kw):   # noqa: ANN001
             lg = logging.getLogger("sophon_live.anything")
             lg.error("ERROR %s", job.objective); lg.critical("CRITICAL %s", job.objective); logging.getLogger().error("root %s", job.objective)
-            return await br._fake_worker(job)
-        self.sealed_run(worker=noisy_worker)
+            return await real_fake(job)
+        rows = self.sealed_run(worker=noisy_worker)
+        self.assertEqual([r["error"] for r in rows], [None] * len(SENTENCES))
+
+    def test_the_keyword_function_wrappers_keep_arguments_out_of_every_observer(self) -> None:
+        from sophon_live.coordinator import memory_gate
+        real_fake = br._fake_worker
+        async def w(job, **kw):   # noqa: ANN001
+            memory_gate.has_explicit_save_intent(job.objective)
+            return await real_fake(job)
+        rows = self.sealed_run(worker=w)
+        self.assertEqual([r["error"] for r in rows], [None] * len(SENTENCES))
+        self.assertTrue(all(r["memory_gate_explicit"] in ([True], [False]) for r in rows))
+        self.assertFalse([m for m in MARKERS if m in json.dumps(rows, ensure_ascii=False)])
 
     def test_a_real_device_call_inside_the_run_does_not_reach_a_configured_hook(self) -> None:
         from sophon_live.assistant_tools import device
+        real_fake = br._fake_worker
         async def device_worker(job, **kw):   # noqa: ANN001
             await device.run({"device": "light", "action": "on"})
-            return await br._fake_worker(job)
-        self.sealed_run(worker=device_worker)
+            return await real_fake(job)
+        rows = self.sealed_run(worker=device_worker)
+        self.assertEqual([r["error"] for r in rows], [None] * len(SENTENCES))
 
     def test_the_hook_check_is_not_vacuous_the_hook_does_run_when_the_environment_is_not_sealed(self) -> None:
         from sophon_live.assistant_tools import device
@@ -516,9 +729,10 @@ class Privacy(_Base):
         with tempfile.TemporaryDirectory() as d:
             out = os.path.join(d, "out.jsonl")
             inp = _write(d, SENTENCES)
+            # cwd, TMPDIR and HOME are all inside the scanned directory, so a stray file written to any of them is found
             env = dict(os.environ, PYTHONPATH=str(LIVE), PYTHONDONTWRITEBYTECODE="1", SOPHON_LIVE_MEMORY_PATH=os.path.join(d, "mem.json"),
-                       PYTHONWARNINGS="default", SOPHON_LIVE_DEVICE_HOOK=os.path.join(d, "no-such-hook"))
-            p = subprocess.run([sys.executable, "-m", "tools.blind_runner", inp, out], cwd=str(LIVE), env=env, capture_output=True, text=True, timeout=120)
+                       PYTHONWARNINGS="default", SOPHON_LIVE_DEVICE_HOOK=os.path.join(d, "no-such-hook"), TMPDIR=d, HOME=d)
+            p = subprocess.run([sys.executable, "-m", "tools.blind_runner", inp, out], cwd=d, env=env, capture_output=True, text=True, timeout=120)
             self.assertEqual(p.returncode, 0, p.stderr[-500:])
             self.assertFalse([m for m in MARKERS if m in p.stdout + p.stderr], p.stdout + p.stderr)
             # the input file holds the sentences by definition; everything else in the tmp dir must be clean of them

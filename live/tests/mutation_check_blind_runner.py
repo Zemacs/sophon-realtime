@@ -7,17 +7,22 @@ runner does not pass its tests, a mutant's old text is not in the file, or a mut
 
 PRIVACY mutants M1..M17 are Critic's 17 privacy mutants of e74e470 (review I-3), ported to the current source. M14 as Critic wrote it
 (an ERROR-level log call in the error branch) is EQUIVALENT under ``logging.disable(CRITICAL)`` -- no test can see a log call the logging module
-discards -- so it is ported together with the weaker seal it needs to matter (``disable(WARNING)``), which makes it observable.
-The rest (R-*) pin the review's B-R1..B-R7 and suggestions: they are mutants of the new columns, the output guard, and the input handling."""
+discards. It is kept below in EQUIVALENT exactly as written (it must SURVIVE, and the script says so); M14w is the same call together with the
+weaker seal it needs to matter (``disable(WARNING)``), and that one is killed. Only M-mutants in ``M`` count towards killed/survived.
+The rest (R-*) pin the review's B-R1..B-R7 and suggestions: they are mutants of the new columns, the output guard, and the input handling.
+Every pytest run happens in a throw-away working directory that is deleted at the end: a mutant that writes a file into its cwd leaves nothing behind.
+No mutant is run in parallel; the runner source is restored in a ``finally`` and compared byte for byte at the end."""
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 
+LIVE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PY = sys.executable
-SRC = "tools/blind_runner.py"
-TESTS = ["tests/test_blind_runner.py"]
+SRC = os.path.join(LIVE, "tools", "blind_runner.py")
+TESTS = [os.path.join(LIVE, "tests", "test_blind_runner.py")]
 EXC = 'row["error"], row["error_stage"] = type(e).__name__, stage'
 WRITE = "                f.write(json.dumps(row, ensure_ascii=False) + \"\\n\")"
 RUNCALL = "                                    history_sink=run_history if shared_ledger else None)\n"
@@ -37,7 +42,7 @@ M = [
  ("M11 write sentence to a cwd file", WRITE, "                open('trace.txt', 'a').write(s.text)\n" + WRITE),
  ("M12 device hook not removed", "            for k in _HOOK_ENV_NAMES:\n                os.environ.pop(k, None)\n", "            pass\n"),
  ("M13 extra env var left behind", "            yield\n", '            os.environ["LASTSENT"] = "x"\n            yield\n'),
- ("M14 ERROR-level log of the sentence in the error branch (with the seal at WARNING)", EXC, EXC + '\n        logging.getLogger().error("x %s", text)'),
+ ("M14w ERROR-level log of the sentence in the error branch (with the seal at WARNING)", EXC, EXC + '\n        logging.getLogger().error("x %s", text)'),
  ("M15 repr(e) to stderr in the error branch", EXC, EXC + "\n        print(repr(e), file=sys.stderr)"),
  ("M16 device hook set instead of removed", "            for k in _HOOK_ENV_NAMES:\n                os.environ.pop(k, None)\n", "            for k in _HOOK_ENV_NAMES:\n                os.environ[k] = '/bin/true'\n"),
  ("M17 output opened for append instead of exclusive create", "os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)\n\n\nasync def run", "os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)\n\n\nasync def run"),
@@ -53,9 +58,12 @@ M = [
  ("R1i guard counted as route_via heuristic", '    if res.via == "guard":\n        return "guard"', '    if res.via == "guard":\n        return "heuristic"'),
  # --- B-R7 degraded kinds + errors keep what was obtained -------------------------------------------------------------------------
  ("R7a timeout reported as conn", 'return "timeout"', 'return "conn"'),
- ("R7b http reported as conn", 'return "http"', 'return "conn"'),
- ("R7c conn reported as http", 'return "conn"', 'return "http"'),
- ("R7d the JEV error is swallowed by the spy (production behaviour changed)", "            rec.error_kind = jev_error_kind(e)\n            raise\n", "            rec.error_kind = jev_error_kind(e)\n            return {}\n"),
+ ("R7b http_status reported as conn", 'return "http_status"', 'return "conn"'),
+ ("R7c conn reported as http_status", 'return "conn"', 'return "http_status"'),
+ ("S2f bad_json not told from runtime_error", 'return "bad_json" if e.__cause__ is not None else "runtime_error"', 'return "runtime_error"'),
+ ("S2g the message decides the kind", 'return "bad_json" if e.__cause__ is not None else "runtime_error"', 'return "bad_json" if "json" in str(e) else "runtime_error"'),
+ ("S2h degraded_exc not recorded", 'row["degraded_reason"], row["degraded_exc"] = reason, rec.error_exc', 'row["degraded_reason"], row["degraded_exc"] = reason, None'),
+ ("R7d the JEV error is swallowed by the spy (production behaviour changed)", "            rec.error_kind, rec.error_exc = jev_error_kind(e), type(e).__name__\n            raise\n", "            rec.error_kind, rec.error_exc = jev_error_kind(e), type(e).__name__\n            return {}\n"),
  ("R7e an error wipes the row", EXC, "row = _blank_row(sid, mode, []); " + EXC),
  ("R7f error_stage always admit", EXC, 'row["error"], row["error_stage"] = type(e).__name__, "admit"'),
  # --- B-R2 fidelity ---------------------------------------------------------------------------------------------------------------
@@ -66,7 +74,10 @@ M = [
  ("R2e raw_text is the rewrite", "raw_text=text), ledger)", "raw_text=delegate), ledger)"),
  ("R2f playback_active not passed", "playback_active=playback_active, raw_text", "playback_active=False, raw_text"),
  ("R2g history never accumulates with --shared-ledger", "            history_sink.append(", "            (lambda *_: None)("),
- ("R2i fixed-field fidelity codes dropped", 'codes = ["playback_active_fixed", "language_fixed", "no_asr_transcript"]', "codes = []"),
+ ("R2i fidelity codes dropped", '"no_asr_transcript"]\n    codes.append("rewrite_from_input"', '"x"]\n    codes.append("rewrite_from_input"'),
+ ("S1a playback_active value not recorded", 'str(bool(playback_active)).lower()', '"false"'),
+ ("S1b language value not recorded", 'f"language={language},jev_state_language=zh"', '"language=zh,jev_state_language=zh"'),
+ ("S1c run() does not pass the values to fidelity", "shared_ledger=shared_ledger, playback_active=playback_active, language=language)", "shared_ledger=shared_ledger)"),
  ("R2j rewrite not flagged", '"rewrite_from_input" if has_task else "no_frontend_rewrite"', '"no_frontend_rewrite"'),
  ("R2k fake_* codes dropped", 'codes += ["fake_jev", "fake_worker"]', "pass"),
  # --- B-R4 output guard -----------------------------------------------------------------------------------------------------------
@@ -91,15 +102,46 @@ M = [
  ("S3b a comparison with the sentence", "    stage = \"admit\"\n", "    stage = \"admit\"\n    _ = \"x\" in text\n"),
  ("S3c a method call on the sentence", "    stage = \"admit\"\n", "    stage = \"admit\"\n    _ = text.find(\"x\")\n"),
  ("S3d a CJK literal", "    stage = \"admit\"\n", "    stage = \"admit\"\n    _ = \"天气\"\n"),
+ # --- I-1 outcome columns / history like gateway.py -----------------------------------------------------------------------------
+ ("I1a history appended on every outcome", 'if history_sink is not None and out.kind == "answer":', "if history_sink is not None:"),
+ ("I1b history not capped", "del history_sink[:-HISTORY_KEEP]", "pass"),
+ ("I1c history cap 20", "HISTORY_KEEP = 12", "HISTORY_KEEP = 20"),
+ ("I1d outcome_kind not recorded", 'row["outcome_kind"], row["outcome_rejected"] = out.kind, out.rejected or None', 'row["outcome_kind"], row["outcome_rejected"] = None, None'),
+ ("I1e outcome_rejected not recorded", 'out.kind, out.rejected or None', "out.kind, None"),
+ # --- I-2 keyword-function conclusions --------------------------------------------------------------------------------------------
+ ("I2a clarify_slots not recorded", "rec.slots = (rec.slots or []) + [list(r or [])]", "pass"),
+ ("I2b save intent not recorded", "rec.save_intent = (rec.save_intent or []) + [bool(r)]", "pass"),
+ ("I2c the wrapper changes the keyword function's answer", "            return r\n        return wrapper", "            return r if sink != 'slots' else []\n        return wrapper"),
+ ("I2d the wrappers are not restored", "        for o, n, v in saved:\n            setattr(o, n, v)", "        pass"),
+ ("I2e the memory_gate function is not wrapped", 'recording(memory_gate.has_explicit_save_intent, "save"))', "memory_gate.has_explicit_save_intent)"),
+ ("I2f the wrapper records the ARGUMENT", "[bool(r)]", "[str(a)]"),
+ ("I2g clarify_slots lost on the non-job path", '        row["clarify_slots"] = rec.slots\n        if res.job is None:', "        if res.job is None:"),
+ # --- S-4 metamorphic: logic that forks on the sentence is found whatever the variables are called --------------------------------
+ ("S4a forks on the sentence length (no comparison node)", 'row["control_via"] = _control_via(res, rec.route, rec.control)\n', 'row["control_via"] = _control_via(res, rec.route, rec.control)\n        if len(text) % 2:\n            row["control_via"] = "jev"\n'),
+ ("S4b forks on the sentence through an alias", 'row["control_via"] = _control_via(res, rec.route, rec.control)\n', 'row["control_via"] = _control_via(res, rec.route, rec.control)\n        t = text\n        row["decision"] = "X" if ord(t[0]) % 2 else row["decision"]\n'),
+ ("S4c route_via forks on the sentence", 'row["route_via"] = _route_via(res, rec.route, use_jev, set(ROUTE_CRITERIA))\n', 'row["route_via"] = _route_via(res, rec.route, use_jev, set(ROUTE_CRITERIA))\n        row["route_via"] = "heuristic" if sum(map(ord, text)) % 3 == 0 else row["route_via"]\n'),
+ # --- S-5 -------------------------------------------------------------------------------------------------------------------------
+ ("S5a a foreign .done is a traceback not exit 6", "            raise SystemExit(EXIT_DONE_FAILED)\n        with os.fdopen(done_fd", "            raise\n        with os.fdopen(done_fd"),
+ ("S5b an unreadable input is a traceback", "    except OSError as e:\n        print(f\"blind_runner: cannot read", "    except ZeroDivisionError as e:\n        print(f\"blind_runner: cannot read"),
+ ("S5c an unwritable output is a traceback", "    except OSError as e:                         # e.g.", "    except ZeroDivisionError as e:                         # e.g."),
+ ("S5d the exit code for a lost race is not 5", "    except FileExistsError:                      # lost a race for the output file itself\n        print(\"blind_runner: refusing to write the output: it already exists (nothing was changed)\", file=sys.stderr)\n        return EXIT_OUT_REFUSED", "    except FileExistsError:                      # lost a race for the output file itself\n        return 0"),
+]
+# Mutants that are equivalent to the unmutated runner BY CONSTRUCTION (the tests cannot, and must not, see them). They must survive.
+EQUIVALENT = [
+ ("M14 ERROR-level log of the sentence in the error branch (Critic's original: invisible under logging.disable(CRITICAL))", EXC, EXC + '\n        logging.getLogger().error("x %s", text)'),
 ]
 # M14 needs the weaker seal to be observable (see the module docstring)
-COMBO = {"M14 ERROR-level log of the sentence in the error branch (with the seal at WARNING)": ("    logging.disable(logging.CRITICAL)\n", "    logging.disable(logging.WARNING)\n")}
+COMBO = {"M14w ERROR-level log of the sentence in the error branch (with the seal at WARNING)": ("    logging.disable(logging.CRITICAL)\n", "    logging.disable(logging.WARNING)\n")}
 # M9b needs the warning itself
 EXTRA = {"M9b warnings not ignored and warn(sentence)": (WRITE, "                warnings.warn(s.text)\n" + WRITE)}
 
 
+WORK = tempfile.mkdtemp(prefix="blind_runner_mut_")      # the cwd of every pytest run; deleted at the end
+
+
 def run_tests(env):
-    r = subprocess.run([PY, "-m", "pytest", "-q", "-p", "no:cacheprovider", "--maxfail=50", "-rfE", *TESTS], capture_output=True, text=True, env=env, timeout=600)
+    r = subprocess.run([PY, "-m", "pytest", "-q", "-p", "no:cacheprovider", "--maxfail=50", "-rfE", *TESTS], capture_output=True, text=True, env=env,
+                       cwd=WORK, timeout=600)
     out = r.stdout + r.stderr
     def n(word):
         m = re.search(r"(\d+) " + word, out)
@@ -114,18 +156,21 @@ def script_error(msg):
 
 
 env = {k: v for k, v in os.environ.items() if not k.startswith("SOPHON_LIVE_")}
-env.update(PYTHONPATH=".", PYTHONDONTWRITEBYTECODE="1")
-for _d, _dn, _fn in os.walk("."):
-    if os.path.basename(_d) == "__pycache__":
-        shutil.rmtree(_d, ignore_errors=True)
+env.update(PYTHONPATH=LIVE, PYTHONDONTWRITEBYTECODE="1")
+def clean_pycache():
+    for _d, _dn, _fn in os.walk(LIVE):
+        if os.path.basename(_d) == "__pycache__":
+            shutil.rmtree(_d, ignore_errors=True)
+
+
+clean_pycache()
 rc, passed, failed, errors, _, out = run_tests(env)
 if rc != 0 or failed or errors or passed == 0:
     script_error(f"baseline is not green on the unmutated runner (rc={rc} passed={passed} failed={failed} errors={errors})\n" + out[-1500:])
 print(f"baseline ok: {passed} tests {TESTS}")
 
 orig_src = open(SRC, encoding="utf-8").read()
-killed_n = survived_n = 0
-for name, old, new in M:
+def apply(old, new, name):
     src = orig_src
     pairs = [(old, new)] + ([COMBO[name]] if name in COMBO else []) + ([EXTRA[name]] if name in EXTRA else [])
     for o, nw in pairs:
@@ -135,21 +180,38 @@ for name, old, new in M:
     shutil.copy(SRC, SRC + ".orig")
     try:
         open(SRC, "w", encoding="utf-8").write(src)
-        rc, passed, failed, errors, names, out = run_tests(env)
+        res = run_tests(env)
     finally:
         shutil.move(SRC + ".orig", SRC)
-        for _d, _dn, _fn in os.walk("."):
-            if os.path.basename(_d) == "__pycache__":
-                shutil.rmtree(_d, ignore_errors=True)
+        clean_pycache()
+    rc, passed, failed, errors, names, out = res
     if errors or (passed + failed) == 0:
         script_error(f"mutant '{name}' broke import/collection or collected no tests (errors={errors}, ran={passed + failed}); that is not a kill\n" + out[-1200:])
-    if failed:
-        killed_n += 1
-        print("KILLED  ", name, "|", f"{failed} failing:", "; ".join(names[:2]))
-    else:
-        survived_n += 1
-        print("SURVIVED", name)
-if open(SRC, encoding="utf-8").read() != orig_src:
-    script_error("the runner source was not restored")
+    return failed, names
+
+
+for _name, _old, _new in M + EQUIVALENT:                  # every mutant must apply before any test run is spent
+    for _o in [_old] + [x[0] for x in (COMBO.get(_name), EXTRA.get(_name)) if x]:
+        if _o not in orig_src:
+            script_error("mutant not applicable (old text not found): " + _name + " :: " + _o[:60])
+killed_n = survived_n = 0
+try:
+    for name, old, new in M:
+        failed, names = apply(old, new, name)
+        if failed:
+            killed_n += 1
+            print("KILLED  ", name, "|", f"{failed} failing:", "; ".join(names[:2]))
+        else:
+            survived_n += 1
+            print("SURVIVED", name)
+    for name, old, new in EQUIVALENT:
+        failed, names = apply(old, new, name)
+        print("EQUIVALENT (expected to survive):", name, "->", "SURVIVED, as proven" if not failed else f"killed by {names[:2]} (the equivalence claim is wrong; investigate)")
+finally:
+    if open(SRC, encoding="utf-8").read() != orig_src:
+        open(SRC, "w", encoding="utf-8").write(orig_src)
+        print("SCRIPT ERROR: the runner source was not restored by a mutant run; it has been rewritten from the original text")
+        sys.exit(2)
+    shutil.rmtree(WORK, ignore_errors=True)
 print(f"killed={killed_n} survived={survived_n} of {len(M)}")
 sys.exit(1 if survived_n else 0)

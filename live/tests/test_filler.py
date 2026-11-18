@@ -44,5 +44,19 @@ class FrontInstructionTests(unittest.TestCase):
         self.assertNotIn("say one very short spoken phrase that you're on it", DELEGATE["en"]["description"])
 
 
+class SystemPromptTests(unittest.TestCase):
+    def test_session_prompt_carries_the_per_type_lead_in_rule(self) -> None:
+        from tests.test_r0_coord_boundary import _bare_session
+        s = _bare_session()
+        s.instructions, s.lang = "你是小助手。", "zh"
+        p = s._sys()
+        self.assertTrue(p.startswith("你是小助手。"))
+        self.assertIn("我帮你查一下", p)
+        self.assertIn("好的，马上", p)
+        self.assertIn("讲笑话，不要说任何过渡语", p)
+        s.lang = "en"
+        self.assertIn("a joke, say nothing", s._sys())
+
+
 if __name__ == "__main__":
     unittest.main()

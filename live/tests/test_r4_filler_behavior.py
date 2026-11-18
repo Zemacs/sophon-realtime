@@ -76,16 +76,16 @@ class LeadInRuleReachesTheEngine(unittest.TestCase):
     def test_prompt_and_coordinator_prescribe_the_same_lead_in_per_type(self) -> None:
         rule = gw.FILLER_RULE["zh"]
         by_lead_in = {
-            "我帮你查一下。": ["明天北京天气怎么样", "今天有什么科技新闻", "今天美元兑人民币是多少", "比特币现在多少钱", "你还记得我喜欢吃什么吗"],
+            "我帮你查一下。": ["明天北京天气怎么样", "今天有什么科技新闻", "今天美元兑人民币是多少", "比特币现在多少钱"],
             "好的，马上。": ["把客厅的灯关掉"],
-            "": ["现在几点了", "讲个笑话"],
+            "": ["现在几点了", "讲个笑话", "你还记得我喜欢吃什么吗"],
         }
         for lead_in, texts in by_lead_in.items():
             for text in texts:
                 self.assertEqual(intent.pad_for(text), lead_in, text)                    # what the Coordinator pads with
                 if lead_in:
                     self.assertIn(lead_in.rstrip("。"), rule, text)                      # ...is what the prompt tells the front to say
-        self.assertIn("问时间或日期、讲笑话，不要说任何过渡语", rule)                          # and the no-lead-in types are the same two
+        self.assertIn("问时间或日期、讲笑话、问我记得什么（记忆），不要说任何过渡语", rule)           # and the no-lead-in types are the same three (memory: v0.1.0, live-tested)
 
 
 if __name__ == "__main__":

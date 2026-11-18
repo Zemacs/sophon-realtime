@@ -70,3 +70,7 @@ Measured on one H100 (mock backend, 14 recorded questions):
 ### Release gate
 
 `python tests/release_gate.py` (from `live/`, with pytest, httpx, websockets, fastapi, uvicorn, numpy, aiohttp installed) fails unless **node** is installed (the page behaviour tests need it), no page test is skipped, the full suite passes with `SOPHON_LIVE_*` cleared, and `tests/mutation_check_r4c.py` kills every mutant. There is no CI in this repository; run the gate before releasing.
+
+### Blind runner (I-10 routing test)
+
+`python -m tools.blind_runner SENTENCES OUT.jsonl` (from `live/`) records, per sentence, the Coordinator's route / JEV answer / `via` (jev, guard, heuristic, plus a `degraded` flag) / tools called / reply, into `OUT.jsonl` only. It never scores. The default **fake mode** needs no server. **Real mode** (`--mode real --jev-url ... [--orch-url ...]`) is refused unless `BLIND_RUNNER_ALLOW_REAL=1` and is meant for after the server freeze is lifted. There is no text-turn interface on the gateway or the Realtime face (speech only), so `--mode gateway` is unavailable. Sentence text is never logged, printed or persisted anywhere but the reply field of the output file; see the docstring of `tools/blind_runner.py` and `tests/test_blind_runner.py`.

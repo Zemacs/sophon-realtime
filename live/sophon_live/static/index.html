@@ -48,7 +48,7 @@ small code{background:#0d1117;padding:1px 4px;border-radius:4px}
       <textarea id="ins" rows="6">你是小智，一个温暖、幽默的语音伙伴。说话简短自然，像朋友聊天一样。</textarea></div>
     <div class="row">
       <div><label>委派（delegation）</label><select id="dlg"><option value="client" selected>client：交给后端</option><option value="none">关闭</option></select></div>
-      <div><label>后端</label><select id="be"><option value="auto" selected>内置演示后端</option><option value="manual">手动回答</option></select></div>
+      <div><label>后端</label><select id="be"><option value="manual" selected>手动回答</option></select></div>
     </div>
     <div class="row">
       <div><label>注入方式</label><select id="via"><option value="commentary" selected>commentary（转述）</option><option value="thinking">thinking（背景）</option></select></div>
@@ -63,7 +63,7 @@ small code{background:#0d1117;padding:1px 4px;border-radius:4px}
       <div><b id="dlat">–</b><span>委派结果→开口</span></div>
     </div>
     <p class="hint">建议戴耳机（外放的声音会被麦克风收进去）。直接说话，说完它就接话；它说话时可以随时打断。<br>
-    问时间、日期、天气、关灯这类事会触发委派：内置演示后端查真实时间和天气（Open-Meteo），设备类操作模拟成功；其他问题可切到“手动回答”自己当后端。</p>
+    需要工具的请求会触发委派：网关配了 GPU 侧后端（orch / coord）时由它处理，页面只显示委派卡片；否则页面弹出手动回答框，由你自己当后端。页面不再内置任何演示后端。</p>
     <p class="hint">用 duplex-system 等 GPT-Live 客户端接入：把 <code>live_url</code> 改成上面的接口地址即可（不带 Origin 头）。</p>
   </section>
   <section class="panel">
@@ -167,30 +167,6 @@ function onEvent(ev) {
   else if (t === "error") { bubble("deleg", "错误：" + (ev.error && ev.error.message)); }
   else if (t === "session.closed") { setSt("会话已结束"); }
 }
-// ---------------- demo backend
-const CITIES = {"北京": "Beijing", "上海": "Shanghai", "广州": "Guangzhou", "深圳": "Shenzhen", "杭州": "Hangzhou", "成都": "Chengdu", "南京": "Nanjing", "武汉": "Wuhan", "西安": "Xi'an", "重庆": "Chongqing", "天津": "Tianjin", "苏州": "Suzhou", "香港": "Hong Kong", "台北": "Taipei", "东京": "Tokyo", "纽约": "New York", "伦敦": "London", "巴黎": "Paris", "墨尔本": "Melbourne", "悉尼": "Sydney", "新加坡": "Singapore"};
-async function weather(task) {
-  let city = null;
-  for (const [zh, en] of Object.entries(CITIES)) if (task.includes(zh) || task.toLowerCase().includes(en.toLowerCase())) { city = en; break; }
-  city = city || "Beijing";
-  const g = await (await fetch(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(city)}&count=1`)).json();
-  const p = g.results && g.results[0]; if (!p) return null;
-  const w = await (await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${p.latitude}&longitude=${p.longitude}&current=temperature_2m,weather_code&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max,weather_code&timezone=auto&forecast_days=2`)).json();
-  const tmr = /明天|tomorrow/i.test(task) ? 1 : 0, d = w.daily;
-  const zh = /[一-鿿]/.test(task), code = d.weather_code[tmr];
-  const desc = zh ? (code <= 1 ? "晴" : code <= 3 ? "多云" : code <= 48 ? "有雾" : code <= 67 ? "有雨" : code <= 77 ? "有雪" : code <= 82 ? "阵雨" : "雷雨") : (code <= 1 ? "clear" : code <= 3 ? "cloudy" : code <= 48 ? "foggy" : code <= 67 ? "rainy" : code <= 77 ? "snowy" : code <= 82 ? "showers" : "thunderstorms");
-  const name = zh ? (Object.entries(CITIES).find(([, en]) => en === city) || [city])[0] : city;
-  return zh ? `${name}${tmr ? "明天" : "今天"}${desc}，气温${Math.round(d.temperature_2m_min[tmr])}到${Math.round(d.temperature_2m_max[tmr])}度，降水概率${d.precipitation_probability_max[tmr]}%。${tmr ? "" : `现在${Math.round(w.current.temperature_2m)}度。`}`
-            : `${name} ${tmr ? "tomorrow" : "today"}: ${desc}, ${Math.round(d.temperature_2m_min[tmr])} to ${Math.round(d.temperature_2m_max[tmr])}°C, ${d.precipitation_probability_max[tmr]}% chance of rain.`;
-}
-async function demoBackend(task) {
-  const zh = /[一-鿿]/.test(task), now = new Date(), s = task.toLowerCase();
-  if (/天气|下雨|气温|温度|冷不冷|热不热|weather|rain|temperature/.test(s)) return await weather(task);
-  if (/几点|时间|what time|the time/.test(s)) return zh ? `现在是${now.getHours()}点${now.getMinutes()}分。` : `It's ${now.toLocaleTimeString("en-US", {hour: "numeric", minute: "2-digit"})}.`;
-  if (/日期|几号|星期|周几|礼拜|date|what day/.test(s)) return zh ? `今天是${now.getMonth() + 1}月${now.getDate()}日，星期${"日一二三四五六"[now.getDay()]}。` : `Today is ${now.toLocaleDateString("en-US", {weekday: "long", month: "long", day: "numeric"})}.`;
-  if (/灯|空调|音量|窗帘|电视|播放|闹钟|提醒|light|volume|alarm|remind|play/.test(s)) return zh ? `（模拟设备）已经帮你${task.replace(/^帮我|请/, "")}了。` : `(simulated device) Done: ${task}.`;
-  return null;
-}
 async function onDelegation(d) {
   nDeleg++; $("#ndl").textContent = nDeleg; lastDelegId = d.id;
   const card = document.createElement("div"); card.className = "deleg";
@@ -198,13 +174,8 @@ async function onDelegation(d) {
   card.querySelector("b").textContent = d.task || "（未带任务文本）"; $("#chat").appendChild(card); $("#chat").scrollTop = 1e9;
   const setR = t => card.querySelector(".r").textContent = t;
   // GPU-side backends inject commentary themselves; the page only displays the card.
-  if (d.backend === "orch") { setR("GPU 编排（文本 LLM + 工具）处理中…"); return; }
-  if ($("#be").value === "manual") { pendingDeleg = {id: d.id, setR}; $("#manual").style.display = ""; $("#mtask").textContent = d.task || d.id; $("#mtext").focus(); setR("等你手动回答…"); return; }
-  let r = null;
-  try { r = await demoBackend(d.task || (curUser && curUser.textContent) || ""); } catch (e) { r = null; }
-  if (r === null) { pendingDeleg = {id: d.id, setR}; $("#manual").style.display = ""; $("#mtask").textContent = d.task || d.id; setR("演示后端答不了这个，请手动回答（或 10 秒后自动兜底）");
-    setTimeout(() => { if (pendingDeleg && pendingDeleg.id === d.id) inject(d.id, /[一-鿿]/.test(d.task || "") ? "这个后端暂时查不到，请委婉地告诉用户，换个问法试试。" : "The backend couldn't find this; tell the user politely and suggest rephrasing.", $("#via").value, setR); }, 10000); return; }
-  setTimeout(() => inject(d.id, r, $("#via").value, setR), Math.max(0, +$("#bdelay").value) * 1000);
+  if (d.backend === "orch" || d.backend === "coord") { setR("GPU 侧后端（编排 / 协调器）处理中…"); return; }
+  pendingDeleg = {id: d.id, setR}; $("#manual").style.display = ""; $("#mtask").textContent = d.task || d.id; $("#mtext").focus(); setR("等你手动回答…");
 }
 function inject(id, text, via, setR) {
   send({type: via === "thinking" ? "session.thinking.append" : "session.commentary.append", content: text, delegation_id: id});

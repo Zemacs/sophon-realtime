@@ -17,6 +17,8 @@ ORCH = "sophon_live/assistant_tools/orchestrator.py"
 GR = "sophon_live/grounding.py"; RT = "sophon_live/realtime.py"; GW = "sophon_live/gateway.py"
 T_G = ["tests.test_r4g_failure_hint", "tests.test_assistant_tools"]
 T_H = ["tests.test_r4h_grounding_news"]
+T_I = ["tests.test_r4i_demo_removed_retired_env"]
+IDX = "sophon_live/static/index.html"
 T_F = ["tests.test_r4e_b4_i18", "tests.test_orch_worker", "tests.test_orchestrator"]
 NEWS = "sophon_live/assistant_tools/news.py"; WS = "sophon_live/assistant_tools/web_search.py"; WX = "sophon_live/assistant_tools/weather.py"
 INF = "sophon_live/assistant_tools/inflight.py"; SCH = "sophon_live/coordinator/schemas.py"; INT = "sophon_live/coordinator/intent.py"
@@ -87,6 +89,15 @@ M = [
  ("orchestrator: a required enum value outside the enum is accepted", ORCH, "                if not v or (enum and v not in enum):", "                if not v:", T_H),
  ("orchestrator: the job language no longer fills get_news lang", ORCH, 'args.get("lang") not in ("zh", "en") and job.language in ("zh", "en")', "False", T_H),
  ("schema: get_news topic is a free string again", "sophon_live/assistant_tools/registry.py", '"topic": {"type": "string", "enum": ["tech", "finance", "world", "general"], ', '"topic": {"type": "string", ', T_H),
+  # Round 4i (I-22 demo backend deleted / retired env var warning)
+ ("I-22: the page short-circuits orch only (coord gets the demo path again)", IDX, 'd.backend === "orch" || d.backend === "coord"', 'd.backend === "orch"', T_I),
+ ("I-22: the demo backend code is back in the page", IDX, "async function onDelegation(d) {", "async function demoBackend(task) { return null; }\nasync function onDelegation(d) {", T_I),
+ ("I-22: the page answers a delegation by itself after a delay", IDX, 'setR("等你手动回答…");', 'setR("等你手动回答…"); setTimeout(() => inject(d.id, "demo", "commentary", setR), 800);', T_I),
+ ("I-22: the page fetches from a weather API again", IDX, "async function onDelegation(d) {", "async function wx() { return await fetch('https://api.open-meteo.com'); }\nasync function onDelegation(d) {", T_I),
+ ("retired env: main no longer runs the startup check", GW, "    warn_retired_env()\n", "", T_I),
+ ("retired env: the warning is never logged", GW, "        log.warning(\"%s is set but", "        log.debug(\"%s is set but", T_I),
+ ("retired env: the warning echoes the value", GW, 'remove it from the environment", n)', 'remove it from the environment" + os.environ[n], n)', T_I),
+ ("retired env: an empty value is treated as unset", GW, "hit = [n for n in RETIRED_ENV_VARS if n in os.environ]", "hit = [n for n in RETIRED_ENV_VARS if os.environ.get(n)]", T_I),
 ]
 def run_group(tests, env):
     """-> (returncode, passed, failed, errors, failed_names, output). Uses pytest; module names are mapped to files."""

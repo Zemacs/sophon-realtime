@@ -22,7 +22,7 @@ cd sophon-realtime/tag && GPU=0 PORT=8000 bash start.sh
 cd ../live && BUILD=tag PORT=8000 LIVE_PORT=8780 bash start_live.sh
 ```
 
-GPT-Live clients connect to `ws://HOST:8780/v1/live/sessions`; `http://HOST:8780/` is a browser test page (microphone, delegation cards, a demo backend and the protocol event log). Stop with `LIVE_PORT=8780 bash stop_live.sh`.
+GPT-Live clients connect to `ws://HOST:8780/v1/live/sessions`; `http://HOST:8780/` is a browser test page (microphone, delegation cards, a manual-answer box and the protocol event log). Stop with `LIVE_PORT=8780 bash stop_live.sh`.
 
 The gateway loads a small ASR model for the user transcript (`Qwen/Qwen3-ASR-0.6B-hf`, about 2 GB of GPU memory). In mainland China, download it from ModelScope first: `modelscope download --model Qwen/Qwen3-ASR-0.6B-hf --local_dir ./asr`, then `SOPHON_LIVE_ASR=./asr bash start_live.sh`.
 

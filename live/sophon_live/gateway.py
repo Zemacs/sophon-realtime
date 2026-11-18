@@ -975,9 +975,21 @@ def _exposure_note(host: str) -> str:
     return f"gateway bound to {host}: reachable from every network this machine is on; the gateway has NO authentication, rely on the firewall"
 
 
+RETIRED_ENV_VARS = ("SOPHON_LIVE_GROUND_MODE",)      # retired settings: set-ness is checked, the value is never read or logged
+
+
+def warn_retired_env() -> list[str]:
+    """One WARN per retired env var that is still set, so a stale config does not stop working silently. Returns the names warned about."""
+    hit = [n for n in RETIRED_ENV_VARS if n in os.environ]
+    for n in hit:
+        log.warning("%s is set but is no longer used and has no effect (retired in Round 4h); remove it from the environment", n)
+    return hit
+
+
 def main() -> None:
     args = _build_parser().parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    warn_retired_env()
     (log.info if args.host in ("127.0.0.1", "localhost", "::1") else log.warning)("%s", _exposure_note(args.host))
     asr = ASR(args.asr) if args.asr else None
     if asr is not None:

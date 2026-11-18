@@ -36,7 +36,7 @@ def wilson_upper(k: int, n: int, z: float = 1.96) -> float:
 
 
 async def judge(text: str) -> str:
-    state = {"utterance": text, "user_said": text, "playback_active": False, "tasks": []}
+    state = {"utterance": text, "user_said": text, "playback_active": False, "tasks": [], "language": "zh"}
     resp = await jev_stub.real_system_one(state, {intent.TOOL_KEY: intent.build_tool_question()})
     return str(jev_client.choice_answer(resp, intent.TOOL_KEY))
 

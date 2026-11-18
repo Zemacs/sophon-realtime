@@ -409,7 +409,9 @@ async def run(args: dict[str, Any] | None = None) -> str:
     text, meta = await run_detailed(args)
     from . import toolmeta
 
-    toolmeta.note(ok=False if meta.get("ok") is False else None, source=meta.get("source"), fallbacks=len(meta.get("notes") or []) or None,
+    if meta.get("ok") is False:
+        toolmeta.note(ok=False)              # only a failure is noted: a stray ok=None would overwrite the evidence's own ok (live regression)
+    toolmeta.note(source=meta.get("source"), fallbacks=len(meta.get("notes") or []) or None,
                   orig_source=meta.get("orig_source"), age_s=meta.get("age_s"),
                   failure=meta.get("failure"),
                   **{failcodes.SUCCESS_KEY: True if (not meta.get("failure") and meta.get("tmin") is not None and meta.get("tmax") is not None) else None},

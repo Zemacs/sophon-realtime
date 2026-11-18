@@ -70,6 +70,24 @@ class RunJobTests(unittest.IsolatedAsyncioTestCase):
         # the job objective is the only task text the model sees
         self.assertIn("北京明天天气", sess.posts[0]["json"]["messages"][1]["content"])
 
+    async def test_the_real_weather_tool_success_counts_as_evidence_for_a_required_tool(self) -> None:
+        """Live regression (rc3 :8790): weather.run noted ok=None in toolmeta, which overwrote the evidence's ok -> the required tool never
+        counted as satisfied -> the worker kept forcing get_weather until its step budget ran out ("我还在查")."""
+        from sophon_live.assistant_tools import weather
+
+        async def fake_detailed(args):
+            return "上海明天多云，气温5到12度。", {"city": "上海", "tmin": "5", "tmax": "12", "now": "7.3", "source": "sojson"}
+
+        sess = _FakeSession([
+            _FakeResp(200, _tool_call("get_weather", '{"city":"上海","when":"tomorrow"}')),
+            _FakeResp(200, _say("上海明天多云，气温5到12度。")),
+        ])
+        with mock.patch.object(orch.aiohttp, "ClientSession", return_value=sess), mock.patch.object(weather, "run_detailed", fake_detailed):
+            res = await orch.run_job(_job("明天上海会下雨吗", require_tools=["get_weather"]))
+        self.assertEqual(res.status, "completed", res.spoken_answer)
+        self.assertTrue(res.evidence[0]["ok"])
+        self.assertEqual(len(sess.posts), 2)
+
     async def test_missing_required_slot_is_reported_not_asked(self) -> None:
         sess = _FakeSession([_FakeResp(200, _tool_call("get_weather", '{"when":"tomorrow"}'))])
         rt = mock.AsyncMock(return_value="should not run")

@@ -43,7 +43,7 @@ SOJSON = {
         {"high": "高温 12℃", "low": "低温 2℃", "type": "小雨"},
     ]},
 }
-ENV = {"SOPHON_WEATHER_TIMEOUT": "0.6", "SOPHON_WEATHER_ROUNDS": "1"}
+ENV = {"SOPHON_WEATHER_TIMEOUT": "0.6", "SOPHON_WEATHER_ROUNDS": "1", "SOPHON_WEATHER_CACHE_TTL": "0"}  # cache off unless a test turns it on
 
 
 def _router(om=None, wttr=None, om_delay=0.0, wttr_delay=0.0, sojson=None, sj_delay=0.0):
@@ -68,6 +68,7 @@ def _router(om=None, wttr=None, om_delay=0.0, wttr_delay=0.0, sojson=None, sj_de
 class WeatherSourceTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         weather.STATS.clear()
+        weather.CACHE.clear()
 
     async def test_open_meteo_parse_and_wmo_text(self) -> None:
         with mock.patch.dict(os.environ, ENV), mock.patch.object(weather, "_fetch_json", _router(om=OM, wttr=TimeoutError("x"))):
@@ -181,6 +182,62 @@ class WeatherSourceTests(unittest.IsolatedAsyncioTestCase):
     async def test_sojson_error_status_is_not_success(self) -> None:
         self.assertIsNone(weather._normalize_sojson({"status": 304, "data": {}}, 1, zh=True))
         self.assertIsNone(weather._normalize_sojson({"status": 200, "data": {"forecast": [{"high": "x"}]}}, 0, zh=True))
+
+    async def test_fresh_cache_answers_instantly_without_touching_the_network(self) -> None:
+        env = {**ENV, "SOPHON_WEATHER_CACHE_TTL": "600"}
+        fetch = _router(om=OM, wttr=WTTR)
+        with mock.patch.dict(os.environ, env), mock.patch.object(weather, "_fetch_json", fetch):
+            first, m1 = await weather.run_detailed({"city": "北京", "when": "tomorrow"})
+            calls = len(fetch.calls)
+            second, m2 = await weather.run_detailed({"city": "北京", "when": "tomorrow"})
+        self.assertEqual(first, second)
+        self.assertEqual(len(fetch.calls), calls)  # nothing fetched the second time
+        self.assertEqual((m1["source"], m2["source"]), ("open-meteo", "cache"))
+
+    async def test_cache_is_per_city_and_day(self) -> None:
+        env = {**ENV, "SOPHON_WEATHER_CACHE_TTL": "600"}
+        fetch = _router(om=OM, wttr=WTTR)
+        with mock.patch.dict(os.environ, env), mock.patch.object(weather, "_fetch_json", fetch):
+            await weather.run({"city": "北京", "when": "tomorrow"})
+            _, m = await weather.run_detailed({"city": "上海", "when": "tomorrow"})
+            _, m2 = await weather.run_detailed({"city": "北京", "when": "today"})
+        self.assertNotEqual(m["source"], "cache")
+        self.assertNotEqual(m2["source"], "cache")
+
+    async def test_blackout_falls_back_to_old_data_but_says_so(self) -> None:
+        env = {**ENV, "SOPHON_WEATHER_CACHE_TTL": "60"}
+        with mock.patch.dict(os.environ, env), mock.patch.object(weather, "_fetch_json", _router(om=OM, wttr=WTTR)):
+            await weather.run({"city": "北京", "when": "today"})
+        key = next(iter(weather.CACHE))
+        ts, data, src = weather.CACHE[key]
+        weather.CACHE[key] = (ts - 15 * 60, data, src)  # 15 min old: past the fresh TTL
+        down = _router(om=OSError("down"), wttr=TimeoutError("down"), sojson=OSError("down"))
+        with mock.patch.dict(os.environ, env), mock.patch.object(weather, "_fetch_json", down):
+            text, meta = await weather.run_detailed({"city": "北京", "when": "today"})
+        self.assertEqual(meta["source"], "cache-stale")
+        self.assertTrue(text.startswith("网络不太好，这是15分钟前查到的："))
+        self.assertNotIn("现在", text)  # an old reading is not "now"
+
+    async def test_ancient_or_missing_cache_is_not_used(self) -> None:
+        env = {**ENV, "SOPHON_WEATHER_CACHE_TTL": "60"}
+        with mock.patch.dict(os.environ, env), mock.patch.object(weather, "_fetch_json", _router(om=OM, wttr=WTTR)):
+            await weather.run({"city": "北京", "when": "today"})
+        key = next(iter(weather.CACHE))
+        ts, data, src = weather.CACHE[key]
+        weather.CACHE[key] = (ts - 3 * 3600, data, src)
+        down = _router(om=OSError("down"), wttr=TimeoutError("down"), sojson=OSError("down"))
+        with mock.patch.dict(os.environ, env), mock.patch.object(weather, "_fetch_json", down):
+            text = await weather.run({"city": "北京", "when": "today"})
+        self.assertEqual(text, "暂时查不到北京的天气，请稍后再试。")
+        with mock.patch.dict(os.environ, env), mock.patch.object(weather, "_fetch_json", down):
+            self.assertEqual(await weather.run({"city": "上海", "when": "today"}), "暂时查不到上海的天气，请稍后再试。")
+
+    async def test_failures_are_not_cached(self) -> None:
+        env = {**ENV, "SOPHON_WEATHER_CACHE_TTL": "600"}
+        down = _router(om=OSError("down"), wttr=TimeoutError("down"), sojson=OSError("down"))
+        with mock.patch.dict(os.environ, env), mock.patch.object(weather, "_fetch_json", down):
+            await weather.run({"city": "北京", "when": "today"})
+        self.assertEqual(weather.CACHE, {})
 
     async def test_sources_can_be_selected_for_ab_runs(self) -> None:
         fetch = _router(om=OM, wttr=WTTR)

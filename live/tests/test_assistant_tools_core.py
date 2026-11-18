@@ -57,6 +57,9 @@ class DatetimeToolTests(unittest.IsolatedAsyncioTestCase):
 
 
 class WeatherToolTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        weather.CACHE.clear()
+
     async def test_weather_today_zh_mocked(self) -> None:
         payload = {
             "current_condition": [{"temp_C": "18"}],

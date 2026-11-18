@@ -1,4 +1,4 @@
-"""City weather from independent sources, raced: Open-Meteo, sojson (CN-hosted, mainland cities) and wttr.in.
+"""City weather from independent sources, raced: Open-Meteo, sojson (CN-hosted, mainland cities) and wttr.in, with a short-lived cache.
 
 All of them are flaky from the GPU box (measured: each answers only some of the time, 1-40 s), so they run
 concurrently with a short per-source timeout; the first source that returns real data wins and the rest
@@ -88,6 +88,19 @@ _WMO: dict[int, tuple[str, str]] = {
 # per-source reachability counters since process start (read by the matrix / trace tooling)
 STATS: dict[str, dict[str, Any]] = {}
 
+# Recent answers, so a repeated question is instant and a network blackout does not erase what we just learned.
+# Fresh (<= SOPHON_WEATHER_CACHE_TTL, default 10 min) entries answer directly. Older ones (<= 2 h) are used ONLY
+# when every source has just failed, and are spoken as old data ("网络不太好，这是N分钟前查到的"), never as live.
+CACHE: dict[tuple, tuple[float, dict[str, Any], str]] = {}
+_STALE_MAX_S = 2 * 3600.0
+
+
+def _cache_ttl() -> float:
+    try:
+        return max(0.0, float(os.environ.get("SOPHON_WEATHER_CACHE_TTL", "600")))
+    except ValueError:
+        return 600.0
+
 
 def _note(source: str, ok: bool, ms: float, err: str = "") -> None:
     st = STATS.setdefault(source, {"ok": 0, "fail": 0, "ms_ok": [], "errors": {}})
@@ -108,9 +121,9 @@ def _timeout_s() -> float:
 
 def _rounds() -> int:
     try:
-        return max(1, int(os.environ.get("SOPHON_WEATHER_ROUNDS", "2")))
+        return max(1, int(os.environ.get("SOPHON_WEATHER_ROUNDS", "3")))
     except ValueError:
-        return 2
+        return 3
 
 
 def _source_names() -> list[str]:
@@ -310,6 +323,14 @@ async def run_detailed(args: dict[str, Any] | None = None) -> tuple[str, dict[st
         if en == query_name:
             name = zh_name
             break
+    import datetime as _dt
+
+    ckey = (name, idx, zh, _dt.date.today().isoformat())
+    hit = CACHE.get(ckey)
+    age_s = (time.time() - hit[0]) if hit else None
+    if hit and age_s is not None and age_s <= _cache_ttl():
+        return _compose(hit[1], name, when, idx, zh), {"source": "cache", "ms": 0, "notes": [], "age_s": round(age_s), "orig_source": hit[2]}
+
     data, source, notes = await _first_ok(query_name, name, idx, zh)
     meta = {"source": source or None, "ms": round((time.monotonic() - t0) * 1000), "notes": notes}
     if data is None and notes and all(n.endswith(":no_data") for n in notes):
@@ -317,10 +338,22 @@ async def run_detailed(args: dict[str, Any] | None = None) -> tuple[str, dict[st
         return (f"找不到{display_name}的天气信息。" if zh else f"No weather data for {display_name}."), meta
     if data is None:
         log.warning("weather all sources failed for %s: %s", display_name, notes)
+        if hit and age_s is not None and age_s <= _STALE_MAX_S:
+            mins = max(1, round(age_s / 60))
+            old = {**hit[1], "now": None}  # a "current temperature" that old is not current
+            body = _compose(old, name, when, idx, zh)
+            lead = f"网络不太好，这是{mins}分钟前查到的：" if zh else f"The network is poor; this is from {mins} min ago: "
+            meta.update(source="cache-stale", age_s=round(age_s), orig_source=hit[2])
+            return lead + body, meta
         if zh:
             return f"暂时查不到{display_name}的天气，请稍后再试。", meta
         return f"Weather for {display_name} is unavailable right now ({', '.join(notes) or 'no source'}).", meta
 
+    CACHE[ckey] = (time.time(), data, source)
+    return _compose(data, name, when, idx, zh), meta
+
+
+def _compose(data: dict[str, Any], name: str, when: str, idx: int, zh: bool) -> str:
     tmin, tmax, desc, precip, now = data["tmin"], data["tmax"], data["desc"], data["precip"], data.get("now")
     if not zh:
         day_word = "tomorrow" if when == "tomorrow" else "today"
@@ -328,13 +361,13 @@ async def run_detailed(args: dict[str, Any] | None = None) -> tuple[str, dict[st
         msg = f"{name} {day_word}: {desc}, {tmin} to {tmax}°C{rain}."
         if idx == 0 and now is not None:
             msg += f" Now {now}°C."
-        return msg, meta
+        return msg
     day_label = "明天" if when == "tomorrow" else "今天"
     rain = f"，降水概率{precip}%" if precip is not None else ""
     msg = f"{name}{day_label}{desc}，气温{tmin}到{tmax}度{rain}。"
     if idx == 0 and now is not None:
         msg += f"现在{now}度。"
-    return msg, meta
+    return msg
 
 
 async def run(args: dict[str, Any] | None = None) -> str:

@@ -9,6 +9,8 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from typing import Any
 
+from . import inflight
+
 _RSS_BASE = "https://news.google.com/rss/search"
 _UA = "sophon-live-assistant/1.0"
 
@@ -140,7 +142,7 @@ def _urlopen(url: str) -> bytes:
 
 
 async def _fetch_rss(url: str) -> bytes:
-    return await asyncio.to_thread(_urlopen, url)
+    return await asyncio.to_thread(inflight.guarded, _urlopen, url)      # S-14: same in-flight cap as web_search
 
 
 def _filter_topic(titles: list[str], topic: str, *, require_hit: bool) -> list[str]:

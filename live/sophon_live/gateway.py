@@ -544,6 +544,27 @@ class LiveSession:
         elif use_builtin:
             asyncio.create_task(self._builtin_resolve(did, what))
 
+    async def _ack_delegation(self, did: str, note: str) -> None:
+        """Close a delegation without speaking: the model gets a result, but is told to stay silent."""
+        d = self.deleg.get(did)
+        if d is None or getattr(self, "engine", None) is None:
+            return
+        try:
+            await self.engine.tool_result(d["call_id"], note, speak=False)
+        except Exception as e:  # noqa: BLE001
+            log.warning("session %s ack delegation %s failed: %s", self.id, did, e)
+
+    async def _coord_say(self, did: str, text: str) -> None:
+        d = self.deleg.get(did)
+        if d is None:
+            return
+        await self.send({"type": "session.commentary.appended", "start_ms": self.timeline_ms, "end_ms": self.timeline_ms,
+                         "client_event_id": "coord"})
+        d["chunks"].append(("commentary", text))
+        if d.get("timer"):
+            d["timer"].cancel()
+        await self._flush_deleg(did)
+
     async def _coord_resolve(self, did: str, what: str | None) -> None:
         """Path-1 Coordinator: Karpo/JEV route + ledger, then Worker orch for TOOL jobs."""
         from .coordinator import AdmitRequest, Ledger, admit, complete_job
@@ -551,6 +572,8 @@ class LiveSession:
 
         if not hasattr(self, "coord_ledger"):
             self.coord_ledger = Ledger()
+        if not hasattr(self, "coord_workers"):
+            self.coord_workers = {}                  # task_id -> in-flight worker asyncio.Task
         ledger: Ledger = self.coord_ledger
         d = self.deleg.get(did)
         if d is None:
@@ -572,44 +595,53 @@ class LiveSession:
         if result is None:
             await self._orch_resolve(did, what)
             return
+        # CANCEL / REFINE: the old (task_id, version) must stop now; its result is never spoken.
+        stale = getattr(result, "stale_task", None)
+        if stale is not None:
+            worker = self.coord_workers.pop(stale[0], None)
+            if worker is not None and not worker.done():
+                worker.cancel()
         if result.speak.kind == "stop_speaking":
             self._drop_playback("coord stop_speaking")
+            await self._ack_delegation(did, "已停止播报，不需要再说什么。")
             return
         if result.speak.kind in ("clarify", "answer") and result.speak.text and result.job is None:
-            await self.send({"type": "session.commentary.appended", "start_ms": self.timeline_ms, "end_ms": self.timeline_ms,
-                             "client_event_id": "coord"})
-            d["chunks"].append(("commentary", result.speak.text))
-            if d.get("timer"):
-                d["timer"].cancel()
-            await self._flush_deleg(did)
+            await self._coord_say(did, result.speak.text)
             return
         job = result.job
         if job is None:
-            # Tag already delegated; treat FAST as worker on the utterance.
-            from .coordinator.api import _new_job
-            job = _new_job(ledger, what or "")
+            # FAST (thanks / ok): nothing to run, nothing to say. Close the delegation silently.
+            await self._ack_delegation(did, "这句话不需要后台办事，不用再说什么。")
+            return
+        worker = asyncio.ensure_future(
+            resolve_task_orch(job.objective, instructions=self.instructions or "", history=getattr(self, "orch_history", None) or [])
+        )
+        self.coord_workers[job.task_id] = worker
         try:
-            hist = getattr(self, "orch_history", None) or []
-            text = await resolve_task_orch(job.objective, instructions=self.instructions or "", history=hist)
+            text = await worker
+        except asyncio.CancelledError:
+            if worker.cancelled():                   # cancelled by a later CANCEL/REFINE, not by us shutting down
+                log.info("session %s worker for %s v%s cancelled", self.id, job.task_id, job.version)
+                await self._ack_delegation(did, "这个任务已被取消或改口，不用再说什么。")
+                return
+            worker.cancel()
+            raise
         except Exception as e:  # noqa: BLE001
             log.warning("session %s coord worker error: %s", self.id, e)
             text = "后台编排出错了，请稍后再试。"
+        finally:
+            if self.coord_workers.get(job.task_id) is worker:
+                self.coord_workers.pop(job.task_id, None)
         text = (text or "").strip() or "好的，我这边查过了。"
-        complete_job(ledger, job, text)
+        if not complete_job(ledger, job, text):      # cancelled or superseded while running
+            await self._ack_delegation(did, "这个任务已被取消或改口，不用再说什么。")
+            return
         if not hasattr(self, "orch_history"):
             self.orch_history = []
         self.orch_history.append({"task": job.objective, "answer": text})
         if len(self.orch_history) > 12:
             self.orch_history = self.orch_history[-12:]
-        d = self.deleg.get(did)
-        if d is None:
-            return
-        await self.send({"type": "session.commentary.appended", "start_ms": self.timeline_ms, "end_ms": self.timeline_ms,
-                         "client_event_id": "coord"})
-        d["chunks"].append(("commentary", text))
-        if d.get("timer"):
-            d["timer"].cancel()
-        await self._flush_deleg(did)
+        await self._coord_say(did, text)
 
     async def _orch_resolve(self, did: str, what: str | None) -> None:
         """Path-1 co-located orchestrator: local text LLM selects tools; tools run on this host."""

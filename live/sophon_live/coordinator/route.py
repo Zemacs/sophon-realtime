@@ -1,9 +1,11 @@
 """Build System One questions and interpret route/control decisions."""
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from .ledger import Ledger
+from .schemas import ControlDecision, TaskStatus
 
 # Interactive routes (Jarvis-inspired, Path-1 subset)
 ROUTE_CRITERIA = {
@@ -48,8 +50,9 @@ def build_state(text: str, ledger: Ledger, *, playback_active: bool) -> dict[str
     }
 
 
-# Heuristic fallback when JEV is down — keep Path-1 usable.
+# Heuristic fallback when JEV is down (or cannot name a target) — keep Path-1 usable.
 _CLARIFY_HINTS = ("天气怎么样", "明天天气", "今天天气", "会不会下雨")
+_CITIES = ("北京", "上海", "广州", "深圳", "杭州", "成都", "城市")
 _WORKER_HINTS = (
     "几点",
     "什么时间",
@@ -65,16 +68,64 @@ _WORKER_HINTS = (
     "笑话",
     "讲个",
 )
-_CONTROL_HINTS = ("再讲", "换一个", "不好笑", "取消", "别查了", "北京的", "上海的", "改成")
+# Words that make a short utterance a *new* request, never the answer to a pending question.
+_NEW_REQUEST_HINTS = ("几点", "什么时间", "新闻", "头条", "打开", "关掉", "空调", "记住", "笑话", "讲个")
+_CANCEL_HINTS = ("取消", "别查了", "不用查了", "不要查了", "算了", "不用了", "别办了")
+_STATUS_HINTS = (
+    "查得怎么样",
+    "查到了吗",
+    "查好了吗",
+    "查完了吗",
+    "结果呢",
+    "结果怎么样",
+    "进度",
+    "刚才那个",
+    "刚才的结果",
+    "刚才查的",
+    "再说一遍",
+    "重新说一遍",
+    "没听清",
+    "再听一下",
+)
+_REFINE_HINTS = ("改成", "换成", "改为", "不对", "再讲", "再来一个", "换一个", "另一个", "不一样的", "不好笑", "重新讲")
+_SWAP_RE = re.compile(r"(那|换成|改成)?[一-鿿]{2,4}(的呢|的|呢)")
+_SLOT_MAX_CHARS = 10
+
+
+def heuristic_control(text: str, ledger: Ledger) -> ControlDecision | None:
+    """Pick (op, task_id, version) from the Ledger when JEV is off or names no target.
+
+    The Ledger decides which task exists; the words only choose the operation.
+    Returns None when the utterance is not about an existing task.
+    """
+    t = (text or "").strip()
+    latest = ledger.latest()
+    if not t or latest is None:
+        return None
+    pending = [r for r in ledger.active() if r.status in (TaskStatus.QUEUED, TaskStatus.RUNNING, TaskStatus.NEEDS_INPUT)]
+
+    def pick(op: str, rec) -> ControlDecision:  # noqa: ANN001
+        return ControlDecision(op=op, task_id=rec.task_id, version=rec.version, via="heuristic")  # type: ignore[arg-type]
+
+    if any(h in t for h in _CANCEL_HINTS):
+        return pick("CANCEL", pending[-1] if pending else latest)
+    if any(h in t for h in _STATUS_HINTS):
+        return pick("STATUS", latest)
+    waiting = ledger.pending_input()
+    if waiting is not None and len(t) <= _SLOT_MAX_CHARS and not any(h in t for h in _NEW_REQUEST_HINTS):
+        return pick("REFINE", waiting)
+    if any(h in t for h in _REFINE_HINTS):
+        return pick("REFINE", latest)
+    if "天气" in latest.objective and _SWAP_RE.fullmatch(t):
+        return pick("REFINE", latest)
+    return None
 
 
 def heuristic_route(text: str, ledger: Ledger) -> str:
     t = (text or "").strip()
-    if ledger.latest() and any(h in t for h in _CONTROL_HINTS):
+    if heuristic_control(t, ledger) is not None:
         return "CONTROL"
-    if any(h in t for h in _CLARIFY_HINTS) and not any(
-        c in t for c in ("北京", "上海", "广州", "深圳", "杭州", "成都", "城市")
-    ):
+    if any(h in t for h in _CLARIFY_HINTS) and not any(c in t for c in _CITIES):
         return "CLARIFY"
     if any(h in t for h in _WORKER_HINTS):
         return "WORKER"

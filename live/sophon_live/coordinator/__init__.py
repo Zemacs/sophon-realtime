@@ -8,6 +8,7 @@ from .api import AdmitResult, admit, complete_job
 from .ledger import Ledger
 from .schemas import (
     AdmitRequest,
+    ControlDecision,
     PlaybackReceipt,
     SpeakPlan,
     TaskRecord,
@@ -19,6 +20,7 @@ from .schemas import (
 __all__ = [
     "AdmitRequest",
     "AdmitResult",
+    "ControlDecision",
     "Ledger",
     "PlaybackReceipt",
     "SpeakPlan",

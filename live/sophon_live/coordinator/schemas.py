@@ -69,6 +69,20 @@ class PlaybackReceipt:
 
 
 @dataclass
+class ControlDecision:
+    """A CONTROL operation aimed at one (task_id, version) of the Ledger."""
+
+    op: Literal["CANCEL", "STATUS", "REFINE"]
+    task_id: str
+    version: int
+    via: Literal["jev", "heuristic"] = "heuristic"
+
+    @property
+    def key(self) -> str:
+        return f"{self.op}:{self.task_id}:{self.version}"
+
+
+@dataclass
 class TaskRecord:
     task_id: str
     version: int

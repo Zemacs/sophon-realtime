@@ -96,6 +96,7 @@ RESULT_FMT = {"zh": ("后端结果（只能根据这段内容回答，用你自�
 PROGRESS_FMT = {"zh": "后端还在处理（这是进度，不是结果）。用一句很短的口语让用户稍等，不要重复你刚说过的话，不要编结果：\n{c}",
                 "en": "The backend is still working (progress, not the result). Say one very short phrase asking the user to hold on; don't repeat "
                       "what you just said and don't invent a result:\n{c}"}
+NET_GRACE_S = float(os.environ.get("SOPHON_LIVE_NET_GRACE", "0.8"))   # wait this long after "done" for a trailing tool call before the safety net acts
 DELEG_MODE = os.environ.get("SOPHON_LIVE_DELEG_MODE", "model")   # model: every backend update goes to the model, which decides to speak or <wait>; rules: gateway heuristics
 IDLE_UPDATE_S = float(os.environ.get("SOPHON_LIVE_IDLE_UPDATE", "7.0"))   # model mode: no backend news by then -> tell the model once, it may say a short "hold on"
 UPDATE_FMT = {
@@ -172,6 +173,8 @@ BARGE_MS = int(os.environ.get("SOPHON_LIVE_BARGE_MS", "200"))          # user vo
 BARGE_MIN_RMS = float(os.environ.get("SOPHON_LIVE_BARGE_RMS", "0.015"))
 
 class LiveSession:
+    deleg_calls = 0                                # delegate calls seen from the front (v0.1.0 safety net)
+    last_deleg_asr_t = 0.0                         # transcript time of the utterance last delegated
     def __init__(self, ws, args, asr, asr_lock):
         self.ws, self.args, self.asr, self.asr_lock = ws, args, asr, asr_lock
         self.id = "sess_" + uuid.uuid4().hex[:24]
@@ -564,7 +567,8 @@ class LiveSession:
                     self.cur_rid = rid
                     task = self._cut_user()
                     lead = lead_for(self.last_text, self.lang)
-                    self.resp[rid] = {"text": lead, "released": 0, "audio_s": 0.0, "played_s": 0.0, "start_ms": None, "done": False, "asr": task}
+                    self.resp[rid] = {"text": lead, "released": 0, "audio_s": 0.0, "played_s": 0.0, "start_ms": None, "done": False, "asr": task,
+                                      "deleg_n0": self.deleg_calls, "t0": time.monotonic()}
                     self._delivery().attach(rid)
                     self._trace().response_started(rid)
                 r = self.resp[rid]
@@ -581,6 +585,7 @@ class LiveSession:
                 rid = e.get("rid") or self.cur_rid
                 if rid in self.resp:
                     self.resp[rid]["done"] = True
+                    asyncio.create_task(self._no_delegate_net(rid))
                 if rid == self.cur_rid:
                     self.cur_rid = None
             elif t == "cancel":
@@ -588,11 +593,42 @@ class LiveSession:
             elif t == "tool_call":
                 if e.get("name") != "delegate":
                     log.warning("ignoring call to unknown tool %s", e.get("name")); continue
+                self.deleg_calls += 1
                 asyncio.create_task(self._delegate(e))           # never block the audio path while the transcript finishes
             elif t == "error":
                 log.warning("session %s engine: %s", self.id, e.get("message"))
                 if "closed" in (e.get("message") or ""):
                     await self.error("server_error", "engine connection lost"); await self.close("server_error"); return
+
+    async def _no_delegate_net(self, rid: str) -> None:
+        """v0.1.0 safety net. The voice front sometimes says only its lead-in ("我帮你查一下") and ends the turn without calling
+        delegate (live: zh_memory 2 of 4, zh_light 1 of 6 on c88195c). For a request the Coordinator knows is tool-backed that means
+        a fabricated or empty answer, so the gateway delegates it itself. Never when the front did call delegate in that turn."""
+        try:
+            r = self.resp.get(rid)
+            if r is None:
+                return
+            asr = r.get("asr")
+            if asr is not None and not asr.done():
+                try:
+                    await asyncio.wait_for(asyncio.shield(asr), 5)
+                except Exception:  # noqa: BLE001
+                    pass
+            await asyncio.sleep(NET_GRACE_S)                       # a tool call can trail the done event
+            if self.closed or self.deleg_calls != r.get("deleg_n0"):
+                return
+            lu = getattr(self, "last_user", None)
+            if not lu or lu[1] < r.get("t0", 0) - 10 or lu[1] <= self.last_deleg_asr_t:   # no fresh transcript, or it was already delegated
+                return
+            text = (lu[0] or "").strip()
+            from .coordinator import intent as _intent
+            if not text or not _intent.required_tools(text):
+                return
+            log.warning("session %s front ended the turn without delegate for a tool-backed request; delegating %r", self.id, text)
+            self.deleg_calls += 1
+            await self._delegate({"call_id": None, "arguments": {"task": text}, "net": "no_delegate"})
+        except Exception:  # noqa: BLE001
+            log.exception("no-delegate safety net failed")
 
     async def _delegate(self, e: dict) -> None:
         task = self._cut_user()
@@ -603,8 +639,11 @@ class LiveSession:
                 pass
         did = "item_" + uuid.uuid4().hex[:16]
         what = (e.get("arguments") or {}).get("task")
-        self.deleg[did] = {"call_id": e["call_id"], "chunks": [], "timer": None, "task": what, "t0": time.monotonic()}
+        self.last_deleg_asr_t = getattr(self, "last_user", None) and self.last_user[1] or 0.0
+        self.deleg[did] = {"call_id": e.get("call_id"), "chunks": [], "timer": None, "task": what, "t0": time.monotonic()}
         tr = self._trace().start(did)
+        if e.get("net"):
+            tr.set(net=e["net"])
         tr.set(task=(what or "")[:40], asr_ago_ms=round((time.monotonic() - self.last_user[1]) * 1000) if getattr(self, "last_user", None) else None)
         use_coord = os.environ.get("SOPHON_LIVE_COORD", "").strip().lower() in ("1", "true", "yes", "on")
         use_orch = (not use_coord) and os.environ.get("SOPHON_LIVE_ORCH", "").strip().lower() in ("1", "true", "yes", "on")

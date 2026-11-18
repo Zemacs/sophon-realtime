@@ -157,12 +157,12 @@ class BingHedgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("外汇牌价", out)
         self.assertLess(time.monotonic() - t0, 1.5)
 
-    async def test_three_failures_are_an_honest_outage(self) -> None:
-        fetch = self._flaky(["fail", "fail", "fail"])
+    async def test_all_attempts_failing_is_an_honest_outage(self) -> None:
+        fetch = self._flaky(["fail", "fail", "fail", "fail"])
         with mock.patch.object(web_search, "_fetch_bytes", fetch):
             out = await web_search.run({"query": "汇率"})
         self.assertIn("网络暂时不可用", out)
-        self.assertEqual(len(fetch.calls), 3)
+        self.assertEqual(len(fetch.calls), 4)
 
     def test_gzip_pages_are_decoded(self) -> None:
         import gzip as _gz

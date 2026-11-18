@@ -6,7 +6,7 @@ import os
 import time
 from dataclasses import dataclass
 
-from . import jev_client
+from . import intent, jev_client
 from .clarify import clarify_for_slots, missing_slots_for_text
 from .ledger import Ledger
 from .route import build_route_questions, build_state, heuristic_control, heuristic_route, slot_edit
@@ -217,6 +217,8 @@ def _apply_control(decision: ControlDecision, text: str, req: AdmitRequest, ledg
             objective=new.objective,
             language=req.language,
             freshness_token=f"{new.task_id}:{new.version}",
+            # a REFINE re-runs the job with the new slots: what the new words ask for, else what the old task needed
+            require_tools=intent.required_tools(text) or intent.required_tools(rec.objective),
         ),
         route="CONTROL",
         ledger=ledger,
@@ -242,6 +244,7 @@ def _new_job(ledger: Ledger, objective: str, *, language: str = "zh") -> WorkerJ
         objective=objective,
         language=language,
         freshness_token=f"{rec.task_id}:{rec.version}",
+        require_tools=intent.required_tools(objective),
     )
 
 
@@ -256,6 +259,9 @@ def complete_job(ledger: Ledger, job: WorkerJob, answer: str) -> bool:
     return ledger.mark_completed(job.task_id, answer)
 
 
+NO_TOOL_ANSWER = "这个我这边没查到准确结果，你再问我一次吧。"
+
+
 @dataclass
 class JobOutcome:
     """What the Coordinator wants said for a finished WorkerResult."""
@@ -264,6 +270,14 @@ class JobOutcome:
     text: str = ""
     task_id: str = ""
     version: int = 0
+    rejected: str = ""  # why a Worker answer was not spoken ("no_tool_result"), for the trace
+
+
+def _ungrounded(job: WorkerJob, result: WorkerResult) -> bool:
+    """A completed answer for a tool-scoped job with no evidence of any of its tools being called."""
+    if not job.require_tools or result.status != "completed":
+        return False
+    return not any(ev.get("tool") in job.require_tools for ev in result.evidence)
 
 
 def finish_job(ledger: Ledger, job: WorkerJob, result: WorkerResult) -> JobOutcome:
@@ -283,6 +297,12 @@ def finish_job(ledger: Ledger, job: WorkerJob, result: WorkerResult) -> JobOutco
     if result.status == "needs_input":
         ledger.mark_needs_input(job.task_id)
         return JobOutcome(kind="clarify", text=clarify_for_slots(result.needs_slots), task_id=job.task_id, version=job.version)
+    if _ungrounded(job, result):
+        # Never speak a tool-backed answer the model produced without calling its tool (fabricated numbers).
+        log.warning("reject ungrounded worker answer task=%s v%s require=%s answer=%r", job.task_id, job.version, job.require_tools, (result.spoken_answer or "")[:60])
+        if not ledger.mark_failed(job.task_id, NO_TOOL_ANSWER):
+            return stale
+        return JobOutcome(kind="answer", text=NO_TOOL_ANSWER, task_id=job.task_id, version=job.version, rejected="no_tool_result")
     text = (result.spoken_answer or "").strip() or "好的，我这边查过了。"
     ok = ledger.mark_failed(job.task_id, text) if result.status == "failed" else ledger.mark_completed(job.task_id, text)
     if not ok:

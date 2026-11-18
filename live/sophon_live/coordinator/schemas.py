@@ -50,6 +50,9 @@ class WorkerJob:
     tool_scope: list[str] = field(default_factory=lambda: ["*"])
     constraints: list[dict[str, Any]] = field(default_factory=list)
     freshness_token: str = ""
+    # Tool-backed request (weather / time / news / device / search / memory): the answer MUST come from a tool result.
+    # Set by the Coordinator (coordinator.intent); the Worker forces the first call, finish_job rejects a tool-less answer.
+    require_tools: list[str] = field(default_factory=list)
 
 
 @dataclass

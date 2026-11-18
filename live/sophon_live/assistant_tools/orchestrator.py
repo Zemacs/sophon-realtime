@@ -142,6 +142,25 @@ def _ungrounded_city(name: str, args: dict, msgs: list[dict[str, Any]]) -> bool:
     return not any(c in seen for c in slots.CITY_NAMES)
 
 
+def _evidence_has_required(job: WorkerJob, evidence: list[dict]) -> bool:
+    """True when the job needs no tool, or at least one of its required tools was actually called."""
+    req = [t for t in (job.require_tools or []) if _in_scope(job, t)]
+    return not req or any(ev.get("tool") in req for ev in evidence)
+
+
+def _force_choice(job: WorkerJob) -> Any:
+    """OpenAI ``tool_choice`` that forces the Coordinator-required tool (one tool: by name; several: any tool)."""
+    req = [t for t in (job.require_tools or []) if _in_scope(job, t)]
+    if not req:
+        return None
+    if len(req) == 1:
+        return {"type": "function", "function": {"name": req[0]}}
+    return "required"
+
+
+NO_TOOL_ANSWER = "这个我这边没查到准确结果，你再问我一次吧。"
+
+
 def _in_scope(job: WorkerJob, name: str) -> bool:
     scope = job.tool_scope or ["*"]
     return "*" in scope or name in scope
@@ -174,6 +193,12 @@ async def run_job(
     user = f"Job objective:\n{task}"
     if hist:
         user = hist + "\n\n" + user
+    required = [t for t in (job.require_tools or []) if _in_scope(job, t)]
+    if required:
+        user += (
+            f"\n\nThis job is tool-backed: you MUST call {' or '.join(required)} and answer ONLY from its result. "
+            "Never answer facts (weather, time, news, device state, memory) from your own knowledge."
+        )
     msgs: list[dict[str, Any]] = [
         {"role": "system", "content": SYS + (("\n\nExtra policy:\n" + instructions) if instructions else "")},
         {"role": "user", "content": user},
@@ -181,6 +206,7 @@ async def run_job(
     tools = [t for t in _openai_tools() if _in_scope(job, t["function"]["name"])]
     headers = {"Authorization": "Bearer " + key, "Content-Type": "application/json"}
     unavailable = "后台模型暂时不可用，请稍后再试。"
+    forced = False   # the forced first call has been attempted (once); a second tool-less answer is rejected
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as cs:
         for step in range(max_steps):
             body: dict[str, Any] = {
@@ -189,6 +215,9 @@ async def run_job(
                 "temperature": 0.2,
                 "tools": tools,
             }
+            choice = _force_choice(job)
+            if choice is not None and not _evidence_has_required(job, evidence):
+                body["tool_choice"] = choice          # the Coordinator says this answer needs its tool: do not let the model skip it
             # Prefer non-thinking for low-latency spoken answers when the server supports it.
             body["chat_template_kwargs"] = {"enable_thinking": False}
             try:
@@ -201,9 +230,10 @@ async def run_job(
                         log.warning("orch LLM bad JSON HTTP %s: %r body=%s", status, e, raw[:300])
                         return _result(job, "failed", unavailable, evidence)
                 if status >= 400:
-                    # retry once without chat_template_kwargs if rejected
-                    if status == 400 and "chat_template_kwargs" in body:
+                    # retry once without chat_template_kwargs / tool_choice if rejected (the guard below still applies)
+                    if status == 400 and ("chat_template_kwargs" in body or "tool_choice" in body):
                         body.pop("chat_template_kwargs", None)
+                        body.pop("tool_choice", None)
                         async with cs.post(url, json=body, headers=headers) as r2:
                             status = r2.status
                             j = await r2.json(content_type=None)
@@ -223,6 +253,16 @@ async def run_job(
                 return _result(job, "failed", "后台模型连接失败，请稍后再试。", evidence)
             tcs = m.get("tool_calls") or []
             if not tcs:
+                if not _evidence_has_required(job, evidence):
+                    # A tool-backed job answered without calling its tool: never accept that (fabricated numbers).
+                    if not forced:
+                        forced = True
+                        log.warning("orch step=%d job %s answered without %s -> forcing the tool call", step, job.task_id, required)
+                        msgs.append({"role": "assistant", "content": m.get("content") or ""})
+                        msgs.append({"role": "user", "content": f"You did not call the tool. Call {' or '.join(required)} now; do not answer without it."})
+                        continue
+                    log.warning("orch step=%d job %s still no %s call -> failed (answer withheld)", step, job.task_id, required)
+                    return _result(job, "failed", NO_TOOL_ANSWER, evidence)
                 return _result(job, "completed", _say(m.get("content") or ""), evidence)
             msgs.append({"role": "assistant", "content": m.get("content") or "", "tool_calls": tcs})
             for tc in tcs:

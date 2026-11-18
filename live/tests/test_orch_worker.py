@@ -182,7 +182,7 @@ class GatewayWorkerTests(unittest.IsolatedAsyncioTestCase):
             seen.append(job.objective)
             if "北京" not in job.objective:
                 return WorkerResult(job.task_id, job.version, "needs_input", "", needs_slots=["city"])
-            return WorkerResult(job.task_id, job.version, "completed", "北京明天晴。")
+            return WorkerResult(job.task_id, job.version, "completed", "北京明天晴。", evidence=[{"tool": "get_weather", "ok": True}])
 
         _arm(session, "d1", "明天天气怎么样")
         _arm(session, "d2", "北京的")

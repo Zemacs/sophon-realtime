@@ -9,6 +9,7 @@ def as_worker(fn):
 
     async def run(job: WorkerJob, instructions: str = "", history=None) -> WorkerResult:  # noqa: ANN001
         text = await fn(job.objective, instructions=instructions, history=history)
-        return WorkerResult(task_id=job.task_id, version=job.version, status="completed", spoken_answer=text)
+        return WorkerResult(task_id=job.task_id, version=job.version, status="completed", spoken_answer=text,
+                            evidence=[{"tool": t, "ok": True} for t in job.require_tools])  # a fake Worker that "ran" the required tool
 
     return run

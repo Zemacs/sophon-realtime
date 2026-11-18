@@ -720,6 +720,8 @@ class LiveSession:
             for ev in result.evidence:
                 tr.add_tool(ev.get("tool", "?"), ev.get("ms"), bool(ev.get("ok")), source=ev.get("source"), fallbacks=ev.get("fallbacks"))
         outcome = finish_job(ledger, job, result)    # the Coordinator decides what gets said; stale results are dropped
+        if tr is not None and job.require_tools:
+            tr.set(require=",".join(job.require_tools), **({"guard": outcome.rejected} if outcome.rejected else {}))
         if outcome.kind == "stale":                  # cancelled or superseded while running
             await self._ack_delegation(did, "这个任务已被取消或改口，不用再说什么。")
             return

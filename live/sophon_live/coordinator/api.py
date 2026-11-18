@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import os
 import time
 from dataclasses import dataclass
@@ -280,6 +281,25 @@ def _ungrounded(job: WorkerJob, result: WorkerResult) -> bool:
     return not any(ev.get("tool") in job.require_tools and tool_succeeded(ev) for ev in result.evidence)
 
 
+# v0.1.0 / Critic S-13: a tool's own failure sentence may be spoken only if it has the SHAPE the tools really produce
+# (assistant_tools.weather / web_search / news). The Worker's ``failure_text`` evidence is self-reported, so a dishonest
+# Worker could set failure_text == fake answer; it now has to look like a tool failure too.
+_TOOL_FAILURE_SHAPES = tuple(re.compile(p) for p in (
+    r"暂时查不到[^，。！？]{1,20}的天气，请稍后再试。",
+    r"Weather for [^()]{1,40} is unavailable right now \([^()]{0,160}\)\.",
+    r"网络暂时不可用，没法完成网页搜索，请稍后再试。",
+    r"Web search is unavailable right now due to a network problem\. Please try again later\.",
+    r"没有搜到关于「[^」]{1,80}」的可靠摘要。",
+    r"I couldn't find useful snippets for '[^']{1,80}'\.",
+    r"新闻源暂时连不上，稍后再帮你看看头条吧。",
+    r"News feeds are unreachable right now\. Try again in a moment\.",
+))
+
+
+def _is_tool_failure_sentence(text: str) -> bool:
+    return any(p.fullmatch(text) for p in _TOOL_FAILURE_SHAPES)
+
+
 def _failure_text(job: WorkerJob, result: WorkerResult) -> str:
     """What may be said for a FAILED result: a fixed honest sentence, or the failed required tool's own sentence
     (recorded by the Worker as evidence ``failure_text``). Anything else is model free text: replaced (Critic I-5)."""
@@ -287,7 +307,7 @@ def _failure_text(job: WorkerJob, result: WorkerResult) -> str:
     if said in FIXED_FAILURES:
         return said
     if said and any(ev.get("tool") in (job.require_tools or []) and ev.get("ok") is False and ev.get("failure_text") == said
-                    for ev in result.evidence):
+                    for ev in result.evidence) and _is_tool_failure_sentence(said):
         return said
     return NO_TOOL_ANSWER if job.require_tools else FAILED_GENERIC
 

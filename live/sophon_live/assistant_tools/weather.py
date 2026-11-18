@@ -359,6 +359,7 @@ async def run_detailed(args: dict[str, Any] | None = None) -> tuple[str, dict[st
             lead = f"网络不太好，这是{mins}分钟前查到的：" if zh else f"The network is poor; this is from {mins} min ago: "
             meta.update(source="cache-stale", age_s=round(age_s), orig_source=hit[2], **_facts(old, name))
             return lead + body, meta
+        meta["ok"] = False          # structured outcome: no source answered (the orchestrator reads this, not the sentence)
         if zh:
             return f"暂时查不到{display_name}的天气，请稍后再试。", meta
         return f"Weather for {display_name} is unavailable right now ({', '.join(notes) or 'no source'}).", meta
@@ -388,7 +389,7 @@ async def run(args: dict[str, Any] | None = None) -> str:
     text, meta = await run_detailed(args)
     from . import toolmeta
 
-    toolmeta.note(source=meta.get("source"), fallbacks=len(meta.get("notes") or []) or None,
+    toolmeta.note(ok=False if meta.get("ok") is False else None, source=meta.get("source"), fallbacks=len(meta.get("notes") or []) or None,
                   orig_source=meta.get("orig_source"), age_s=meta.get("age_s"),
                   city=meta.get("city"), tmin=meta.get("tmin"), tmax=meta.get("tmax"), now=meta.get("now"))
     return text

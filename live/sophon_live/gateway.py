@@ -661,7 +661,6 @@ class LiveSession:
         tr.set(task=(what or "")[:40], asr_ago_ms=round((time.monotonic() - self.last_user[1]) * 1000) if getattr(self, "last_user", None) else None)
         use_coord = os.environ.get("SOPHON_LIVE_COORD", "").strip().lower() in ("1", "true", "yes", "on")
         use_orch = (not use_coord) and os.environ.get("SOPHON_LIVE_ORCH", "").strip().lower() in ("1", "true", "yes", "on")
-        use_builtin = (not use_coord) and (not use_orch) and os.environ.get("SOPHON_LIVE_BUILTIN_TOOLS", "").strip().lower() in ("1", "true", "yes", "on")
         # Orch/coord returns one final spoken result; skip the 7s empty idle nudge (it races long tools).
         if DELEG_MODE == "model" and not use_orch and not use_coord:
             self.deleg[did]["idle_timer"] = asyncio.get_running_loop().call_later(IDLE_UPDATE_S, lambda: asyncio.ensure_future(self._idle_update(did)))
@@ -670,19 +669,15 @@ class LiveSession:
             deleg_body["backend"] = "coord"
         elif use_orch:
             deleg_body["backend"] = "orch"
-        elif use_builtin:
-            deleg_body["backend"] = "builtin"
         await self.send({"type": "session.delegation.created", "offset_ms": self.timeline_ms, "delegation": deleg_body})
         log.info(
-            "session %s delegation %s task=%r coord=%s orch=%s builtin=%s",
-            self.id, did, what, use_coord, use_orch, use_builtin,
+            "session %s delegation %s task=%r coord=%s orch=%s",
+            self.id, did, what, use_coord, use_orch,
         )
         if use_coord:
             asyncio.create_task(self._coord_resolve(did, what))
         elif use_orch:
             asyncio.create_task(self._orch_resolve(did, what))
-        elif use_builtin:
-            asyncio.create_task(self._builtin_resolve(did, what))
 
     async def _ack_delegation(self, did: str, note: str) -> None:
         """Close a delegation without speaking: the model gets a result, but is told to stay silent."""
@@ -833,7 +828,7 @@ class LiveSession:
             # FAST (thanks / ok): nothing to run, nothing to say. Close the delegation silently.
             await self._ack_delegation(did, "这句话不需要后台办事，不用再说什么。")
             return
-        with bind_task(TaskContext(task_id=job.task_id, version=job.version, utterance=job.objective, ledger=ledger)):
+        with bind_task(TaskContext(task_id=job.task_id, version=job.version, utterance=job.objective, ledger=ledger, explicit_save=job.explicit_save)):
             # the worker task copies this context: its memory writes go through memory_gate, its tool args become task slots
             worker = asyncio.ensure_future(
                 run_worker_job(job, instructions=self.instructions or "", history=getattr(self, "orch_history", None) or [])
@@ -906,26 +901,6 @@ class LiveSession:
             return
         await self.send({"type": "session.commentary.appended", "start_ms": self.timeline_ms, "end_ms": self.timeline_ms,
                          "client_event_id": "orch"})
-        d["chunks"].append(("commentary", text))
-        if d.get("timer"):
-            d["timer"].cancel()
-        await self._flush_deleg(did)
-    async def _builtin_resolve(self, did: str, what: str | None) -> None:
-        """Legacy heuristic tool pack (demo). Prefer SOPHON_LIVE_ORCH for production Path-1."""
-        try:
-            from .assistant_tools import run_task
-            text = await run_task(what or "")
-        except Exception as e:  # noqa: BLE001
-            log.warning("session %s builtin tools error: %s", self.id, e)
-            return
-        if not text:
-            log.info("session %s builtin tools: no match for %r", self.id, what)
-            return
-        d = self.deleg.get(did)
-        if d is None:
-            return
-        await self.send({"type": "session.commentary.appended", "start_ms": self.timeline_ms, "end_ms": self.timeline_ms,
-                         "client_event_id": "builtin"})
         d["chunks"].append(("commentary", text))
         if d.get("timer"):
             d["timer"].cancel()

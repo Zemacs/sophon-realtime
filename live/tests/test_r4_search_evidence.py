@@ -16,6 +16,7 @@ if str(_LIVE_ROOT) not in sys.path:
 from sophon_live.assistant_tools import orchestrator as orch
 from sophon_live.assistant_tools import web_search
 from sophon_live.coordinator import Ledger, WorkerJob, finish_job
+from tests.toolstub import tool_returning
 from tests.test_orch_worker import _tool_call
 from tests.test_orchestrator import _FakeResp, _FakeSession
 from tests.test_web_search_fallback import BING_HTML
@@ -66,11 +67,11 @@ class CaptchaDoesNotEndTheHedge(unittest.IsolatedAsyncioTestCase):
 class NoResultsIsNotEvidence(unittest.IsolatedAsyncioTestCase):
     NOTHING = "没有搜到关于「美元兑人民币」的可靠摘要。"
 
-    async def _run(self, tool_out: str, model_after: str = "今天美元兑人民币大约七点二。"):
+    async def _run(self, tool_out: str, model_after: str = "今天美元兑人民币大约七点二。", ok: bool = False):
         job = WorkerJob(task_id="t1", version=1, objective="今天美元兑人民币是多少", require_tools=["web_search"])
         sess = _FakeSession([_FakeResp(200, _tool_call("web_search", '{"query":"美元兑人民币"}')),
                              _FakeResp(200, {"choices": [{"message": {"role": "assistant", "content": model_after}}]})])
-        with mock.patch.object(orch.aiohttp, "ClientSession", return_value=sess), mock.patch.object(orch, "run_tool", new=mock.AsyncMock(return_value=tool_out)):
+        with mock.patch.object(orch.aiohttp, "ClientSession", return_value=sess), mock.patch.object(orch, "run_tool", new=tool_returning(tool_out, ok=ok)):
             return await orch.run_job(job)
 
     async def test_nothing_found_is_a_failed_job_with_the_tools_own_sentence(self) -> None:
@@ -93,7 +94,7 @@ class NoResultsIsNotEvidence(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(out.text, self.NOTHING)
 
     async def test_real_snippets_are_still_a_success(self) -> None:
-        res = await self._run("关于「美元兑人民币」，中国银行外汇牌价：美元 713.20。")
+        res = await self._run("关于「美元兑人民币」，中国银行外汇牌价：美元 713.20。", ok=True)
         self.assertTrue(res.evidence[0]["ok"])
 
 

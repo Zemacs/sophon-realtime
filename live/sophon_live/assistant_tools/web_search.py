@@ -49,12 +49,16 @@ def _clamp_max(n: Any, default: int = 3) -> int:
 
 
 def _network_error(zh: bool) -> str:
+    from . import toolmeta
+    toolmeta.note(ok=False)             # structured outcome
     if zh:
         return "网络暂时不可用，没法完成网页搜索，请稍后再试。"
     return "Web search is unavailable right now due to a network problem. Please try again later."
 
 
 def _no_results(query: str, *, zh: bool) -> str:
+    from . import toolmeta
+    toolmeta.note(ok=False)             # structured outcome: searched, found nothing (not evidence for a factual answer, Critic S-11)
     if zh:
         return f"没有搜到关于「{query}」的可靠摘要。"
     return f"I couldn't find useful snippets for '{query}'."

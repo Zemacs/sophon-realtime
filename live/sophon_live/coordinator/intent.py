@@ -23,6 +23,7 @@ TOOL_KEY = "tool"
 # Option key -> what the router sees. The text is PROMPT (instructions + few-shot examples for the model); no code reads it.
 # The examples are deliberately not taken from the evaluation sets (tests/intent_*.py), which only measure.
 NONE = "NONE"
+MEMORY_SAVE = "memory_save"      # option key: the memory_note tool, and the user explicitly asked to keep it long-term
 TOOL_CRITERIA: dict[str, str] = {
     NONE: "不需要查任何东西：闲聊、问候、感谢、观点、常识和历史知识、概念解释、不随时间变化的事实、创作（讲笑话、编故事）、"
           "算术和单位换算、用户在讲述自己的经历。例：「给我讲个冷笑话」「光在真空里多快」「二战哪年结束」「我今天跑了五公里」「十二乘以八」「谢谢你」",
@@ -33,7 +34,8 @@ TOOL_CRITERIA: dict[str, str] = {
     "web_search": "答案会随时间变化、必须现查才准的事实：价格、行情、汇率、股市是否开盘、比分和赛果、票房和榜单、路况/限号/航班车次、"
                   "地震台风等突发事件、现任职务的人，或者用户明确要求上网搜索。拿不准答案会不会变的时候，选这一项（宁可多查一次，也不要凭记忆报数字）。"
                   "例：「瑞士法郎今天兑人民币多少」「今天沪市成交了多少」「周杰伦演唱会还有票吗」「现在三环堵不堵」「帮我搜一下这家店的评价」",
-    "memory_note": "让助手记住一件事，或回忆用户以前说过的话和偏好。例：「帮我记一下明天要交报告」「我之前跟你说过我爱吃什么来着」",
+    "memory_note": "回忆或查看用户以前说过的话和偏好（只读）。例：「我之前跟你说过我爱吃什么来着」「你都记得我什么」",
+    MEMORY_SAVE: "用户明确要求助手长期记住一件事、一个偏好或习惯（以后/默认/总是…也算）。例：「帮我记一下我对花生过敏」「以后默认用美式咖啡」",
 }
 
 # What the user hears while the Worker runs: by the tool the router chose (our own table, keyed by option key).
@@ -59,7 +61,16 @@ def tools_from_answer(choice: str | None) -> list[str] | None:
     """The router's enumerated answer -> tool names. ``[]`` = the model said no tool; ``None`` = unknown (no / non-option answer)."""
     if choice is None or choice not in TOOL_CRITERIA:
         return None
-    return [] if choice == NONE else [choice]
+    if choice == NONE:
+        return []
+    return ["memory_note"] if choice == MEMORY_SAVE else [choice]
+
+
+def explicit_save_from_answer(choice: str | None) -> bool | None:
+    """The model's judgment "the user explicitly asked to remember this long-term" (memory_gate enforces it). None = unknown -> never writes."""
+    if choice is None or choice not in TOOL_CRITERIA:
+        return None
+    return choice == MEMORY_SAVE
 
 
 def pad_for_tools(tools: list[str] | None) -> str:

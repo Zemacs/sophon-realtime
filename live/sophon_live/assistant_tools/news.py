@@ -11,7 +11,7 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from typing import Any
 
-from . import inflight
+from . import inflight, toolmeta
 
 _RSS_BASE = "https://news.google.com/rss/search"
 _UA = "sophon-live-assistant/1.0"
@@ -37,9 +37,9 @@ _ZH_FEEDS: dict[str, tuple[str, ...]] = {
     ),
 }
 
-_TECH_KEYS = ("科技", "技术", "数码", "互联网", "AI", "人工智能", "芯片", "IT", "互联网", "cyber", "tech")
-_FIN_KEYS = ("财经", "金融", "股市", "经济", "finance")
-_WORLD_KEYS = ("国际", "世界", "海外", "world")
+# Which feed family to read is chosen by the orchestrator MODEL through the ``category`` argument (an enum in the tool schema);
+# this module does not read the topic words to guess one. "search" = a specific person / company / event: query RSS only.
+CATEGORIES = ("general", "tech", "finance", "world", "search")
 
 
 def _is_zh(text: str) -> bool:
@@ -54,15 +54,9 @@ def _clamp_items(n: Any, default: int = 3) -> int:
     return max(1, min(8, v))
 
 
-def _bucket(topic: str) -> str:
-    t = topic.lower()
-    if any(k.lower() in t for k in _TECH_KEYS):
-        return "tech"
-    if any(k.lower() in t for k in _FIN_KEYS):
-        return "finance"
-    if any(k.lower() in t for k in _WORLD_KEYS):
-        return "world"
-    return "general"
+def _bucket(category: Any) -> str:
+    c = str(category or "").strip().lower()
+    return c if c in CATEGORIES else "general"
 
 
 def _rss_url(topic: str, lang: str) -> str:
@@ -158,19 +152,6 @@ async def _fetch_rss(url: str) -> bytes:
     return await asyncio.to_thread(inflight.guarded, _urlopen, url)      # S-14: same in-flight cap as web_search
 
 
-def _filter_topic(titles: list[str], topic: str, *, require_hit: bool) -> list[str]:
-    """If require_hit, never return off-topic filler when keywords miss."""
-    keys = [k for k in re.split(r"[\s,，、]+", topic) if len(k) >= 2]
-    # Drop generic wrappers that appear in every request.
-    keys = [k for k in keys if k not in ("新闻", "头条", "资讯", "news", "headlines")]
-    if not keys:
-        return titles
-    hit = [t for t in titles if any(k.lower() in t.lower() for k in keys)]
-    if hit:
-        return hit
-    return [] if require_hit else titles
-
-
 async def run(args: dict[str, Any] | None = None) -> str:
     args = args or {}
     topic = (args.get("topic") or "").strip()
@@ -189,7 +170,7 @@ async def run(args: dict[str, Any] | None = None) -> str:
         speak_n = max(2, speak_n)
 
     titles: list[str] = []
-    bucket = _bucket(topic)
+    bucket = _bucket(args.get("category"))
     deadline = time.monotonic() + _budget_s()
 
     async def fetch(url: str) -> bytes:
@@ -198,24 +179,11 @@ async def run(args: dict[str, Any] | None = None) -> str:
             raise asyncio.TimeoutError("news budget spent")
         return await asyncio.wait_for(_fetch_rss(url), min(_PER_FEED_S + 0.5, left))
 
-    if lang == "zh":
-        # Topic-matched CN feeds first (Google News usually times out on PAI-DSW).
+    if lang == "zh" and bucket != "search":
+        # Category CN feeds first (Google News usually times out on PAI-DSW). The channel itself is the relevance filter.
         for fb in _ZH_FEEDS.get(bucket, _ZH_FEEDS["general"]):
             try:
-                raw = await fetch(fb)
-                # Dedicated topic feeds (it/finance) are already on-domain — take titles.
-                # Cross feeds: require keyword hit so politics never masquerades as 科技.
-                require = bucket == "general" or "it.xml" not in fb and bucket == "tech"
-                # For tech→it.xml / finance→finance.xml, trust the channel.
-                if bucket == "tech" and "it.xml" in fb:
-                    require = False
-                if bucket == "finance" and "finance.xml" in fb:
-                    require = False
-                if bucket == "world" and "world.xml" in fb:
-                    require = False
-                titles = _filter_topic(_titles_from_rss(raw), topic, require_hit=require)
-                if not require and not titles:
-                    titles = _titles_from_rss(raw)
+                titles = _titles_from_rss(await fetch(fb))
                 if titles:
                     break
             except (OSError, urllib.error.URLError, ET.ParseError, UnicodeDecodeError, asyncio.TimeoutError):
@@ -228,6 +196,7 @@ async def run(args: dict[str, Any] | None = None) -> str:
             titles = []
 
     if not titles:
+        toolmeta.note(ok=False)         # structured outcome: no feed answered
         if lang == "zh":
             return "新闻源暂时连不上，稍后再帮你看看头条吧。"
         return "News feeds are unreachable right now. Try again in a moment."

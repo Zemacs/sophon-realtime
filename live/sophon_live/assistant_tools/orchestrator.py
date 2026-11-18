@@ -17,10 +17,10 @@ from typing import Any
 import aiohttp
 
 from .. import model_client
-from ..coordinator import slots
 from ..coordinator.clarify import clarify_for_slots
 from ..coordinator.schemas import NO_TOOL_ANSWER, WorkerJob, WorkerResult, tool_succeeded
 from . import toolmeta
+from . import weather as weather_tool
 from .registry import TOOL_SCHEMAS
 from .runner import run_tool
 
@@ -140,7 +140,9 @@ def _ungrounded_city(name: str, args: dict, msgs: list[dict[str, Any]]) -> bool:
     bare = city.rstrip("市")
     if city in seen or (bare and bare in seen):
         return False
-    return not any(c in seen for c in slots.CITY_NAMES)
+    # a translation of a city the user named (北京 -> Beijing) is grounded too: provenance through the weather tool's own name table
+    low = seen.lower()
+    return not any(zh in seen and en.lower() == city.lower() for zh, en in weather_tool.CITIES.items()) and city.lower() not in low
 
 
 def _evidence_has_required(job: WorkerJob, evidence: list[dict]) -> bool:
@@ -309,18 +311,9 @@ async def run_job(
                     out[:160],
                 )
                 msgs.append({"role": "tool", "tool_call_id": tc.get("id") or name, "content": out})
-                failed = (
-                    '"ok": false' in out
-                    or "暂时连不上" in out
-                    or "暂时查不到" in out
-                    or "暂时没有" in out
-                    or "unreachable" in out.lower()
-                    or "unavailable" in out.lower()
-                    or "不可用" in out
-                    # "searched, found nothing" is not usable evidence for a factual answer (Critic S-11): the user hears the
-                    # tool's own 没搜到 sentence, the model does not get to improvise one from its head
-                    or (name == "web_search" and ("没有搜到" in out or "couldn't find useful snippets" in out))
-                )
+                # Structured outcome: a tool that fails or finds nothing says so through ``toolmeta.note(ok=False)`` (a return code, not a
+                # reading of its sentence). "searched, found nothing" is not usable evidence for a factual answer (Critic S-11).
+                failed = tool_meta.pop("ok", None) is False
                 evidence.append({"tool": name, "args": args, "ok": not failed, "ms": tool_ms, "out": out[:4000], **tool_meta})   # "out": the number-containment source (coordinator.grounding)
                 if failed and name in required:
                     # A tool-backed job whose tool failed: say so plainly. The model never gets to word it, it could
@@ -329,8 +322,8 @@ async def run_job(
                     text = _tool_failure_text(out)
                     evidence[-1]["failure_text"] = text      # the Coordinator may speak exactly this sentence for the failed job
                     return _result(job, "failed", text, evidence)
-                news_ok = name == "get_news" and ("第1条" in out or "Headlines on" in out) and not failed
-                weather_ok = name == "get_weather" and ("度" in out or "°" in out or "°C" in out) and not failed
+                news_ok = name == "get_news" and not failed
+                weather_ok = name == "get_weather" and not failed
                 if news_ok or weather_ok:
                     msgs.append({
                         "role": "user",

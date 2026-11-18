@@ -13,7 +13,7 @@ from unittest import mock
 LIVE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(LIVE))
 
-from sophon_live.assistant_tools import list_tool_names, run_task, run_tool  # noqa: E402
+from sophon_live.assistant_tools import list_tool_names, run_tool  # noqa: E402
 from sophon_live.assistant_tools import memory as memory_mod  # noqa: E402
 
 
@@ -44,20 +44,6 @@ class TestDatetimeDeviceMemory(unittest.TestCase):
                 self.assertIn("city", asyncio.run(run_tool("memory_note", {"op": "list"})))
             finally:
                 os.environ.pop("SOPHON_LIVE_MEMORY_PATH", None)
-
-
-class TestRouting(unittest.TestCase):
-    def test_route_time(self):
-        with mock.patch("sophon_live.assistant_tools.runner.run_tool", new=mock.AsyncMock(return_value="现在是1点")) as m:
-            out = asyncio.run(run_task("现在几点了"))
-            self.assertEqual(out, "现在是1点")
-            self.assertEqual(m.await_args.args[0], "get_datetime")
-
-    def test_route_news(self):
-        with mock.patch("sophon_live.assistant_tools.runner.run_tool", new=mock.AsyncMock(return_value="新闻")) as m:
-            out = asyncio.run(run_task("查一下关于黄仁勋的新闻"))
-            self.assertEqual(out, "新闻")
-            self.assertEqual(m.await_args.args[0], "get_news")
 
 
 if __name__ == "__main__":

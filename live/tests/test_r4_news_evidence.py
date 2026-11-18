@@ -25,6 +25,7 @@ from sophon_live.assistant_tools import inflight, news, web_search
 from sophon_live.assistant_tools import orchestrator as orch
 from sophon_live.coordinator import Ledger, WorkerJob, WorkerResult, finish_job
 from sophon_live.coordinator.schemas import NO_TOOL_ANSWER
+from tests.toolstub import tool_returning
 from tests.test_orch_worker import _tool_call
 from tests.test_orchestrator import _FakeResp, _FakeSession
 
@@ -125,7 +126,7 @@ class NewsFailureCannotBecomeHeadlines(unittest.IsolatedAsyncioTestCase):
         job = WorkerJob(task_id="t1", version=1, objective="今天有什么科技新闻", require_tools=["get_news"])
         sess = _FakeSession([_FakeResp(200, _tool_call("get_news", '{"topic":"科技"}')),
                              _FakeResp(200, {"choices": [{"message": {"role": "assistant", "content": model_after}}]})])
-        with mock.patch.object(orch.aiohttp, "ClientSession", return_value=sess), mock.patch.object(orch, "run_tool", new=mock.AsyncMock(return_value=tool_out)):
+        with mock.patch.object(orch.aiohttp, "ClientSession", return_value=sess), mock.patch.object(orch, "run_tool", new=tool_returning(tool_out, ok=False)):
             return await orch.run_job(job)
 
     async def test_orch_failure_is_the_tools_sentence_and_the_model_gets_no_turn(self) -> None:

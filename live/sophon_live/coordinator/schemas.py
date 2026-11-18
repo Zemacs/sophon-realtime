@@ -115,6 +115,8 @@ class WorkerJob:
     # Who decided ``require_tools``: "model" (the router answered; [] = it said no tool) or "unknown" (the router was unavailable or
     # gave a non-option answer). With "unknown" nothing is forced, but the number-containment check covers every answer of the job.
     tool_judgment: str = "model"
+    # The router model's judgment: did the user explicitly ask to keep this long-term? ``memory_gate`` writes long-term memory only on True.
+    explicit_save: bool | None = None
 
 
 @dataclass
@@ -160,4 +162,5 @@ class TaskRecord:
     slots: dict[str, str] = field(default_factory=dict)  # task-scoped slots (this task version only; never long-term)
     require_tools: list[str] = field(default_factory=list)   # what the router said this task needs (a REFINE inherits it)
     tool_judgment: str = "model"
+    explicit_save: bool | None = None
     interrupted: int = 0  # how many times playback of the answer was cut off (answer stays re-playable)

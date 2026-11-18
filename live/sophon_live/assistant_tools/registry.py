@@ -47,7 +47,9 @@ TOOL_SCHEMAS: list[dict] = [
         "parameters": {
             "type": "object",
             "properties": {
-                "topic": {"type": "string", "description": "Topic keywords, e.g. 科技 / NVIDIA / 特朗普."},
+                "topic": {"type": "string", "description": "What the user wants news about, in their words, e.g. 科技 / NVIDIA / 特朗普 / 今天的新闻."},
+                "category": {"type": "string", "enum": ["general", "tech", "finance", "world", "search"],
+                             "description": "Feed family: general = top headlines; tech / finance / world = that channel; search = a specific person, company or event."},
                 "lang": {"type": "string", "enum": ["zh", "en"], "description": "Prefer Chinese or English feeds."},
                 "max_items": {"type": "integer", "default": 3},
             },

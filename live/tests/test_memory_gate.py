@@ -43,21 +43,31 @@ class GateCase(unittest.TestCase):
             os.environ["SOPHON_LIVE_MEMORY_PATH"] = self._env
         self._tmp.cleanup()
 
-    def task(self, utterance: str):
+    def task(self, utterance: str, explicit_save: bool | None = None):
         rec = self.ledger.create(utterance)
         self.ledger.mark_running(rec.task_id)
-        return rec, mg.TaskContext(task_id=rec.task_id, version=rec.version, utterance=utterance, ledger=self.ledger)
+        return rec, mg.TaskContext(task_id=rec.task_id, version=rec.version, utterance=utterance, ledger=self.ledger,
+                                   explicit_save=explicit_save)
 
     def stored(self) -> dict:
         return json.loads(self.path.read_text(encoding="utf-8")) if self.path.is_file() else {}
 
 
 class IntentTests(unittest.TestCase):
-    def test_explicit_save_intent(self) -> None:
-        for t in ("记住我喜欢美式", "以后默认查北京天气", "把这个记下来", "我喜欢听爵士"):
-            self.assertTrue(mg.has_explicit_save_intent(t), t)
-        for t in ("明天天气怎么样。用户补充：北京的", "现在几点了", "科技新闻", ""):
-            self.assertFalse(mg.has_explicit_save_intent(t), t)
+    """v0.1.1: whether the user asked to remember something is the MODEL's judgment (the ``memory_save`` tool option), not a word list."""
+
+    def test_explicit_save_is_the_models_answer_and_unknown_is_not_a_yes(self) -> None:
+        from sophon_live.coordinator import intent
+
+        self.assertIs(intent.explicit_save_from_answer("memory_save"), True)
+        self.assertIs(intent.explicit_save_from_answer("memory_note"), False)
+        self.assertIs(intent.explicit_save_from_answer("NONE"), False)
+        self.assertIsNone(intent.explicit_save_from_answer(None))
+        self.assertIsNone(intent.explicit_save_from_answer("not an option"))
+        self.assertEqual(intent.tools_from_answer("memory_save"), ["memory_note"])
+
+    def test_the_gate_keeps_a_write_as_a_task_slot_unless_the_model_said_save(self) -> None:
+        assert mg.TaskContext.__dataclass_fields__["explicit_save"].default is None
 
 
 class GatedWriteTests(GateCase):
@@ -70,7 +80,7 @@ class GatedWriteTests(GateCase):
         self.assertEqual(self.ledger.get_slots(rec.task_id), {"preferred_city": "北京"})
 
     def test_explicit_remember_saves_long_term(self) -> None:
-        rec, ctx = self.task("记住我喜欢美式")
+        rec, ctx = self.task("记住我喜欢美式", explicit_save=True)
         with mg.bind_task(ctx):
             out = _run(memory.run({"op": "save", "key": "coffee", "value": "美式"}))
         self.assertIn("记住", out)
@@ -78,7 +88,7 @@ class GatedWriteTests(GateCase):
         self.assertEqual(self.ledger.get_slots(rec.task_id), {})
 
     def test_explicit_remember_of_a_task_slot_key_is_stored_as_preferred(self) -> None:
-        rec, ctx = self.task("记住我在北京，以后默认查北京")
+        rec, ctx = self.task("记住我在北京，以后默认查北京", explicit_save=True)
         with mg.bind_task(ctx):
             _run(memory.run({"op": "save", "key": "city", "value": "北京"}))
         self.assertEqual(self.stored(), {"preferred_city": "北京"})  # never shares a key with the task slot "city"
@@ -213,6 +223,10 @@ class GatewayBindingTests(GateCase):
             await runner.run_tool("memory_note", {"op": "save", "key": "coffee", "value": "美式"})
             return "好的，记住了。"
 
+        from tests import jev_stub
+
+        jev_stub.tool_is("memory_save")          # the (scripted) model's judgment: the user asked to keep it
+        self.addCleanup(jev_stub.tool_is, "NONE")
         _arm(session, "d1", "记住我喜欢美式")
         with mock.patch.object(api, "USE_JEV", True), mock.patch.object(tools, "run_worker_job", as_worker(orch)):
             _run(session._coord_resolve("d1", "记住我喜欢美式"))

@@ -11,7 +11,6 @@ if str(_LIVE_ROOT) not in sys.path:
     sys.path.insert(0, str(_LIVE_ROOT))
 
 from sophon_live.coordinator import AdmitRequest, Ledger, admit, api
-from sophon_live.coordinator.route import heuristic_control
 from sophon_live.coordinator.schemas import TaskStatus
 
 
@@ -37,14 +36,6 @@ class HygieneTests(unittest.IsolatedAsyncioTestCase):
             res = await admit(_req("好的"), led)
         self.assertEqual(res.route, "FAST")
         self.assertIsNone(res.job)
-
-    def test_acknowledgements_never_fill_a_pending_slot(self) -> None:
-        led = Ledger()
-        rec = led.create("明天天气怎么样")
-        led.mark_needs_input(rec.task_id)
-        for t in ("好的", "谢谢", "嗯", "行", "知道了", "好的谢谢"):
-            self.assertIsNone(heuristic_control(t, led), t)
-        self.assertIsNotNone(heuristic_control("北京的", led))
 
     async def test_superseded_clarification_is_not_resurrected_by_refine(self) -> None:
         led = Ledger()

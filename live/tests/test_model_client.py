@@ -136,10 +136,8 @@ class JevDegradeTests(unittest.TestCase):
     def _admit(self, ledger: Ledger, text: str, jev):
         async def go():
             return await admit(_req(text), ledger)
-        with mock.patch.object(api.jev_client, "system_one", jev), \
-                mock.patch("sophon_live.coordinator.route.heuristic_route", side_effect=AssertionError("heuristic_route must not run")) as hr:
+        with mock.patch.object(api.jev_client, "system_one", jev):
             res = run(go())
-            hr.assert_not_called()
         return res
 
     def _live_ledger(self) -> Ledger:
@@ -201,9 +199,11 @@ class JevDegradeTests(unittest.TestCase):
         self.assertEqual(res.degraded_reason, "breaker_open")
         self.assertLess(times[-1], 0.05)
 
-    def test_heuristic_route_is_not_called_by_production_code(self) -> None:
-        src = (_LIVE_ROOT / "sophon_live" / "coordinator" / "api.py").read_text()
-        self.assertNotIn("heuristic_route(", src)
+    def test_there_is_no_keyword_router_in_production_code(self) -> None:
+        from sophon_live.coordinator import route
+
+        for gone in ("heuristic_route", "heuristic_control", "slot_edit"):
+            self.assertFalse(hasattr(route, gone), gone)
 
 
 class OrchAndHealthTests(unittest.TestCase):

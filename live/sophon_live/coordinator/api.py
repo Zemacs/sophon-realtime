@@ -8,16 +8,15 @@ from dataclasses import dataclass
 
 from .. import model_client
 from . import grounding, intent, jev_client
-from .clarify import clarify_for_slots, missing_slots_for_text
+from .clarify import MISSING_SLOT_KEY, build_missing_slot_question, clarify_for_slots, slots_from_answer
 from .ledger import Ledger
-from .route import build_route_questions, build_state, heuristic_control, slot_edit
+from .route import build_route_questions, build_state
 from .schemas import AdmitRequest, ControlDecision, PlaybackReceipt, SpeakPlan, TaskStatus, WorkerJob, WorkerResult, freshness_token_for
 from .schemas import FAILED_GENERIC, FIXED_FAILURES, NO_TOOL_ANSWER, NUMBERS_UNVERIFIED, is_tool_failure_sentence, tool_succeeded
 
 log = logging.getLogger("sophon_live.coordinator")
 
 USE_JEV = os.environ.get("SOPHON_LIVE_JEV", "1").strip().lower() in ("1", "true", "yes", "on")
-REFINE_GUARD = os.environ.get("SOPHON_LIVE_REFINE_GUARD", "1").strip().lower() in ("1", "true", "yes", "on")
 
 
 FAITHFUL_KEY = "task_faithful"
@@ -66,8 +65,20 @@ class AdmitResult:
     degraded_reason: str = ""  # via=degraded: breaker_open | timeout | connection | error | non_option_answer | jev_disabled
 
 
-def _clarify_text(text: str) -> str:
-    return clarify_for_slots(missing_slots_for_text(text))
+async def _clarify_text(text: str) -> str:
+    """The question to ask for a CLARIFY route: the MODEL names the missing slot (clarify.MISSING_SLOT_KEY); unknown -> generic ask."""
+    slots: list[str] = []
+    try:
+        resp = await jev_client.system_one({"utterance": text, "language": "zh"}, {MISSING_SLOT_KEY: build_missing_slot_question()})
+        slots = slots_from_answer(jev_client.choice_answer(resp, MISSING_SLOT_KEY))
+    except Exception as e:  # noqa: BLE001
+        log.warning("missing-slot judgment unavailable: %r", e)
+    return clarify_for_slots(slots)
+
+
+def _clarify_text_for_task(objective: str) -> str:
+    """Re-asking for a task that already waits for input: the Worker's own report named the slots; the generic ask is the safe repeat."""
+    return clarify_for_slots(None)
 
 
 def _parse_control_key(key: str | None) -> ControlDecision | None:
@@ -110,18 +121,12 @@ async def admit(req: AdmitRequest, ledger: Ledger) -> AdmitResult:
 async def _admit(req: AdmitRequest, ledger: Ledger, meta: dict) -> AdmitResult:
     text = (req.delegate_task or req.text or "").strip()
     raw = (req.raw_text or "").strip()
-    if REFINE_GUARD:
-        edit = slot_edit(text, req.raw_text, ledger)
-        if edit is not None:
-            meta["via"] = "guard"
-            log.info("refine guard: %r edits %s v%s", text[:60], edit.task_id, edit.version)
-            return _apply_control(edit, text, req, ledger)
-
     # JEV decides the route. When it cannot (down, slow, breaker open, or an answer that is not one of the offered options)
     # the Coordinator never guesses from keywords: it degrades to a model-free safe behaviour (see _degrade).
     route: str | None = None
     control_key: str | None = None
     tools: list[str] | None = None            # None = the model gave no tool answer (unknown)
+    explicit_save: bool | None = None         # the model's judgment: did the user explicitly ask to remember it long-term? None = unknown
     reason = "jev_disabled"
     if USE_JEV:
         try:
@@ -139,7 +144,9 @@ async def _admit(req: AdmitRequest, ledger: Ledger, meta: dict) -> AdmitResult:
             route = jev_client.choice_answer(resp, "route")
             if route in _ROUTES:
                 control_key = jev_client.choice_answer(resp, "control")
-                tools = intent.tools_from_answer(jev_client.choice_answer(resp, intent.TOOL_KEY))
+                tool_choice = jev_client.choice_answer(resp, intent.TOOL_KEY)
+                tools = intent.tools_from_answer(tool_choice)
+                explicit_save = intent.explicit_save_from_answer(tool_choice)
                 if jev_client.choice_answer(resp, FAITHFUL_KEY) == "DIFFERENT":
                     # model judged the front's task wording unfaithful to the user's words -> the user's own words are the task (provenance)
                     log.warning("delegate task %r judged unfaithful to what the user said; using %r", text[:60], raw[:60])
@@ -171,7 +178,7 @@ async def _admit(req: AdmitRequest, ledger: Ledger, meta: dict) -> AdmitResult:
         return AdmitResult(
             speak=SpeakPlan(
                 kind="clarify",
-                text=_clarify_text(text),
+                text=await _clarify_text(text),
                 task_id=rec.task_id,
                 version=rec.version,
             ),
@@ -186,16 +193,21 @@ async def _admit(req: AdmitRequest, ledger: Ledger, meta: dict) -> AdmitResult:
             ledger=ledger,
         )
 
-    if route == "CONTROL":
+    if route in ("CONTROL", "WORKER"):
+        # The model's ``control`` answer names which live task (if any) this utterance edits / cancels / asks about. A rewritten full
+        # sentence ("明天北京会下雨吗" after "…上海…") is the model's call too, so a REFINE option is honoured whichever of the two
+        # routes it came with; the code only enforces (task exists, version current, state machine) in _apply_control.
         decision = _parse_control_key(control_key)
-        # JEV said CONTROL but named no usable target (or NEW): the Ledger decides what exists.
-        if decision is None and control_key != "NEW":
-            decision = heuristic_control(text, ledger)
         if decision is not None:
-            return _apply_control(decision, text, req, ledger, tools)
+            return _apply_control(decision, text, req, ledger, tools, explicit_save)
+    if route == "CONTROL":
+        if control_key != "NEW":
+            # JEV said CONTROL but named no usable target: only the router could tell what to do, so ask (model-free, fixed sentence).
+            log.warning("route=CONTROL without a usable control option (%r): fixed clarify", control_key)
+            return AdmitResult(speak=SpeakPlan(kind="clarify", text=DEGRADED_CLARIFY), route="CLARIFY", ledger=ledger)
 
     # WORKER or CONTROL→NEW or CONTROL with nothing to control
-    job = _new_job(ledger, text, language=req.language, tools=tools)
+    job = _new_job(ledger, text, language=req.language, tools=tools, explicit_save=explicit_save)
     return AdmitResult(
         speak=SpeakPlan(
             kind="pad",
@@ -237,11 +249,11 @@ def _answer(text: str, ledger: Ledger, decision: ControlDecision, *, version: in
     )
 
 
-def _apply_control(decision: ControlDecision, text: str, req: AdmitRequest, ledger: Ledger, tools: list[str] | None = None) -> AdmitResult:
+def _apply_control(decision: ControlDecision, text: str, req: AdmitRequest, ledger: Ledger, tools: list[str] | None = None, explicit_save: bool | None = None) -> AdmitResult:
     rec = ledger.tasks.get(decision.task_id)
     if rec is None:
         # unknown id (e.g. a hallucinated option): nothing to control, treat as a new request
-        job = _new_job(ledger, text, language=req.language, tools=tools)
+        job = _new_job(ledger, text, language=req.language, tools=tools, explicit_save=explicit_save)
         return AdmitResult(
             speak=SpeakPlan(kind="pad", text=intent.pad_for_tools(tools), task_id=job.task_id, version=job.version),
             job=job,
@@ -266,7 +278,7 @@ def _apply_control(decision: ControlDecision, text: str, req: AdmitRequest, ledg
         if rec.status in (TaskStatus.QUEUED, TaskStatus.RUNNING):
             return _answer("还在查，请稍等一下。", ledger, decision, version=rec.version)
         if rec.status == TaskStatus.NEEDS_INPUT:
-            return _answer(_clarify_text(rec.objective), ledger, decision, version=rec.version)
+            return _answer(_clarify_text_for_task(rec.objective), ledger, decision, version=rec.version)
         if rec.status == TaskStatus.FAILED and rec.spoken_answer:
             return _answer(rec.spoken_answer, ledger, decision, version=rec.version)
         return _answer("这个任务已经取消了，没有结果。", ledger, decision, version=rec.version)
@@ -277,7 +289,7 @@ def _apply_control(decision: ControlDecision, text: str, req: AdmitRequest, ledg
     objective = _refined_objective(rec.objective, text, slot_fill=rec.status == TaskStatus.NEEDS_INPUT)
     new = ledger.refine(decision.task_id, objective, version=decision.version)
     if new is None:
-        job = _new_job(ledger, text, language=req.language, tools=tools)
+        job = _new_job(ledger, text, language=req.language, tools=tools, explicit_save=explicit_save)
         return AdmitResult(
             speak=SpeakPlan(kind="answer", text="原任务已经失效，我按新请求来办。", task_id=job.task_id, version=job.version),
             job=job,
@@ -287,6 +299,8 @@ def _apply_control(decision: ControlDecision, text: str, req: AdmitRequest, ledg
         )
     if tools:
         new.require_tools, new.tool_judgment = list(tools), "model"
+        if explicit_save is not None:
+            new.explicit_save = explicit_save
     ledger.mark_running(new.task_id)
     return AdmitResult(
         speak=SpeakPlan(kind="pad", text="好的，按你改的来。", task_id=new.task_id, version=new.version),
@@ -299,6 +313,7 @@ def _apply_control(decision: ControlDecision, text: str, req: AdmitRequest, ledg
             # a REFINE re-runs the job with the new slots: what the router said for the new words, else what it said for the old task
             require_tools=tools or list(rec.require_tools),
             tool_judgment="model" if tools is not None else rec.tool_judgment,
+            explicit_save=new.explicit_save,
         ),
         route="CONTROL",
         ledger=ledger,
@@ -314,10 +329,10 @@ def _refined_objective(old: str, utterance: str, *, slot_fill: bool) -> str:
     return f"{old}。用户改口，以新说法为准：{utterance}"
 
 
-def _new_job(ledger: Ledger, objective: str, *, language: str = "zh", tools: list[str] | None = None) -> WorkerJob:
+def _new_job(ledger: Ledger, objective: str, *, language: str = "zh", tools: list[str] | None = None, explicit_save: bool | None = None) -> WorkerJob:
     ledger.supersede_pending_input()  # a fresh request replaces any open clarification
     judgment = "unknown" if tools is None else "model"
-    rec = ledger.create(objective, require_tools=tools or [], tool_judgment=judgment)
+    rec = ledger.create(objective, require_tools=tools or [], tool_judgment=judgment, explicit_save=explicit_save)
     ledger.mark_running(rec.task_id)
     return WorkerJob(
         task_id=rec.task_id,
@@ -327,6 +342,7 @@ def _new_job(ledger: Ledger, objective: str, *, language: str = "zh", tools: lis
         freshness_token=freshness_token_for(rec.task_id, rec.version),
         require_tools=list(tools or []),
         tool_judgment=judgment,
+        explicit_save=explicit_save,
     )
 
 

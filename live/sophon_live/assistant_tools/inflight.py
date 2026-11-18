@@ -14,6 +14,7 @@ own socket timeout. Two things bound the damage:
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import functools
 import os
 import threading
@@ -21,6 +22,25 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Callable, TypeVar
 
 T = TypeVar("T")
+
+BUSY_ZH = "我这边同时在查的太多了，稍等再问我一次。"
+BUSY_EN = "I'm running too many lookups at once right now. Please ask me again in a moment."
+
+
+class Busy(OSError):
+    """The cap is full: a refusal OF OURS, not a network problem (S-24: the tools say so instead of 'network unavailable')."""
+
+
+# one list per tool call; ``run`` appends to it when it refuses, the tool reads it when it has to report a failure
+_SEEN: contextvars.ContextVar[list | None] = contextvars.ContextVar("sophon_outbound_busy", default=None)
+
+
+def track_busy() -> list:
+    """Start a fresh busy record for the current tool call (tasks it spawns share it through the copied context)."""
+    seen: list = []
+    _SEEN.set(seen)
+    return seen
+
 
 MAX_INFLIGHT = max(1, int(os.environ.get("SOPHON_SEARCH_MAX_INFLIGHT", "12")))
 SHARED = threading.BoundedSemaphore(MAX_INFLIGHT)
@@ -34,7 +54,10 @@ async def run(fn: Callable[..., T], *args, sem: threading.BoundedSemaphore | Non
     is cancelled (the thread is still holding a socket then)."""
     s = sem if sem is not None else SHARED
     if not s.acquire(blocking=False):
-        raise OSError("too many outbound requests in flight")
+        seen = _SEEN.get()
+        if seen is not None:
+            seen.append(1)
+        raise Busy("too many outbound requests in flight")
     try:
         fut: Future = EXECUTOR.submit(functools.partial(fn, *args, **kw))
     except BaseException:

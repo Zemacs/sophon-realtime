@@ -230,6 +230,7 @@ async def run(args: dict[str, Any] | None = None) -> str:
     max_results = _clamp_max(args.get("max_results"), 3)
     zh = _is_zh(query) or args.get("lang") == "zh"
 
+    busy = _inflight_mod.track_busy()
     budget = _budget_s()
     t_end = time.monotonic() + budget
     per_source = max(0.5, budget - 0.5)
@@ -266,6 +267,8 @@ async def run(args: dict[str, Any] | None = None) -> str:
     if not snippets:
         if empty:
             return _no_results(query, zh=zh)
+        if busy:
+            return _inflight_mod.BUSY_ZH if zh else _inflight_mod.BUSY_EN       # S-24: our own cap refused, not a network fault
         return _network_error(zh)
 
     snippets = snippets[:max_results]

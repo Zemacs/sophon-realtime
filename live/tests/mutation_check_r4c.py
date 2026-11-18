@@ -5,7 +5,9 @@ ROOT = "."
 PY = sys.executable
 T_S19 = ["tests.test_r4_s19_inflight", "tests.test_r4_search_evidence", "tests.test_r4_news_evidence"]
 T_S18 = ["tests.test_r4_s18_s21", "tests.test_no_fabrication", "tests.test_r4_review_b1"]
-T_INT = ["tests.test_r4_intent_i10", "tests.test_r4_intent_gate"]
+T_INT = ["tests.test_r4_intent_i10", "tests.test_r4_intent_gate", "tests.test_r4d_intent"]
+T_D = ["tests.test_r4d_s23_s24", "tests.test_r4_news_evidence"]
+NEWS = "sophon_live/assistant_tools/news.py"; WS = "sophon_live/assistant_tools/web_search.py"; WX = "sophon_live/assistant_tools/weather.py"
 INF = "sophon_live/assistant_tools/inflight.py"; SCH = "sophon_live/coordinator/schemas.py"; INT = "sophon_live/coordinator/intent.py"
 CB = "    fut.add_done_callback(lambda _f: s.release())\n    return await asyncio.wrap_future(fut)"
 M = [
@@ -19,10 +21,18 @@ M = [
  ("echo: fullmatch -> match", SCH, "pat.fullmatch(text or \"\")", "pat.match(text or \"\")", T_S18),
  ("weather slot widened to 200 chars", SCH, "(?:no source|{_WEATHER_SRC}(?:, {_WEATHER_SRC}){{0,7}})", "[A-Za-z0-9:_,\\- ]{{0,200}}", T_S18),
  ("echo: no word boundary", SCH, "    if re.match(r\"[a-z0-9]\", e[0]):\n        pat = r\"(?<![a-z0-9])\" + pat\n    if re.match(r\"[a-z0-9]\", e[-1]):\n        pat += r\"(?![a-z0-9])\"\n", "", T_S18),
- ("echo: checked against Worker args", SCH, "_said_in(echoed, objective)", "_said_in(echoed, str((ev.get('args') or {})) + ' ' + objective)", T_S18),
- ("templates not bound to the tool", SCH, "TOOL_FAILURE_TEMPLATES.get(str((ev or {}).get(\"tool\") or \"\"), ())", "[p for v in TOOL_FAILURE_TEMPLATES.values() for p in v]", T_S18),
+ ("echo: checked against Worker args", SCH, "_echo_ok(m.group(1), objective, city=tool == \"get_weather\")", "_echo_ok(m.group(1), str((ev or {}).get('args')) + ' ' + objective, city=tool == \"get_weather\")", T_S18),
+ ("templates not bound to the tool", SCH, "TOOL_FAILURE_TEMPLATES.get(tool, ())", "[p for v in TOOL_FAILURE_TEMPLATES.values() for p in v]", T_S18),
  ("intent: unit-conversion veto removed", INT, "    if _UNIT_CONVERT.search(t) and not _MONEYISH.search(t):\n        return False                                    # unit conversion is arithmetic, never a lookup", "    if False:\n        return False", T_INT),
  ("intent: 黄金/白银 back in _MONEYISH", INT, "|USDT|多少钱|价格", "|USDT|黄金|白银|多少钱|价格", T_INT),
+ ("S-23: single-character echo accepted", SCH, "    if len(e) < 2:\n        return False\n    low", "    low", T_D),
+ ("S-23: refine objective not split (stale city accepted)", SCH, "    if not city or not earlier or mark == _REFINE_MARKERS[1]:", "    if True:", T_D),
+ ("S-24: news says 'feeds unreachable' when the cap refused", NEWS, "        if busy:\n            return inflight.BUSY_ZH if lang", "        if False:\n            return inflight.BUSY_ZH if lang", T_D),
+ ("S-24: search says 'network' when the cap refused", WS, "        if busy:\n            return _inflight_mod.BUSY_ZH", "        if False:\n            return _inflight_mod.BUSY_ZH", T_D),
+ ("S-24: weather says 'cannot find' when the cap refused", WX, "        if busy:\n            return (inflight.BUSY_ZH", "        if False:\n            return (inflight.BUSY_ZH", T_D),
+ ("S-24: busy sentence not whitelisted for web_search", SCH, '    "web_search": tuple(re.compile(p) for p in (\n        r"网络暂时不可用，没法完成网页搜索，请稍后再试。",\n        BUSY_ZH_RE, BUSY_EN_RE,', '    "web_search": tuple(re.compile(p) for p in (\n        r"网络暂时不可用，没法完成网页搜索，请稍后再试。",', T_D),
+ ("I-11: fallback F without the value noun", INT, "and _QTY_NOW_RE.search(t) and _VALUE_NOUN_RE.search(t)", "and _QTY_NOW_RE.search(t)", T_INT),
+ ("I-11: arithmetic veto removed from the primary route", INT, "    if _ARITH_STRONG.search(t):\n        return False\n", "", T_INT),
 ]
 bad = 0
 for name, f, old, new, tests in M:

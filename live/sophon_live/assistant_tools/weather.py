@@ -346,6 +346,7 @@ async def run_detailed(args: dict[str, Any] | None = None) -> tuple[str, dict[st
     if hit and age_s is not None and age_s <= _cache_ttl():
         return _compose(hit[1], name, when, idx, zh), {"source": "cache", "ms": 0, "notes": [], "age_s": round(age_s), "orig_source": hit[2], **_facts(hit[1], name)}
 
+    busy = inflight.track_busy()
     data, source, notes = await _first_ok(query_name, name, idx, zh)
     meta = {"source": source or None, "ms": round((time.monotonic() - t0) * 1000), "notes": notes, **_facts(data, name)}
     if data is None and notes and all(n.endswith(":no_data") for n in notes):
@@ -360,6 +361,8 @@ async def run_detailed(args: dict[str, Any] | None = None) -> tuple[str, dict[st
             lead = f"网络不太好，这是{mins}分钟前查到的：" if zh else f"The network is poor; this is from {mins} min ago: "
             meta.update(source="cache-stale", age_s=round(age_s), orig_source=hit[2], **_facts(old, name))
             return lead + body, meta
+        if busy:
+            return (inflight.BUSY_ZH if zh else inflight.BUSY_EN), meta               # S-24: our own cap refused, not a weather-source outage
         if zh:
             return f"暂时查不到{display_name}的天气，请稍后再试。", meta
         return f"Weather for {display_name} is unavailable right now ({', '.join(notes) or 'no source'}).", meta

@@ -66,7 +66,7 @@ class SharedInflightCap(unittest.TestCase):
         with mock.patch.object(inflight, "SHARED", full), mock.patch.object(news, "_urlopen", side_effect=AssertionError("must not even start")):
             t0 = time.monotonic()
             out = _run(news.run({"topic": "科技", "lang": "zh"}))
-        self.assertIn("连不上", out)
+        self.assertEqual(out, inflight.BUSY_ZH)          # S-24: our own cap refused: say "too many at once", not "feeds unreachable"
         self.assertLess(time.monotonic() - t0, 1.0)
 
     def test_slots_are_released_after_a_news_request(self) -> None:

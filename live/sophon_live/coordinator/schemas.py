@@ -61,26 +61,47 @@ FIXED_FAILURES = frozenset({
 # fabricated sentence by writing it into evidence as the "tool's own text", nor pass a web_search sentence off as the weather tool's.
 # Group 1, where present, is what the tool echoes back (city / query); it must appear, as a whole word, in the user's ORIGINAL request
 # (``job.objective``), never in the Worker's own ``args`` (the Worker is the party being checked).
-_CITY = r"[\u4e00-\u9fffA-Za-z·\- ]"
-_WEATHER_SRC = r"(?:sojson|open-meteo|wttr):(?:no_data|[A-Z][A-Za-z]{2,40})"          # exactly what weather._first_ok writes into ``notes``
+_CITY = r"[\u4e00-\u9fffA-Za-z·\-.' ]"          # (St. Louis, Xi'an)
+_WEATHER_SRC = r"(?:sojson|open-meteo|wttr):(?:no_data|[A-Za-z][A-Za-z0-9_]{2,40})"          # exactly what weather._first_ok writes into ``notes``
+# S-24: the "I am saturated" sentence, one text for every outbound tool (assistant_tools.inflight.BUSY_ZH / BUSY_EN; a test keeps them equal)
+BUSY_ZH_RE = r"我这边同时在查的太多了，稍等再问我一次。"
+BUSY_EN_RE = r"I'm running too many lookups at once right now\. Please ask me again in a moment\."
 TOOL_FAILURE_TEMPLATES: dict[str, tuple[re.Pattern[str], ...]] = {
     "get_weather": tuple(re.compile(p) for p in (
         rf"暂时查不到({_CITY}{{1,24}})的天气，请稍后再试。",
         rf"Weather for ({_CITY}{{1,40}}) is unavailable right now \((?:no source|{_WEATHER_SRC}(?:, {_WEATHER_SRC}){{0,7}})\)\.",
         rf"找不到({_CITY}{{1,24}})的天气信息。",
         rf"No weather data for ({_CITY}{{1,40}})\.",
+        BUSY_ZH_RE, BUSY_EN_RE,
     )),
     "get_news": tuple(re.compile(p) for p in (
         r"新闻源暂时连不上，稍后再帮你看看头条吧。",
+        BUSY_ZH_RE, BUSY_EN_RE,
         r"News feeds are unreachable right now\. Try again in a moment\.",
     )),
     "web_search": tuple(re.compile(p) for p in (
         r"网络暂时不可用，没法完成网页搜索，请稍后再试。",
+        BUSY_ZH_RE, BUSY_EN_RE,
         r"Web search is unavailable right now due to a network problem\. Please try again later\.",
         r"没有搜到关于「([^」\n]{1,60})」的可靠摘要。",
         r"I couldn't find useful snippets for '([^'\n]{1,60})'\.",
     )),
 }
+
+
+_REFINE_MARKERS = ("。用户改口，以新说法为准：", "。用户补充：")      # api._refined_objective builds the objective as  <old> + marker + <new words>, possibly nested
+
+
+def _split_objective(objective: str) -> tuple[str, str, str]:
+    """(earlier part, last marker, latest words). With no marker the whole objective is the latest words."""
+    cut, mark = -1, ""
+    for m in _REFINE_MARKERS:
+        i = objective.rfind(m)
+        if i > cut:
+            cut, mark = i, m
+    if cut < 0:
+        return "", "", objective
+    return objective[:cut], mark, objective[cut + len(mark):]
 
 
 def _said_in(echoed: str, request: str) -> bool:
@@ -97,30 +118,70 @@ def _said_in(echoed: str, request: str) -> bool:
     return re.search(pat, r) is not None
 
 
+def _known_cities() -> dict[str, str]:
+    try:
+        from ..assistant_tools.weather import CITIES
+    except Exception:  # noqa: BLE001
+        return {}
+    return dict(CITIES)
+
+
+def _is_whole_entity(echoed: str, request: str) -> bool:
+    """S-23: at least two characters, and at least one occurrence in the request is a clean one: it is a known city exactly, or it does not
+    cut into a known city name the request mentions (京 / 海 / 北 of 北京 / 上海, 京天 of 北京天气)."""
+    e = " ".join(echoed.split()).lower()
+    if len(e) < 2:
+        return False
+    low = " ".join(request.split()).lower()
+    spans = []
+    for zh, en in _known_cities().items():
+        for name in (zh, en):
+            n = name.lower()
+            i = low.find(n)
+            while i >= 0:
+                spans.append((i, i + len(n)))
+                i = low.find(n, i + 1)
+    i = low.find(e)
+    while i >= 0:
+        j = i + len(e)
+        if all((i, j) == sp or j <= sp[0] or i >= sp[1] for sp in spans):
+            return True
+        i = low.find(e, i + 1)
+    return False
+
+
+def _echo_ok(echoed: str, objective: str, *, city: bool) -> bool:
+    earlier, mark, latest = _split_objective(objective or "")
+    names = {echoed}
+    if city:
+        names |= _city_aliases(echoed)
+    def seen(text: str) -> bool:
+        return any(_is_whole_entity(n, text) and _said_in(n, text) for n in names)
+    if not city or not earlier or mark == _REFINE_MARKERS[1]:
+        return seen(objective or "")                    # plain request / a slot fill (the supplement completes the original ask)
+    # a 改口 (the new words win): the echoed city must be in the new words; or in the old ask while the new words name no city at all
+    if seen(latest):
+        return True
+    cities = [n.lower() for zh, en in _known_cities().items() for n in (zh, en)]
+    low = latest.lower()
+    return seen(earlier) and not any(c in low for c in cities)
+
+
 def is_tool_failure_sentence(text: str, ev: dict, objective: str = "") -> bool:
     """``text`` is one of the failed tool's own failure sentences, and what it echoes (city / query) is in the user's original request."""
-    for pat in TOOL_FAILURE_TEMPLATES.get(str((ev or {}).get("tool") or ""), ()):
+    tool = str((ev or {}).get("tool") or "")
+    for pat in TOOL_FAILURE_TEMPLATES.get(tool, ()):
         m = pat.fullmatch(text or "")
         if not m:
             continue
-        if not m.groups():
-            return True
-        echoed = m.group(1)
-        if _said_in(echoed, objective):
-            return True
-        # the weather tool names a known city by its canonical name (北京) even when the user wrote it in English (Beijing) or the reverse
-        return str(ev.get("tool")) == "get_weather" and any(_said_in(a, objective) for a in _city_aliases(echoed))
+        return True if not m.groups() else _echo_ok(m.group(1), objective, city=tool == "get_weather")
     return False
 
 
 def _city_aliases(name: str) -> set[str]:
-    try:
-        from ..assistant_tools.weather import CITIES
-    except Exception:  # noqa: BLE001
-        return set()
     n = " ".join(name.split()).lower()
     out: set[str] = set()
-    for zh, en in CITIES.items():
+    for zh, en in _known_cities().items():
         if n in (zh.lower(), en.lower()):
             out.update((zh, en))
     out.discard(name)

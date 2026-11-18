@@ -175,6 +175,7 @@ async def run(args: dict[str, Any] | None = None) -> str:
     if max_items >= 2:
         speak_n = max(2, speak_n)
 
+    busy = inflight.track_busy()
     titles: list[str] = []
     bucket = _bucket(topic)
     if lang == "zh":
@@ -207,6 +208,8 @@ async def run(args: dict[str, Any] | None = None) -> str:
             titles = []
 
     if not titles:
+        if busy:
+            return inflight.BUSY_ZH if lang == "zh" else inflight.BUSY_EN         # S-24: our own cap refused, not a feed outage
         if lang == "zh":
             return "新闻源暂时连不上，稍后再帮你看看头条吧。"
         return "News feeds are unreachable right now. Try again in a moment."

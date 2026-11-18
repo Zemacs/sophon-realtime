@@ -306,6 +306,8 @@ async def run_job(
                 failed = (
                     '"ok": false' in out
                     or "暂时连不上" in out
+                    or "同时在查的太多" in out
+                    or "too many lookups" in out
                     or "暂时查不到" in out
                     or "暂时没有" in out
                     or "unreachable" in out.lower()

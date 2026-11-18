@@ -135,7 +135,7 @@ class GatewayDeliveryTests(unittest.IsolatedAsyncioTestCase):
             return "北京明天晴。"
 
         _arm(session, "d1", "北京明天天气")
-        with mock.patch.object(api, "USE_JEV", False), mock.patch.object(tools, "run_worker_job", as_worker(orch)):
+        with mock.patch.object(api, "USE_JEV", True), mock.patch.object(tools, "run_worker_job", as_worker(orch)):
             t1 = asyncio.create_task(session._coord_resolve("d1", "北京明天天气"))
             await asyncio.sleep(0.05)
             # real LiveSession._drop_playback needs these
@@ -164,7 +164,7 @@ class GatewayDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
         _arm(session, "d1", "北京明天天气")
         _arm(session, "d2", "取消刚才那个")
-        with mock.patch.object(api, "USE_JEV", False), mock.patch.object(tools, "run_worker_job", as_worker(orch)):
+        with mock.patch.object(api, "USE_JEV", True), mock.patch.object(tools, "run_worker_job", as_worker(orch)):
             t1 = asyncio.create_task(session._coord_resolve("d1", "北京明天天气"))
             await asyncio.sleep(0.05)
             await session._coord_resolve("d2", "取消刚才那个")
@@ -216,7 +216,7 @@ class GatewayDeliveryTests(unittest.IsolatedAsyncioTestCase):
         session.coord_ledger = Ledger()
         tid, ver = _done_task(session.coord_ledger, "北京明天天气", "晴，12到18度。")
         _arm(session, "d2", "刚才查得怎么样")
-        with mock.patch.object(api, "USE_JEV", False):
+        with mock.patch.object(api, "USE_JEV", True):
             await session._coord_resolve("d2", "刚才查得怎么样")
         self.assertEqual(session.deleg["d2"]["chunks"], [("commentary", "晴，12到18度。")])
         self.assertEqual(session.deleg["d2"]["track"], (tid, ver))

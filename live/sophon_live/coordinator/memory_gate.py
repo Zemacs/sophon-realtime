@@ -20,17 +20,12 @@ from typing import Any, Callable, Iterator, Protocol
 
 from .ledger import Ledger
 
-# The user asked to keep something: 记住/记下/保存/以后/默认/别忘/我喜欢/我的偏好/我习惯.
-EXPLICIT_SAVE_HINTS = ("记住", "记下", "记得", "保存", "以后", "默认", "别忘", "我喜欢", "我的偏好", "我习惯")
+# Whether the user explicitly asked to keep something long-term is the ROUTER MODEL's judgment (intent.MEMORY_SAVE option), carried
+# on the task as ``TaskContext.explicit_save``; this gate only enforces it (True writes long-term, anything else keeps a task slot).
 # Keys that describe *this* request. As long-term memory they get the preferred_ prefix, so a stored
 # value can never share a name with a task slot.
 TASK_SLOT_KEYS = frozenset({"city", "location", "when", "date", "time", "day", "device", "action", "topic", "query", "target", "value"})
 PREFERENCE_PREFIXES = ("preferred_", "default_", "favorite_")
-
-
-def has_explicit_save_intent(text: str | None) -> bool:
-    t = (text or "").strip()
-    return bool(t) and any(h in t for h in EXPLICIT_SAVE_HINTS)
 
 
 def long_term_key(key: str) -> str:
@@ -54,6 +49,7 @@ class TaskContext:
     version: int
     utterance: str
     ledger: Ledger
+    explicit_save: bool | None = None     # the router model's judgment; None (unknown) never writes long-term memory
 
 
 _CURRENT: ContextVar[TaskContext | None] = ContextVar("memory_gate_task", default=None)
@@ -101,7 +97,7 @@ class MemoryGate:
             return "要保存什么内容？请再说一下值。"
         val = str(value).strip()
         ctx = self._context()
-        if ctx is not None and not has_explicit_save_intent(ctx.utterance):
+        if ctx is not None and ctx.explicit_save is not True:
             # Only an answer for this task: keep it as a task slot, not as memory.
             ctx.ledger.set_slot(ctx.task_id, ctx.version, key, val)
             return f"这次的「{key}」只用于当前任务，没有存成长期记忆。想让我长期记住的话，请说「记住……」。"

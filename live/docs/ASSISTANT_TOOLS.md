@@ -7,7 +7,7 @@
 
 | 层 | 模型可见工具 | 真正执行方 |
 |---|---|---|
-| GPT-Live `/v1/live/sessions` | 仅 **`delegate(task)`**（`delegation.type=client` 时） | **推荐** `SOPHON_LIVE_ORCH=1`（本机 LLM 选型+工具）；或浏览器 demoBackend / 手动 / 遗留 `BUILTIN` 启发式 |
+| GPT-Live `/v1/live/sessions` | 仅 **`delegate(task)`**（`delegation.type=client` 时） | **推荐** `SOPHON_LIVE_ORCH=1`（本机 LLM 选型+工具）；或手动回答（测试页） |
 | OpenAI Realtime `/v1/realtime` | 客户端传入的 `tools[]`，或 BackOffice 模式下的 **`delegate`** | 客户端 function_call 或 `SOPHON_LIVE_BACKEND` |
 | 引擎 Tag/Flash/E2E | **无内置领域工具**；`extra_body.tools` 透传 | `tool_mode=mock` 本地假结果，或 `client` + HTTP bridge |
 
@@ -22,14 +22,14 @@
 | `get_datetime` | 本地/时区 时间日期 |
 | `get_weather` | Open-Meteo 天气 |
 | `web_search` | DuckDuckGo Instant Answer（无 key） |
-| `get_news` | Google News RSS 头条 |
+| `get_news` | Google News RSS / 人民网 RSS 头条；`topic` 是封闭枚举 `tech`/`finance`/`world`/`general`，由编排模型填写，代码只按参数取源（不读用户原话，不做关键词过滤）；具体人物/公司/事件走 `web_search` |
 | `device_control` | 模拟设备（可选 `SOPHON_LIVE_DEVICE_HOOK`） |
 | `memory_note` | 本地 JSON 记忆 |
 
 前端仍只调用 `delegate`。
 
 - **推荐：** `SOPHON_LIVE_ORCH=1` → `orchestrator.py` 调本地 vLLM，用上表 schemas 选型，再 `run_tool` 执行并 `commentary` 回灌（`backend=orch`）。  
-- **遗留演示：** `SOPHON_LIVE_BUILTIN_TOOLS=1` → 启发式 `run_task`（**不是**正式架构）。
+- **已删除（Round 4g）：** 旧的启发式 `SOPHON_LIVE_BUILTIN_TOOLS` / `run_task`（用关键词给任务选工具，违反「模型判断、代码只强制」）。该环境变量不再有任何作用。
 
 ## 3. 启用（路径 1 共置编排）
 
@@ -41,14 +41,14 @@ export SOPHON_LIVE_ORCH_MODEL=qwen3.8-27b-bo
 BUILD=tag PORT=8000 LIVE_PORT=8780 bash start_live.sh
 ```
 
-测试页收到 `delegation.backend === "orch"`（或 `"builtin"`）时不再跑浏览器 demoBackend。总方案见 deplux `docs/sophon-path1-colocated-backend.md`。
+测试页已不含演示后端（Round 4i）：`delegation.backend` 为 `orch` 或 `coord` 时只显示委派卡片，其他情况弹出手动回答框。总方案见 deplux `docs/sophon-path1-colocated-backend.md`。
 
 ## 4. 架构选择（通用助手）
 
 ```text
 用户语音 → LiveSession → 引擎（仅 delegate）
                 ↓
-        assistant_tools.run_task(task)
+        orchestrator.run_job(job)   # 由模型选工具
                 ↓
         commentary → tool_result → 口语转述
 ```

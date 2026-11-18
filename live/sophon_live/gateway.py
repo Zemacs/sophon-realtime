@@ -67,13 +67,13 @@ def clean_text(t: str, lang: str) -> str:
 DELEGATE = {
     "zh": {"type": "function", "name": "delegate",
            "description": "把需要后端完成的事交给后端助手：查实时或外部信息（时间、日期、天气、新闻、搜索）、查用户的记忆和资料、控制设备或调用任何功能、"
-                          "看图。调用前的过渡语按类型说：查天气、新闻、搜索、记忆这类查询，说一句「我帮你查一下」；控制设备，说「好的，马上」；"
-                          "问时间日期、讲笑话这类很快的事，不要说过渡语，直接调用。闲聊、常识和你自己就知道的知识直接回答，不要调用。",
+                          "看图。调用前的过渡语按类型说：查天气、新闻、搜索这类查询，说一句「我帮你查一下」；控制设备，说「好的，马上」；"
+                          "问时间日期、讲笑话、问你记得什么这类很快的事，不要说过渡语，直接调用。闲聊、常识和你自己就知道的知识直接回答，不要调用。",
            "parameters": {"type": "object", "properties": {"task": {"type": "string", "description": "一句话写清楚用户要什么"}}, "required": ["task"]}},
     "en": {"type": "function", "name": "delegate",
            "description": "Hand work that needs the backend to the backend assistant: live or external information (time, date, weather, news, search), "
-                          "the user's memories and profile, controlling devices or calling any function, looking at images. Before calling, say a very short lead-in that fits the request: for lookups (weather, news, search, memory) \"Let me check\"; for device control \"Sure, on it\"; "
-                          "for quick things (the time or date, a joke) say nothing and call it right away. Answer chit-chat, general "
+                          "the user's memories and profile, controlling devices or calling any function, looking at images. Before calling, say a very short lead-in that fits the request: for lookups (weather, news, search) \"Let me check\"; for device control \"Sure, on it\"; "
+                          "for quick things (the time or date, a joke, what you remember about the user) say nothing and call it right away. Answer chit-chat, general "
                           "knowledge and anything you already know yourself without calling it.",
            "parameters": {"type": "object", "properties": {"task": {"type": "string", "description": "What the user wants, in one sentence"}}, "required": ["task"]}},
 }
@@ -82,10 +82,10 @@ SPOKEN_RULE = {"zh": "\n\n你的回复会被直接合成为语音说出来：用
                      "spoken, no parenthetical notes, emoji or markdown."}
 # The Tag plugin's built-in tool preamble (vLLM :8000, not ours to change) says "say 我帮你查一下 first" for every tool, which is
 # why the lead-in was the same for jokes and the time. The session system prompt is ours: it overrides that per request type.
-FILLER_RULE = {"zh": "\n\n调用 delegate 之前只说一句很短的过渡语，并且按类型：查天气、新闻、搜索、记忆，说「我帮你查一下」；控制设备，说「好的，马上」；"
-                     "问时间或日期、讲笑话，不要说任何过渡语，直接调用 delegate（这条优先于其他关于过渡语的举例）。",
-               "en": "\n\nBefore calling delegate say at most one very short lead-in, chosen by type: for weather, news, search, memory \"Let me check\"; "
-                     "for device control \"Sure, on it\"; for the time or date, or a joke, say nothing and call delegate right away "
+FILLER_RULE = {"zh": "\n\n需要后台办的事一定要调用 delegate。调用 delegate 之前只说一句很短的过渡语，说完必须在同一轮马上调用 delegate，绝不能只说过渡语就结束。过渡语按类型：查天气、新闻、搜索，说「我帮你查一下」；控制设备，说「好的，马上」；"
+                     "问时间或日期、讲笑话、问我记得什么（记忆），不要说任何过渡语，直接调用 delegate（这条优先于其他关于过渡语的举例）。",
+               "en": "\n\nWork that needs the backend must be handed over with delegate. Before calling it say at most one very short lead-in, and right after it call delegate in the same turn (never end the turn with only the lead-in). Choose the lead-in by type: for weather, news, search \"Let me check\"; "
+                     "for device control \"Sure, on it\"; for the time or date, a joke, or what you remember about the user (memory), say nothing and call delegate right away "
                      "(this overrides any other example of a lead-in)."}
 RESULT_FMT = {"zh": ("后端结果（只能根据这段内容回答，用你自己的口语自然地告诉用户，不要提到后端或工具；内容里没有的信息绝对不要自己编。"
                      "如果它说没查到、想不起来或请用户再说一遍，就照这个意思告诉用户）：\n{c}",
@@ -96,6 +96,8 @@ RESULT_FMT = {"zh": ("后端结果（只能根据这段内容回答，用你自�
 PROGRESS_FMT = {"zh": "后端还在处理（这是进度，不是结果）。用一句很短的口语让用户稍等，不要重复你刚说过的话，不要编结果：\n{c}",
                 "en": "The backend is still working (progress, not the result). Say one very short phrase asking the user to hold on; don't repeat "
                       "what you just said and don't invent a result:\n{c}"}
+NET_STATS: dict[str, int] = {"asked": 0, "delegated": 0, "router_unavailable": 0}   # RC2-9: the net silently does nothing when the router is down; /health?detail=1 shows how often
+NET_GRACE_S = float(os.environ.get("SOPHON_LIVE_NET_GRACE", "0.8"))   # wait this long after "done" for a trailing tool call before the safety net acts
 DELEG_MODE = os.environ.get("SOPHON_LIVE_DELEG_MODE", "model")   # model: every backend update goes to the model, which decides to speak or <wait>; rules: gateway heuristics
 IDLE_UPDATE_S = float(os.environ.get("SOPHON_LIVE_IDLE_UPDATE", "7.0"))   # model mode: no backend news by then -> tell the model once, it may say a short "hold on"
 UPDATE_FMT = {
@@ -150,6 +152,14 @@ def split_pieces(text: str) -> list[str]:
     return [p for p in out if p]
 
 
+def _health_detail() -> bytes:
+    """/health?detail=1: breaker state of every downstream model (Tag / orch / JEV) as seen by this gateway process."""
+    from . import model_client
+    from .coordinator import api as _coord_api
+    return json.dumps({"gateway": "ok", "downstream": model_client.snapshot(), "router_invalid_answers": dict(_coord_api.JUDGE_STATS),
+                       "no_delegate_net": dict(NET_STATS)}, ensure_ascii=False).encode()
+
+
 class ASR:
     """Input transcript (GPT-Live sends session.input_transcript.delta; duplex clients build the delegated task from it)."""
 
@@ -172,6 +182,8 @@ BARGE_MS = int(os.environ.get("SOPHON_LIVE_BARGE_MS", "200"))          # user vo
 BARGE_MIN_RMS = float(os.environ.get("SOPHON_LIVE_BARGE_RMS", "0.015"))
 
 class LiveSession:
+    deleg_calls = 0                                # delegate calls seen from the front (v0.1.0 safety net)
+    last_deleg_asr_t = 0.0                         # transcript time of the utterance last delegated
     def __init__(self, ws, args, asr, asr_lock):
         self.ws, self.args, self.asr, self.asr_lock = ws, args, asr, asr_lock
         self.id = "sess_" + uuid.uuid4().hex[:24]
@@ -564,7 +576,8 @@ class LiveSession:
                     self.cur_rid = rid
                     task = self._cut_user()
                     lead = lead_for(self.last_text, self.lang)
-                    self.resp[rid] = {"text": lead, "released": 0, "audio_s": 0.0, "played_s": 0.0, "start_ms": None, "done": False, "asr": task}
+                    self.resp[rid] = {"text": lead, "released": 0, "audio_s": 0.0, "played_s": 0.0, "start_ms": None, "done": False, "asr": task,
+                                      "deleg_n0": self.deleg_calls, "t0": time.monotonic()}
                     self._delivery().attach(rid)
                     self._trace().response_started(rid)
                 r = self.resp[rid]
@@ -581,6 +594,7 @@ class LiveSession:
                 rid = e.get("rid") or self.cur_rid
                 if rid in self.resp:
                     self.resp[rid]["done"] = True
+                    asyncio.create_task(self._no_delegate_net(rid))
                 if rid == self.cur_rid:
                     self.cur_rid = None
             elif t == "cancel":
@@ -588,11 +602,51 @@ class LiveSession:
             elif t == "tool_call":
                 if e.get("name") != "delegate":
                     log.warning("ignoring call to unknown tool %s", e.get("name")); continue
+                self.deleg_calls += 1
                 asyncio.create_task(self._delegate(e))           # never block the audio path while the transcript finishes
             elif t == "error":
                 log.warning("session %s engine: %s", self.id, e.get("message"))
-                if "closed" in (e.get("message") or ""):
+                if e.get("fatal") is True:                      # a typed flag from the adapter (connection gone), not a guess from the message text
                     await self.error("server_error", "engine connection lost"); await self.close("server_error"); return
+
+    async def _no_delegate_net(self, rid: str) -> None:
+        """v0.1.0 safety net, structural trigger only. The voice front sometimes says only its lead-in ("我帮你查一下") and ends the
+        turn without calling delegate (live: zh_memory 2 of 4, zh_light 1 of 6 on c88195c). The TRIGGER is a state-machine fact, not a
+        reading of the user's words: the response is done, the front called no delegate in that turn, and what it said is lead-in sized
+        (RC2-9: no text-length proxy). The router MODEL then decides, from the user's words and what the front said, whether the front only led
+        in and which tool the request needs (``coordinator.api.judge_tools``); only a model answer naming a tool makes the gateway delegate the user's own words itself."""
+        try:
+            r = self.resp.get(rid)
+            if r is None:
+                return
+            asr = r.get("asr")
+            if asr is not None and not asr.done():
+                try:
+                    await asyncio.wait_for(asyncio.shield(asr), 5)
+                except Exception:  # noqa: BLE001
+                    pass
+            await asyncio.sleep(NET_GRACE_S)                       # a tool call can trail the done event
+            if self.closed or self.deleg_calls != r.get("deleg_n0"):
+                return
+            lu = getattr(self, "last_user", None)
+            if not lu or lu[1] < r.get("t0", 0) - 10 or lu[1] <= self.last_deleg_asr_t:   # no fresh transcript, or it was already delegated
+                return
+            text = (lu[0] or "").strip()
+            if not text:
+                return
+            from .coordinator.api import judge_tools
+            NET_STATS["asked"] += 1
+            tools = await judge_tools(text, front_said=(r.get("text") or "").strip())   # the MODEL says whether the front only led in
+            if tools is None:
+                NET_STATS["router_unavailable"] += 1
+            if not tools or self.closed or self.deleg_calls != r.get("deleg_n0"):
+                return                                             # the model says no tool (or is unavailable): nothing to add
+            log.warning("session %s front ended the turn with a filler only; router says %s -> delegating %r", self.id, tools, text)
+            self.deleg_calls += 1
+            NET_STATS["delegated"] += 1
+            await self._delegate({"call_id": None, "arguments": {"task": text}, "net": "no_delegate"})
+        except Exception:  # noqa: BLE001
+            log.exception("no-delegate safety net failed")
 
     async def _delegate(self, e: dict) -> None:
         task = self._cut_user()
@@ -603,12 +657,14 @@ class LiveSession:
                 pass
         did = "item_" + uuid.uuid4().hex[:16]
         what = (e.get("arguments") or {}).get("task")
-        self.deleg[did] = {"call_id": e["call_id"], "chunks": [], "timer": None, "task": what, "t0": time.monotonic()}
+        self.last_deleg_asr_t = getattr(self, "last_user", None) and self.last_user[1] or 0.0
+        self.deleg[did] = {"call_id": e.get("call_id"), "chunks": [], "timer": None, "task": what, "t0": time.monotonic()}
         tr = self._trace().start(did)
+        if e.get("net"):
+            tr.set(net=e["net"])
         tr.set(task=(what or "")[:40], asr_ago_ms=round((time.monotonic() - self.last_user[1]) * 1000) if getattr(self, "last_user", None) else None)
         use_coord = os.environ.get("SOPHON_LIVE_COORD", "").strip().lower() in ("1", "true", "yes", "on")
         use_orch = (not use_coord) and os.environ.get("SOPHON_LIVE_ORCH", "").strip().lower() in ("1", "true", "yes", "on")
-        use_builtin = (not use_coord) and (not use_orch) and os.environ.get("SOPHON_LIVE_BUILTIN_TOOLS", "").strip().lower() in ("1", "true", "yes", "on")
         # Orch/coord returns one final spoken result; skip the 7s empty idle nudge (it races long tools).
         if DELEG_MODE == "model" and not use_orch and not use_coord:
             self.deleg[did]["idle_timer"] = asyncio.get_running_loop().call_later(IDLE_UPDATE_S, lambda: asyncio.ensure_future(self._idle_update(did)))
@@ -617,19 +673,15 @@ class LiveSession:
             deleg_body["backend"] = "coord"
         elif use_orch:
             deleg_body["backend"] = "orch"
-        elif use_builtin:
-            deleg_body["backend"] = "builtin"
         await self.send({"type": "session.delegation.created", "offset_ms": self.timeline_ms, "delegation": deleg_body})
         log.info(
-            "session %s delegation %s task=%r coord=%s orch=%s builtin=%s",
-            self.id, did, what, use_coord, use_orch, use_builtin,
+            "session %s delegation %s task=%r coord=%s orch=%s",
+            self.id, did, what, use_coord, use_orch,
         )
         if use_coord:
             asyncio.create_task(self._coord_resolve(did, what))
         elif use_orch:
             asyncio.create_task(self._orch_resolve(did, what))
-        elif use_builtin:
-            asyncio.create_task(self._builtin_resolve(did, what))
 
     async def _ack_delegation(self, did: str, note: str) -> None:
         """Close a delegation without speaking: the model gets a result, but is told to stay silent."""
@@ -751,7 +803,8 @@ class LiveSession:
         if tr is not None:
             tr.mark("route")
             tr.set(route=result.route, decision=result.control.op if result.control else ("NEW" if result.job else result.route),
-                   via=result.via, jev_ms=None if result.jev_ms is None else round(result.jev_ms))
+                   via=result.via, jev_ms=None if result.jev_ms is None else round(result.jev_ms),
+                   **({"judge_invalid": ",".join(result.judge_invalid)} if result.judge_invalid else {}))
         # CANCEL / REFINE: the old (task_id, version) must stop now; its result is never spoken.
         stale = getattr(result, "stale_task", None)
         if stale is not None:
@@ -780,7 +833,7 @@ class LiveSession:
             # FAST (thanks / ok): nothing to run, nothing to say. Close the delegation silently.
             await self._ack_delegation(did, "这句话不需要后台办事，不用再说什么。")
             return
-        with bind_task(TaskContext(task_id=job.task_id, version=job.version, utterance=job.objective, ledger=ledger)):
+        with bind_task(TaskContext(task_id=job.task_id, version=job.version, utterance=job.objective, ledger=ledger, explicit_save=job.explicit_save)):
             # the worker task copies this context: its memory writes go through memory_gate, its tool args become task slots
             worker = asyncio.ensure_future(
                 run_worker_job(job, instructions=self.instructions or "", history=getattr(self, "orch_history", None) or [])
@@ -816,9 +869,11 @@ class LiveSession:
                 tr.add_tool(ev.get("tool", "?"), ev.get("ms"), bool(ev.get("ok")), source=ev.get("source"), fallbacks=ev.get("fallbacks"),
                             orig_source=ev.get("orig_source"), age_s=ev.get("age_s"),
                             city=ev.get("city"), tmin=ev.get("tmin"), tmax=ev.get("tmax"), now=ev.get("now"))
+        from .coordinator.api import review_numbers
+        await review_numbers(job, result)            # model backstop for an un-tooled answer that states a looked-up fact (RC2-6)
         outcome = finish_job(ledger, job, result)    # the Coordinator decides what gets said; stale results are dropped
-        if tr is not None and job.require_tools:
-            tr.set(require=",".join(job.require_tools), **({"guard": outcome.rejected} if outcome.rejected else {}))
+        if tr is not None and (job.require_tools or outcome.rejected or job.tool_judgment != "model"):
+            tr.set(require=",".join(job.require_tools), judged=job.tool_judgment, **({"guard": outcome.rejected} if outcome.rejected else {}))
         if outcome.kind == "stale":                  # cancelled or superseded while running
             await self._ack_delegation(did, "这个任务已被取消或改口，不用再说什么。")
             return
@@ -853,26 +908,6 @@ class LiveSession:
             return
         await self.send({"type": "session.commentary.appended", "start_ms": self.timeline_ms, "end_ms": self.timeline_ms,
                          "client_event_id": "orch"})
-        d["chunks"].append(("commentary", text))
-        if d.get("timer"):
-            d["timer"].cancel()
-        await self._flush_deleg(did)
-    async def _builtin_resolve(self, did: str, what: str | None) -> None:
-        """Legacy heuristic tool pack (demo). Prefer SOPHON_LIVE_ORCH for production Path-1."""
-        try:
-            from .assistant_tools import run_task
-            text = await run_task(what or "")
-        except Exception as e:  # noqa: BLE001
-            log.warning("session %s builtin tools error: %s", self.id, e)
-            return
-        if not text:
-            log.info("session %s builtin tools: no match for %r", self.id, what)
-            return
-        d = self.deleg.get(did)
-        if d is None:
-            return
-        await self.send({"type": "session.commentary.appended", "start_ms": self.timeline_ms, "end_ms": self.timeline_ms,
-                         "client_event_id": "builtin"})
         d["chunks"].append(("commentary", text))
         if d.get("timer"):
             d["timer"].cancel()
@@ -983,15 +1018,46 @@ def runtime_banner(env=None) -> tuple[str, bool]:  # noqa: ANN001
             f"Set SOPHON_LIVE_COORD=1 (see docs/runbook-path1-coord.md); ORCH={int(orch)}"), False
 
 
-def main() -> None:
+def _default_host() -> str:
+    """Bind address when --host is not given (Critic S-25): loopback. The gateway has no auth of its own, so exposing it is an explicit
+    decision: ``--host 0.0.0.0`` or ``SOPHON_LIVE_HOST=0.0.0.0`` (docs/runbook-path1-coord.md §4). Everything in this repo reaches it through
+    127.0.0.1 (SSH tunnel from the web client, or on-box scripts)."""
+    return os.environ.get("SOPHON_LIVE_HOST", "").strip() or "127.0.0.1"
+
+
+def _build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--host", default="0.0.0.0"); ap.add_argument("--port", type=int, default=8780)
+    ap.add_argument("--host", default=_default_host()); ap.add_argument("--port", type=int, default=8780)
     ap.add_argument("--engine", default="ws://127.0.0.1:8000/v1/realtime")
     ap.add_argument("--bridge", default="http://127.0.0.1:8700")
     ap.add_argument("--asr", default=os.environ.get("SOPHON_LIVE_ASR", "Qwen/Qwen3-ASR-0.6B-hf"))
     ap.add_argument("--path", default="/v1/live/sessions")
-    args = ap.parse_args()
+    return ap
+
+
+def _exposure_note(host: str) -> str:
+    """Startup line about who can connect: loopback is quiet, anything wider says so (the gateway has no authentication)."""
+    if host in ("127.0.0.1", "localhost", "::1"):
+        return f"gateway bound to loopback {host} (reach it through an SSH tunnel / on-box clients)"
+    return f"gateway bound to {host}: reachable from every network this machine is on; the gateway has NO authentication, rely on the firewall"
+
+
+RETIRED_ENV_VARS = ("SOPHON_LIVE_GROUND_MODE",)      # retired settings: set-ness is checked, the value is never read or logged
+
+
+def warn_retired_env() -> list[str]:
+    """One WARN per retired env var that is still set, so a stale config does not stop working silently. Returns the names warned about."""
+    hit = [n for n in RETIRED_ENV_VARS if n in os.environ]
+    for n in hit:
+        log.warning("%s is set but is no longer used and has no effect (retired in Round 4h); remove it from the environment", n)
+    return hit
+
+
+def main() -> None:
+    args = _build_parser().parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    warn_retired_env()
+    (log.info if args.host in ("127.0.0.1", "localhost", "::1") else log.warning)("%s", _exposure_note(args.host))
     asr = ASR(args.asr) if args.asr else None
     if asr is not None:
         asr(np.zeros(16000, np.float32))                         # warm up
@@ -1012,7 +1078,9 @@ def main() -> None:
             return Response(200, "OK", Headers([("Content-Type", "text/html; charset=utf-8"), ("Content-Length", str(len(body))),
                                                 ("Cache-Control", "no-cache")]), body)
         if path == "/health":
-            return conn.respond(200, "ok\n")
+            if "detail=1" in req.path.partition("?")[2].split("&"):
+                return Response(200, "OK", Headers([("Content-Type", "application/json")]), _health_detail())
+            return conn.respond(200, "ok\n")                      # plain liveness of this gateway, unchanged
         if path not in (args.path, "/v1/realtime"):
             return conn.respond(404, "Not Found\n")
         if path == "/v1/realtime" and realtime_keys:              # keyed access for external evaluators (e.g. Artificial Analysis)

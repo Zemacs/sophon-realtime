@@ -76,6 +76,8 @@ async def run(args: dict[str, Any] | None = None) -> str:
                 return msg
             return _simulate(device, action, value_s, zh=zh)
         except Exception as e:  # noqa: BLE001
+            from . import toolmeta
+            toolmeta.note(ok=False)
             if zh:
                 return f"设备控制失败：{e}"
             return f"Device control failed: {e}"

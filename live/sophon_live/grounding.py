@@ -1,17 +1,19 @@
 """Argument grounding for tool calls (Realtime face): a short argument value (name, email, zip, id) must come from somewhere
 the agent actually saw -- the caller's words (ASR), an earlier tool result, or the instructions/tool schema. Values the model
-made up (placeholders like John Doe / example.com / 12345, or a name it misheard) are sent back to the model instead of executed."""
+made up (or a name it misheard) are sent back to the model instead of executed.
+
+PROVENANCE ONLY (Round 4h / I-20): there is no list of "placeholder" names, values, domains or "free-text" argument keys. A value is
+fine when it occurs in what the agent saw (literally, as a whole word, or in a spoken form of it); a value that occurs nowhere is not,
+whatever it looks like. So 12345 / John Doe / example.com are allowed when the caller actually said them and blocked when the model made
+them up, exactly like any other invented value."""
 from __future__ import annotations
-import os
 
 import difflib
 import json
 import re
 
-PLACEHOLDER_NAMES = {("john", "doe"), ("jane", "doe"), ("jane", "smith"), ("john", "smith")}
-PLACEHOLDER_VALUES = {"12345", "00000", "11111", "90210", "123456", "1234", "000000", "5551234567", "5555555555", "1234567890", "5550123"}
-PLACEHOLDER_DOMAINS = ("example.com", "example.org", "test.com", "email.com", "domain.com")
-FREE_TEXT_KEYS = {"summary", "reason", "query", "note", "notes", "message", "description", "comment", "content"}
+from .coordinator.schemas import appears_in_words
+
 NUM_WORDS = {"zero": "0", "oh": "0", "one": "1", "two": "2", "three": "3", "four": "4", "five": "5", "six": "6", "seven": "7",
              "eight": "8", "nine": "9"}
 
@@ -138,43 +140,84 @@ def _values(args, key=""):
         yield key, str(args)
 
 
+_CJK = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+")
+CJK_MIN_COVERAGE = 0.75        # share of the value's character pairs that must occur in what was heard / seen (tolerates a misheard character)
+LONG_MIN_COVERAGE = 0.5        # share of a long Latin value's tokens that must occur in what was heard / seen (the model composes long text)
+
+
+def _cjk_grounded(v: str, said: str) -> bool:
+    """Provenance for the CJK part of a value: its characters (whitespace / punctuation / Latin removed on both sides) occur as one run in
+    what was heard / seen, or at least ``CJK_MIN_COVERAGE`` of its character pairs do. No dictionary, no names list."""
+    c = "".join(_CJK.findall(v))
+    if len(c) < 2:                                           # one character carries no provenance signal (the Latin side skips < 3 too)
+        return True
+    s = "".join(_CJK.findall(said))
+    if c in s:
+        return True
+    pairs = [c[i:i + 2] for i in range(len(c) - 1)]
+    return sum(p in s for p in pairs) / len(pairs) >= CJK_MIN_COVERAGE
+
+
 def check(name: str, args: dict, heard: list[str], seen: list[str]) -> list[tuple[str, str, str]]:
-    """Returns [(key, value, why)] for ungrounded values; [] = OK."""
+    """Returns [(key, value, why)] for ungrounded values; [] = OK.  Every value is checked for provenance, whatever its length or script
+    (Round 4j / I-23): short Latin values by the whole-word / spoken-form / fuzzy rules below, CJK text by character provenance, long Latin
+    text by token coverage. The only values never checked are those with nothing to look up: under 3 Latin characters, a single CJK character."""
     heard_n = [_norm(h) for h in heard]
     corpus = " ".join(heard_n + [_norm(s) for s in seen])
     joins = ([j for h in heard for j in spelled_joins(h)] + [n for h in heard for n in word_numbers(h)]
              + [_norm(x) for h in heard for x in spoken_forms(h)])
     words = set(re.findall(r"[a-z0-9@._]+", " ".join(heard + seen).lower())) | set(joins)
     bad = []
-    a = args if isinstance(args, dict) else {}
-    fn, ln = str(a.get("first_name", "")).lower(), str(a.get("last_name", "")).lower()
-    if (fn, ln) in PLACEHOLDER_NAMES and not any(fn in h and ln in h for h in heard_n):
-        bad.append(("first_name/last_name", f"{fn} {ln}", "placeholder name"))
-    for k, v in _values(args):
-        if k.lower() in FREE_TEXT_KEYS or len(v.split()) > 3:
-            continue
-        nv = _norm(v)
-        if len(nv) < 3:
-            continue
-        if nv in PLACEHOLDER_VALUES or any(nv.endswith(d) for d in PLACEHOLDER_DOMAINS):
-            if nv not in corpus: bad.append((k, v, "placeholder value")); continue
-        if os.environ.get("SOPHON_LIVE_GROUND_MODE", "full") == "placeholder":   # only block obvious made-up values
-            continue
+    said = "\n".join(list(heard) + list(seen))
+
+    def near(w: str) -> float:
+        return max((difflib.SequenceMatcher(None, w, x).ratio() for x in words), default=0.0)
+
+    def latin_grounded(v: str, nv: str) -> tuple[bool, float]:
+        if appears_in_words(v, said):                            # literal provenance: the value is, as a whole word, in what was heard / seen
+            return True, 1.0
         if nv in corpus or nv.lstrip("#") in corpus or nv in joins:
-            continue
+            return True, 1.0
         dm = re.fullmatch(r"\d{4}-(\d{2})-(\d{2})", v.strip())
         if dm and (dm.group(1) + dm.group(2)) in joins:                  # year usually not said
-            continue
+            return True, 1.0
         if "@" in nv:                                            # emails are often said as "name at domain dot com"
             loc, _, dom = nv.partition("@")
-            if loc and loc in corpus and dom.split(".")[0] in corpus: continue
-        best = max((difflib.SequenceMatcher(None, nv, w).ratio() for w in words), default=0.0)
+            if loc and loc in corpus and dom.split(".")[0] in corpus:
+                return True, 1.0
+        best = near(nv)
         if best >= 0.85:
-            continue
+            return True, best
         parts = [_norm(p) for p in re.split(r"[\s,]+", v) if _norm(p)]
-        if len(parts) > 1 and all(p in corpus or p in joins or max((difflib.SequenceMatcher(None, p, w).ratio() for w in words), default=0) >= 0.85 for p in parts):
+        if len(parts) > 1 and all(p in corpus or p in joins or near(p) >= 0.85 for p in parts):
+            return True, best
+        return False, best
+
+    for k, v in _values(args):
+        if _CJK.search(v):
+            if not _cjk_grounded(v, said):
+                bad.append((k, v, "not said by the caller (the characters do not occur in what was heard)"))
+                continue
+            v = _CJK.sub(" ", v).strip()                         # the Latin / digit rest of a mixed value is checked below
+            if not v:
+                continue
+        nv = _norm(v)
+        if len(v.split()) > 3:                                   # long text: checked for provenance too, by token coverage
+            toks = [x.strip(".") for x in re.findall(r"[a-z0-9@._]+", v.lower()) if x.strip(".")]
+            if toks and all(x.isdigit() for x in toks):          # "4 8 2 9 1 3 7": an id read out digit by digit is one value
+                ok, best = latin_grounded(v, nv)
+            else:
+                grounded = [x for x in toks if x in words or near(x) >= 0.85]
+                ok = bool(toks) and len(grounded) / len(toks) > LONG_MIN_COVERAGE and all(x in grounded for x in toks if any(c.isdigit() for c in x))
+                best = len(grounded) / len(toks) if toks else 0.0
+            if not ok:
+                bad.append((k, v, f"not said by the caller (only {best:.0%} of its words occur in what was heard)"))
             continue
-        bad.append((k, v, f"not said by the caller (closest match {best:.2f})"))
+        if len(nv) < 3:
+            continue
+        ok, best = latin_grounded(v, nv)
+        if not ok:
+            bad.append((k, v, f"not said by the caller (closest match {best:.2f})"))
     return bad
 
 
@@ -192,8 +235,39 @@ def guard_message(bad, heard: list[str]) -> str:
     return s
 
 
-def failure_hint(output: str, heard: list[str]) -> str:
-    if not re.search(r"not found|no user|could not find|cannot find|does not exist|invalid|error", output, re.I):
+def needs_input_message(bad) -> str:
+    """The answer to a call the model repeated unchanged after being told its values were not provided: the tool is NOT run and never will be
+    for these values; the only way forward is to ask the caller (Round 4j / I-24)."""
+    vals = ", ".join(f"{k}={v!r}" for k, v, _ in bad)
+    return (f"NOT EXECUTED and will not be. You repeated a call whose values were never provided by the caller ({vals}). Stop calling the tool "
+            "with them. Tell the caller what you need, ask them to say it (spell names, emails and ids letter by letter), and call the tool "
+            "again only with what they actually said.")
+
+
+def output_failed(item: dict) -> bool:
+    """Did the client report this ``function_call_output`` as a failure? STRUCTURE only; the words of the output are never read.
+
+    Contract (the same one our own tools use, ``failcodes`` / the ``{"ok": false}`` envelope): the item carries a truthy ``error``, or its
+    ``status`` is ``failed`` / ``incomplete``; or ``output`` is a JSON object with ``ok: false``, ``success: false`` or a non-empty ``error``.
+    An output that merely *says* "not found" or "error" in prose is NOT a reported failure (B-3 / I-20: no word probes)."""
+    if not isinstance(item, dict):
+        return False
+    if item.get("error") or item.get("status") in ("failed", "incomplete"):
+        return True
+    out = item.get("output")
+    if isinstance(out, str) and out.lstrip().startswith("{"):
+        try:
+            out = json.loads(out)
+        except ValueError:
+            return False
+    if isinstance(out, dict):
+        return out.get("ok") is False or out.get("success") is False or bool(out.get("error"))
+    return False
+
+
+def failure_hint(failed: bool, heard: list[str]) -> str:
+    """The spell-it-out hint for a tool call the client reported as failed (``output_failed``); nothing for any other output."""
+    if not failed:
         return ""
     recent = " | ".join(h.strip() for h in heard[-2:] if h.strip())
     joins = [j for h in heard[-3:] for j in spelled_joins(h)]

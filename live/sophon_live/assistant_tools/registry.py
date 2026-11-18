@@ -43,12 +43,12 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "name": "get_news",
-        "description": "Fetch recent news headlines for a topic or region via public RSS.",
+        "description": "Fetch current headlines for ONE of a fixed set of news categories via public RSS. Headlines only: for news about a specific person, company or event use web_search instead.",
         "parameters": {
             "type": "object",
             "properties": {
-                "topic": {"type": "string", "description": "Topic keywords, e.g. 科技 / NVIDIA / 特朗普."},
-                "lang": {"type": "string", "enum": ["zh", "en"], "description": "Prefer Chinese or English feeds."},
+                "topic": {"type": "string", "enum": ["tech", "finance", "world", "general"], "description": "News category: tech (technology / internet / AI), finance (economy / markets), world (international), general (top headlines, or when no category is named)."},
+                "lang": {"type": "string", "enum": ["zh", "en"], "description": "The language the caller speaks: zh or en."},
                 "max_items": {"type": "integer", "default": 3},
             },
             "required": ["topic"],

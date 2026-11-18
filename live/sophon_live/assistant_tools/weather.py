@@ -20,6 +20,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any
+from .. import failcodes
+from . import inflight
 
 log = logging.getLogger("sophon_live.weather")
 
@@ -174,7 +176,7 @@ def _http_get_json(url: str, *, timeout: float = 20.0) -> dict[str, Any]:
 
 async def _fetch_json(url: str, timeout: float = 5.0) -> dict[str, Any]:
     """One attempt, bounded by ``timeout`` (the thread's socket timeout and the awaiting side)."""
-    return await asyncio.wait_for(asyncio.to_thread(_http_get_json, url, timeout=timeout), timeout + 0.5)
+    return await asyncio.wait_for(inflight.run(_http_get_json, url, timeout=timeout), timeout + 0.5)      # S-19: under the shared cap, off the default pool
 
 
 def _normalize_wttr(data: dict[str, Any], idx: int, *, zh: bool) -> dict[str, Any] | None:
@@ -262,6 +264,19 @@ async def _from_open_meteo(display_name: str, idx: int, zh: bool, timeout: float
     return _normalize_om(data, idx, zh=zh)
 
 
+def _error_code(e: BaseException) -> str:
+    """Map an exception to the closed enum ``failcodes.SOURCE_ERROR_CODES`` (the class name itself is never spoken: I-17)."""
+    if isinstance(e, (asyncio.TimeoutError, TimeoutError)):      # before OSError: TimeoutError is an OSError
+        return "timeout"
+    if isinstance(e, urllib.error.HTTPError):                    # before URLError: HTTPError is a URLError
+        return "http"
+    if isinstance(e, (urllib.error.URLError, OSError)):
+        return "network"
+    if isinstance(e, (ValueError, KeyError, IndexError, TypeError)):   # JSONDecodeError / UnicodeDecodeError are ValueErrors
+        return "bad_data"
+    return "error"
+
+
 async def _first_ok(query_name: str, display_name: str, idx: int, zh: bool) -> tuple[dict[str, Any] | None, str, list[str]]:
     """Start every source at once (hedge), pick the answer by PRIORITY; per-source timeout; a couple of rounds.
 
@@ -290,7 +305,7 @@ async def _first_ok(query_name: str, display_name: str, idx: int, zh: bool) -> t
                 try:
                     res = await asyncio.shield(t)
                 except Exception as e:  # noqa: BLE001
-                    err = type(e).__name__
+                    err = _error_code(e)
                     _note(name, False, (time.monotonic() - t0) * 1000, err)
                     notes.append(f"{name}:{err}")
                     continue
@@ -345,10 +360,12 @@ async def run_detailed(args: dict[str, Any] | None = None) -> tuple[str, dict[st
     if hit and age_s is not None and age_s <= _cache_ttl():
         return _compose(hit[1], name, when, idx, zh), {"source": "cache", "ms": 0, "notes": [], "age_s": round(age_s), "orig_source": hit[2], **_facts(hit[1], name)}
 
+    busy = inflight.track_busy()
     data, source, notes = await _first_ok(query_name, name, idx, zh)
     meta = {"source": source or None, "ms": round((time.monotonic() - t0) * 1000), "notes": notes, **_facts(data, name)}
     if data is None and notes and all(n.endswith(":no_data") for n in notes):
         # every source answered but none knows this city/day: not an outage
+        meta["failure"] = failcodes.NO_DATA
         return (f"找不到{display_name}的天气信息。" if zh else f"No weather data for {display_name}."), meta
     if data is None:
         log.warning("weather all sources failed for %s: %s", display_name, notes)
@@ -359,6 +376,10 @@ async def run_detailed(args: dict[str, Any] | None = None) -> tuple[str, dict[st
             lead = f"网络不太好，这是{mins}分钟前查到的：" if zh else f"The network is poor; this is from {mins} min ago: "
             meta.update(source="cache-stale", age_s=round(age_s), orig_source=hit[2], **_facts(old, name))
             return lead + body, meta
+        if busy:
+            meta["failure"] = failcodes.BUSY
+            return (inflight.BUSY_ZH if zh else inflight.BUSY_EN), meta               # S-24: our own cap refused, not a weather-source outage
+        meta["failure"] = failcodes.NETWORK
         if zh:
             return f"暂时查不到{display_name}的天气，请稍后再试。", meta
         return f"Weather for {display_name} is unavailable right now ({', '.join(notes) or 'no source'}).", meta
@@ -388,7 +409,11 @@ async def run(args: dict[str, Any] | None = None) -> str:
     text, meta = await run_detailed(args)
     from . import toolmeta
 
+    if meta.get("ok") is False:
+        toolmeta.note(ok=False)              # only a failure is noted: a stray ok=None would overwrite the evidence's own ok (live regression)
     toolmeta.note(source=meta.get("source"), fallbacks=len(meta.get("notes") or []) or None,
                   orig_source=meta.get("orig_source"), age_s=meta.get("age_s"),
+                  failure=meta.get("failure"),
+                  **{failcodes.SUCCESS_KEY: True if (not meta.get("failure") and meta.get("tmin") is not None and meta.get("tmax") is not None) else None},
                   city=meta.get("city"), tmin=meta.get("tmin"), tmax=meta.get("tmax"), now=meta.get("now"))
     return text

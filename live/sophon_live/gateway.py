@@ -519,11 +519,142 @@ class LiveSession:
         did = "item_" + uuid.uuid4().hex[:16]
         what = (e.get("arguments") or {}).get("task")
         self.deleg[did] = {"call_id": e["call_id"], "chunks": [], "timer": None, "task": what, "t0": time.monotonic()}
-        if DELEG_MODE == "model":
+        use_coord = os.environ.get("SOPHON_LIVE_COORD", "").strip().lower() in ("1", "true", "yes", "on")
+        use_orch = (not use_coord) and os.environ.get("SOPHON_LIVE_ORCH", "").strip().lower() in ("1", "true", "yes", "on")
+        use_builtin = (not use_coord) and (not use_orch) and os.environ.get("SOPHON_LIVE_BUILTIN_TOOLS", "").strip().lower() in ("1", "true", "yes", "on")
+        # Orch/coord returns one final spoken result; skip the 7s empty idle nudge (it races long tools).
+        if DELEG_MODE == "model" and not use_orch and not use_coord:
             self.deleg[did]["idle_timer"] = asyncio.get_running_loop().call_later(IDLE_UPDATE_S, lambda: asyncio.ensure_future(self._idle_update(did)))
-        await self.send({"type": "session.delegation.created", "offset_ms": self.timeline_ms,
-                         "delegation": {"id": did, "type": "delegation", "target": "client", "task": what}})
-        log.info("session %s delegation %s task=%r", self.id, did, what)
+        deleg_body = {"id": did, "type": "delegation", "target": "client", "task": what}
+        if use_coord:
+            deleg_body["backend"] = "coord"
+        elif use_orch:
+            deleg_body["backend"] = "orch"
+        elif use_builtin:
+            deleg_body["backend"] = "builtin"
+        await self.send({"type": "session.delegation.created", "offset_ms": self.timeline_ms, "delegation": deleg_body})
+        log.info(
+            "session %s delegation %s task=%r coord=%s orch=%s builtin=%s",
+            self.id, did, what, use_coord, use_orch, use_builtin,
+        )
+        if use_coord:
+            asyncio.create_task(self._coord_resolve(did, what))
+        elif use_orch:
+            asyncio.create_task(self._orch_resolve(did, what))
+        elif use_builtin:
+            asyncio.create_task(self._builtin_resolve(did, what))
+
+    async def _coord_resolve(self, did: str, what: str | None) -> None:
+        """Path-1 Coordinator: Karpo/JEV route + ledger, then Worker orch for TOOL jobs."""
+        from .coordinator import AdmitRequest, Ledger, admit, complete_job
+        from .assistant_tools import resolve_task_orch
+
+        if not hasattr(self, "coord_ledger"):
+            self.coord_ledger = Ledger()
+        ledger: Ledger = self.coord_ledger
+        d = self.deleg.get(did)
+        if d is None:
+            return
+        try:
+            result = await admit(
+                AdmitRequest(
+                    session_id=self.id,
+                    utterance_id=did,
+                    text=what or "",
+                    delegate_task=what,
+                    playback_active=bool(getattr(self, "playing", False)),
+                ),
+                ledger,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("session %s coord admit error: %s", self.id, e)
+            result = None
+        if result is None:
+            await self._orch_resolve(did, what)
+            return
+        if result.speak.kind == "stop_speaking":
+            self._drop_playback("coord stop_speaking")
+            return
+        if result.speak.kind in ("clarify", "answer") and result.speak.text and result.job is None:
+            await self.send({"type": "session.commentary.appended", "start_ms": self.timeline_ms, "end_ms": self.timeline_ms,
+                             "client_event_id": "coord"})
+            d["chunks"].append(("commentary", result.speak.text))
+            if d.get("timer"):
+                d["timer"].cancel()
+            await self._flush_deleg(did)
+            return
+        job = result.job
+        if job is None:
+            # Tag already delegated; treat FAST as worker on the utterance.
+            from .coordinator.api import _new_job
+            job = _new_job(ledger, what or "")
+        try:
+            hist = getattr(self, "orch_history", None) or []
+            text = await resolve_task_orch(job.objective, instructions=self.instructions or "", history=hist)
+        except Exception as e:  # noqa: BLE001
+            log.warning("session %s coord worker error: %s", self.id, e)
+            text = "后台编排出错了，请稍后再试。"
+        text = (text or "").strip() or "好的，我这边查过了。"
+        complete_job(ledger, job, text)
+        if not hasattr(self, "orch_history"):
+            self.orch_history = []
+        self.orch_history.append({"task": job.objective, "answer": text})
+        if len(self.orch_history) > 12:
+            self.orch_history = self.orch_history[-12:]
+        d = self.deleg.get(did)
+        if d is None:
+            return
+        await self.send({"type": "session.commentary.appended", "start_ms": self.timeline_ms, "end_ms": self.timeline_ms,
+                         "client_event_id": "coord"})
+        d["chunks"].append(("commentary", text))
+        if d.get("timer"):
+            d["timer"].cancel()
+        await self._flush_deleg(did)
+
+    async def _orch_resolve(self, did: str, what: str | None) -> None:
+        """Path-1 co-located orchestrator: local text LLM selects tools; tools run on this host."""
+        try:
+            from .assistant_tools import resolve_task_orch
+            hist = getattr(self, "orch_history", None) or []
+            text = await resolve_task_orch(what or "", instructions=self.instructions or "", history=hist)
+        except Exception as e:  # noqa: BLE001
+            log.warning("session %s orch error: %s", self.id, e)
+            text = "后台编排出错了，请稍后再试。"
+        text = (text or "").strip() or "好的，我这边查过了。"
+        if not hasattr(self, "orch_history"):
+            self.orch_history = []
+        self.orch_history.append({"task": what or "", "answer": text})
+        if len(self.orch_history) > 12:
+            self.orch_history = self.orch_history[-12:]
+        d = self.deleg.get(did)
+        if d is None:
+            return
+        await self.send({"type": "session.commentary.appended", "start_ms": self.timeline_ms, "end_ms": self.timeline_ms,
+                         "client_event_id": "orch"})
+        d["chunks"].append(("commentary", text))
+        if d.get("timer"):
+            d["timer"].cancel()
+        await self._flush_deleg(did)
+    async def _builtin_resolve(self, did: str, what: str | None) -> None:
+        """Legacy heuristic tool pack (demo). Prefer SOPHON_LIVE_ORCH for production Path-1."""
+        try:
+            from .assistant_tools import run_task
+            text = await run_task(what or "")
+        except Exception as e:  # noqa: BLE001
+            log.warning("session %s builtin tools error: %s", self.id, e)
+            return
+        if not text:
+            log.info("session %s builtin tools: no match for %r", self.id, what)
+            return
+        d = self.deleg.get(did)
+        if d is None:
+            return
+        await self.send({"type": "session.commentary.appended", "start_ms": self.timeline_ms, "end_ms": self.timeline_ms,
+                         "client_event_id": "builtin"})
+        d["chunks"].append(("commentary", text))
+        if d.get("timer"):
+            d["timer"].cancel()
+        await self._flush_deleg(did)
 
     # ------------------------------------------------------------- output pump (continuous, real time)
     async def _pump(self) -> None:

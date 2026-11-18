@@ -41,9 +41,14 @@ class ChineseValuesAreChecked(unittest.TestCase):
         self.assertEqual(bad({"name": "张伟"}, ["look it up"], ["{'customer': '张伟'}"]), [])
         self.assertTrue(bad({"name": "张伟"}, ["look it up"], ["{'customer': '李伟'}"]))
 
-    def test_one_misheard_character_in_a_long_address_is_tolerated_two_are_not(self) -> None:
+    def test_a_value_in_a_different_numeral_script_is_not_literal_provenance(self) -> None:
+        """Round 4k+ / N-1 replaces "一号 == 1号 on the literal path": converting Chinese numerals is a judgment about what a character means here (四川 -> 4), so the
+        literal path compares text as written. The same number in the other script goes through the model's evidence + the independent check."""
         heard = ["我住在上海市浦东新区世纪大道一号"]
-        self.assertEqual(bad({"address": "上海市浦东新区世纪大道1号"}, heard), [])
+        self.assertEqual(bad({"address": "上海市浦东新区世纪大道一号"}, heard), [])
+        self.assertTrue(bad({"address": "上海市浦东新区世纪大道1号"}, heard))
+        ev = [{"argument": "address", "span": "上海市浦东新区世纪大道一号", "value_comes_from_span": True}]
+        self.assertEqual(grounding.check("t", {"address": "上海市浦东新区世纪大道1号"}, heard, [], evidence=ev, judge=lambda *a: True), [])
         self.assertTrue(bad({"address": "北京市朝阳区建国路八十八号"}, heard))
 
     def test_mixed_chinese_and_latin_checks_both_halves(self) -> None:
@@ -63,7 +68,9 @@ class LongValuesAreChecked(unittest.TestCase):
         # Round 4k: the 50% token-overlap rule is gone. A composed value (words the caller never said) needs the model's evidence span instead.
         self.assertTrue(bad({"note": "bob lives at Evergreen Terrace in Springfield"}, self.HEARD))
         ev = [{"argument": "note", "span": "I live at 742 Evergreen Terrace Springfield", "value_comes_from_span": True}]
-        self.assertEqual(grounding.check("t", {"note": "bob lives at Evergreen Terrace in Springfield"}, self.HEARD, [], evidence=ev), [])
+        args = {"note": "bob lives at Evergreen Terrace in Springfield"}
+        self.assertTrue(grounding.check("t", args, self.HEARD, [], evidence=ev))                    # N-2: no independent check, no release
+        self.assertEqual(grounding.check("t", args, self.HEARD, [], evidence=ev, judge=lambda *a: True), [])
 
     def test_an_invented_long_value_is_blocked(self) -> None:
         for args in ({"address": "55 Maple Avenue Shelbyville Ohio"}, {"name": "Dr Alice Marie Carter Jones"}, {"address": "9 Quiet Lane Portland Oregon"}):

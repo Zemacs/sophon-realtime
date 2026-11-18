@@ -1,6 +1,8 @@
 """Round 4k / R-1, R-2, R-4, R-5, R-6, R-7.
 
-R-1 every number needs provenance whatever its length; Chinese numerals and Arabic digits are compared in ONE format (format conversion only).
+R-1 every number needs provenance whatever its length. (4k first compared Chinese numerals and Arabic digits in one format; Critic N-1 showed that this
+    table invents provenance -- 四川 -> 4, 一起 -> 1 -- so the literal path now compares text as written and a number in the other script goes through the
+    model's evidence span + the independent check; see test_r4l_critic_n_fixes.py.)
 R-2 the 0.75 / 0.5 overlap ratios are gone. The MODEL attaches ``grounding_evidence`` (a span of the caller's words it took the value from, plus its own
     statement that the value comes from the span); the code only verifies that the span occurs verbatim (after the same format normalisation). A refused
     call can be unblocked by a read-back the caller confirms. Every model-judged acceptance is audited.
@@ -29,29 +31,34 @@ from tests.test_orchestrator import _FakeResp, _FakeSession  # noqa: E402
 K = grounding.EVIDENCE_KEY
 
 
-def bad(args, heard, seen=None, evidence=None, spoken=None, audit=None):
-    return grounding.check("t", args, heard, seen or [], evidence=evidence, spoken=spoken, audit=audit)
+def YES(*_a):
+    return True
 
 
-def ev(argument, span, derives=True, read_back=None):
+def bad(args, heard, seen=None, evidence=None, spoken=None, audit=None, judge=YES, **kw):
+    """``judge`` is the independent second model (N-2): by default it says yes, so these tests are about the code's own checks of the evidence."""
+    return grounding.check("t", args, heard, seen or [], evidence=evidence, spoken=spoken, audit=audit, judge=judge, **kw)
+
+
+def ev(argument, span, derives=True, read_back=None, reply="confirm"):
     d = {"argument": argument, "span": span, "value_comes_from_span": derives}
     if read_back is not None:
         d["read_back_to_caller"] = read_back
+        if reply is not None:
+            d["caller_reply"] = reply
     return [d]
 
 
 class Normaliser(unittest.TestCase):
-    """Format conversion only: the same function is applied to the value, to the caller's words and to a span."""
+    """Format conversion only (NFKC, case, punctuation): the same function is applied to the value, to the caller's words and to a span. No numeral conversion."""
 
-    def test_chinese_numerals_become_digits(self) -> None:
-        for src, want in (("八十八", "88"), ("一号", "1号"), ("二十三号", "23号"), ("三零二", "302"), ("二零二六年十一月", "2026年11月"), ("十二", "12"), ("十", "10"),
-                          ("一百零五", "105"), ("两千", "2000"), ("一万二千", "12000"), ("九十", "90"), ("壹佰贰拾叁", "123"), ("三千零八", "3008")):
-            self.assertEqual(grounding.norm_text(src), want, src)
+    def test_chinese_numerals_are_not_converted(self) -> None:
+        for src in ("八十八", "一号", "二十三号", "三零二", "二零二六年十一月", "十二", "十", "一百零五", "两千", "一万二千", "九十", "壹佰贰拾叁", "三千零八", "万一", "百货", "十二点", "四川"):
+            self.assertEqual(grounding.norm_text(src), src, src)
 
-    def test_a_bare_unit_or_other_text_is_left_alone(self) -> None:
-        self.assertEqual(grounding.norm_text("万一"), "万一")            # a 万 with no number before it is a word, so the whole run is left alone
-        self.assertEqual(grounding.norm_text("百货"), "百货")
-        self.assertEqual(grounding.norm_text("十二点"), "12点")           # no meaning is added: 12点 is not turned into 12:00
+    def test_the_numeral_tables_and_the_wan_special_case_are_gone(self) -> None:
+        for name in ("_cn_to_int", "_CN_DIGIT", "_CN_UNIT", "_CN_RUN"):
+            self.assertFalse(hasattr(grounding, name), name)
 
     def test_width_case_and_punctuation(self) -> None:
         self.assertEqual(grounding.norm_text("ＡＢＣ １２３"), "abc123")
@@ -73,25 +80,38 @@ class EveryNumberNeedsProvenance(unittest.TestCase):
         for v in ("上海市浦东新区张江路 88 号", "上海市浦东新区张江路88号", "张江路88号", "88号", "88"):
             self.assertTrue(bad({"address": v}, self.ZJ), v)
 
-    def test_it_passes_when_said_in_digits_or_in_chinese_numerals(self) -> None:
-        for heard in (["我住在上海市浦东新区张江路88号"], ["我住在上海市浦东新区张江路八十八号"], ["我住在上海市浦东新区张江路 88 号"]):
-            for v in ("上海市浦东新区张江路88号", "上海市浦东新区张江路八十八号", "张江路 88 号"):
+    def test_it_passes_when_said_in_the_same_script(self) -> None:
+        for heard, vs in ((["我住在上海市浦东新区张江路88号"], ("上海市浦东新区张江路88号", "张江路 88 号")),
+                          (["我住在上海市浦东新区张江路 88 号"], ("上海市浦东新区张江路88号", "张江路 88 号")),
+                          (["我住在上海市浦东新区张江路八十八号"], ("上海市浦东新区张江路八十八号", "张江路八十八号"))):
+            for v in vs:
                 self.assertEqual(bad({"address": v}, heard), [], (heard, v))
+
+    def test_the_other_numeral_script_is_not_literal_provenance_but_the_evidence_path_works(self) -> None:
+        """N-1: 八十八 for a spoken 88 (and back) is the model's call: refused alone, released by span + an independent yes, refused on an independent no."""
+        for heard, v, span in ((["我住在上海市浦东新区张江路八十八号"], "上海市浦东新区张江路88号", "张江路八十八号"),
+                               (["我住在上海市浦东新区张江路88号"], "上海市浦东新区张江路八十八号", "张江路88号")):
+            self.assertTrue(bad({"address": v}, heard), (heard, v))
+            self.assertEqual(bad({"address": v}, heard, evidence=ev("address", span)), [], (heard, v))
+            self.assertTrue(bad({"address": v}, heard, evidence=ev("address", span), judge=lambda *a: False), (heard, v))
 
     def test_building_numbers_both_directions(self) -> None:
         self.assertTrue(bad({"room": "9号楼"}, ["一号楼"]))
-        self.assertEqual(bad({"room": "1号楼"}, ["一号楼"]), [])
-        self.assertEqual(bad({"room": "一号楼"}, ["1号楼"]), [])
-        self.assertEqual(bad({"n": "二十三号"}, ["23号"]), [])
-        self.assertEqual(bad({"n": "23号"}, ["二十三号"]), [])
+        self.assertEqual(bad({"room": "一号楼"}, ["一号楼"]), [])
+        self.assertEqual(bad({"room": "1号楼"}, ["1号楼"]), [])
+        for v, heard, span in (("1号楼", "一号楼", "一号楼"), ("一号楼", "1号楼", "1号楼"), ("二十三号", "23号", "23号"), ("23号", "二十三号", "二十三号")):
+            self.assertTrue(bad({"n": v}, [heard]), (v, heard))                                              # other script: not literal
+            self.assertEqual(bad({"n": v}, [heard], evidence=ev("n", span)), [], (v, heard))                 # evidence + independent yes
 
     def test_short_numbers_are_checked_too(self) -> None:
         self.assertTrue(bad({"age": "37"}, ["我想查一下账单"]))
         self.assertTrue(bad({"floor": "12"}, ["张伟"]))
         self.assertTrue(bad({"qty": 5}, ["hello"]))
         self.assertEqual(bad({"age": "37"}, ["我37岁"]), [])
-        self.assertEqual(bad({"age": "37"}, ["我三十七岁"]), [])
-        self.assertEqual(bad({"floor": 12}, ["十二楼"]), [])
+        self.assertTrue(bad({"age": "37"}, ["我三十七岁"]))                                                    # N-1: other script -> evidence path
+        self.assertEqual(bad({"age": "37"}, ["我三十七岁"], evidence=ev("age", "三十七岁")), [])
+        self.assertTrue(bad({"floor": 12}, ["十二楼"]))
+        self.assertEqual(bad({"floor": 12}, ["十二楼"], evidence=ev("floor", "十二楼")), [])
         self.assertEqual(bad({"qty": 2}, ["two tickets please"]), [])
 
     def test_a_number_cannot_be_assembled_from_two_turns(self) -> None:
@@ -131,7 +151,7 @@ class TheModelsEvidenceSpan(unittest.TestCase):
         self.assertTrue(bad({"address": "浦东张江"}, heard))
         audit: list = []
         self.assertEqual(bad({"address": "浦东张江"}, heard, evidence=ev("address", "浦东新区张江路"), audit=audit), [])
-        self.assertEqual([(a["how"], a["span"], a["value_comes_from_span"]) for a in audit], [("model_span", "浦东新区张江路", True)])
+        self.assertEqual([(a["how"], a["span"], a["value_comes_from_span"], a["judge"]) for a in audit], [("model_span", "浦东新区张江路", True, True)])
 
     def test_homophone_and_traditional_characters(self) -> None:
         heard = ["我叫张伟"]
@@ -185,10 +205,15 @@ class TheModelsEvidenceSpan(unittest.TestCase):
 
 
 # ----------------------------------------------------------------- the guard in a session
+async def _independent_yes(*_a):
+    return True
+
+
 def _session(heard, instructions: str = "") -> realtime.RealtimeSession:
     s = realtime.RealtimeSession.__new__(realtime.RealtimeSession)
     s.id = "t"; s.heard = list(heard); s.seen = []; s.asr = object(); s.asr_tasks = []; s.guard_counts = {}
     s.guard_total = 0; s.audit = []; s.spoken = []; s.degraded_warned = False; s.closed = False; s.tasks = []
+    s.rejected = {}; s.judge = _independent_yes                      # the independent (span, value) judge: tests inject a stub, never the real model
     s.cfg = {"instructions": instructions, "tools": [{"name": "lookup_account"}]}
     s.engine = mock.MagicMock(); s.engine.tool_result = mock.AsyncMock(); s.engine.close = mock.AsyncMock()
     return s
@@ -238,7 +263,7 @@ class GuardWithEvidence(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await s._guard(call(a, f"r{i}")))
         sent = json.loads(s.engine.tool_result.await_args.args[1])
         self.assertEqual(sent["status"], "needs_input")
-        for needle in ("Read each value back", K, "read_back_to_caller=true", "confirming words"):
+        for needle in ("Read each value back", K, "read_back_to_caller=true", "caller_reply=confirm", "very next words"):
             self.assertIn(needle, sent["message"])
         # the assistant reads it back, the caller confirms
         s.spoken.append(("我这边记的是张炜，对吗？", len(s.heard)))
@@ -250,18 +275,27 @@ class GuardWithEvidence(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_confirmation_needs_a_read_back_and_must_come_after_it(self) -> None:
         a = {"name": "张炜"}
-        s = _session(["我姓张", "对，就是这个"])                                   # the "confirmation" is older than any read-back
+
+        async def refused(s, why: str, **ev_kw) -> None:
+            e = call({**a, K: ev("name", ev_kw.pop("span", "对，就是这个"), read_back=True, **ev_kw)})
+            self.assertTrue(await s._guard(e))
+            self.assertIn(why, s.engine.tool_result.await_args.args[1])
+
+        def seeded(heard):
+            s = _session(heard); s.rejected = {"name": {"张炜"}}                      # the value WAS refused before: each case below fails for its own reason
+            return s
+        s = seeded(["我姓张", "对，就是这个"])                                        # the "confirmation" is older than any read-back
         s.spoken.append(("请问是张炜吗", 2))
-        self.assertTrue(await s._guard(call({**a, K: ev("name", "对，就是这个", read_back=True)})))
-        s = _session(["我姓张"])                                                    # nothing was ever read back
+        await refused(s, "has not replied after the read-back yet")
+        s = seeded(["我姓张"])                                                       # nothing was ever read back
         s.heard.append("对，就是这个")
-        self.assertTrue(await s._guard(call({**a, K: ev("name", "对，就是这个", read_back=True)})))
-        s = _session(["我姓张"])                                                    # a different value was read back
+        await refused(s, "never read back")
+        s = seeded(["我姓张"])                                                       # a different value was read back
         s.spoken.append(("请问是李四吗", 1)); s.heard.append("对，就是这个")
-        self.assertTrue(await s._guard(call({**a, K: ev("name", "对，就是这个", read_back=True)})))
-        s = _session(["我姓张"])                                                    # the caller's words after the read-back do not contain the span
+        await refused(s, "never read back")
+        s = seeded(["我姓张"])                                                       # the caller's words after the read-back do not contain the span
         s.spoken.append(("请问是张炜吗", 1)); s.heard.append("不对")
-        self.assertTrue(await s._guard(call({**a, K: ev("name", "对，就是这个", read_back=True)})))
+        await refused(s, "first reply after the read-back")
 
     async def test_a_plain_span_cannot_borrow_the_read_back_flag(self) -> None:
         s = _session(["我叫张伟"])
@@ -318,7 +352,8 @@ class DegradedPathSessionCapAndCleanup(unittest.IsolatedAsyncioTestCase):
         for m in msgs[12:]:
             body = json.loads(m)
             self.assertEqual(body["status"], "needs_input")
-            self.assertIn("Too many of your calls were refused", body["message"])
+            self.assertIn("refused in a row", body["message"])
+            self.assertIn("read_back_to_caller=true", body["message"])                    # N-6(b): giving up still teaches the way forward
         self.assertLessEqual(len(s.guard_counts), realtime.GUARD_SESSION_MAX_REJECTIONS)       # the table cannot grow without bound
         self.assertIs(s.engine.tool_result.await_args.kwargs["speak"], True)
 
@@ -328,7 +363,7 @@ class DegradedPathSessionCapAndCleanup(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(s.guard_counts and s.audit == [] or s.guard_counts)
         s.audit.append({"x": 1}); s.spoken.append(("a", 0))
         await s.close()
-        self.assertEqual((s.guard_counts, s.audit, s.spoken), ({}, [], []))
+        self.assertEqual((s.guard_counts, s.audit, s.spoken, s.rejected), ({}, [], [], {}))
 
 
 class SchemaAndPrompt(unittest.TestCase):

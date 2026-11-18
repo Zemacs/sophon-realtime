@@ -1,6 +1,6 @@
 """Release gate (Round 4k / R-9). Run from live/:  python tests/release_gate.py
 
-Fails (exit 1) unless ALL of these hold:
+Fails (exit 1) unless ALL of these hold (exit 2 = a script problem such as a harness timeout, which is not a verdict on the code):
   * ``node`` is installed (the page behaviour tests need it; without it they are SKIPPED, and a skipped page test must never count as a pass),
   * the page behaviour tests ran and none was skipped,
   * the whole suite passes with every ``SOPHON_LIVE_*`` variable removed from the environment,
@@ -13,6 +13,7 @@ import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+HARNESS_TIMEOUT_MARKER = "the page harness did not finish in"      # same text as tests/test_r4j_page_behaviour.py
 PYTEST = [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"]
 
 
@@ -32,6 +33,9 @@ def main() -> None:
         fail("node is not installed: the page behaviour tests cannot run (tests/test_r4j_page_behaviour.py)")
     r = subprocess.run(PYTEST + ["-rs", "tests/test_r4j_page_behaviour.py"], cwd=ROOT, capture_output=True, text=True, env=clean_env())
     out = r.stdout + r.stderr
+    if HARNESS_TIMEOUT_MARKER in out:
+        print("RELEASE GATE SCRIPT ERROR: the page harness timed out (machine busy?); this says nothing about the page. Re-run on an idle machine.\n" + out[-800:])
+        sys.exit(2)
     if r.returncode != 0 or re.search(r"\d+ skipped", out) or not re.search(r"\d+ passed", out):
         fail("the page behaviour tests failed or were skipped:\n" + out[-1500:])
     r = subprocess.run(PYTEST + ["tests"], cwd=ROOT, capture_output=True, text=True, env=clean_env())

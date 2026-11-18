@@ -70,7 +70,10 @@ class GroundingIsProvenanceOnly(unittest.TestCase):
         # Round 4k: the token-overlap ratio is gone; a composed value needs the model's evidence span (see test_r4k_evidence.py)
         said = ["I want a refund for the blender I bought last week it is broken"]
         ev = [{"argument": "summary", "span": "I want a refund for the blender", "value_comes_from_span": True}]
-        self.assertEqual(grounding.check("t", {"summary": "the caller wants a refund for the broken blender they bought last week"}, said, [], evidence=ev), [])
+        args = {"summary": "the caller wants a refund for the broken blender they bought last week"}
+        self.assertTrue(grounding.check("t", args, said, [], evidence=ev))                          # N-2: the model's own evidence is not enough without the independent check
+        self.assertEqual(grounding.check("t", args, said, [], evidence=ev, judge=lambda *a: True), [])
+        self.assertTrue(grounding.check("t", args, said, [], evidence=ev, judge=lambda *a: False))
 
     def test_the_old_mode_switch_has_no_effect(self) -> None:
         """SOPHON_LIVE_GROUND_MODE=placeholder used to skip every check except the placeholder lists. The lists are gone and so is the mode."""

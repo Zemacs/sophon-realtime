@@ -25,6 +25,7 @@ import websockets
 
 from .adapters import VllmOmniAdapter
 from . import grounding
+from .coordinator import span_judge
 from . import backend
 
 log = logging.getLogger("sophon_live.realtime")
@@ -193,6 +194,8 @@ class RealtimeSession:
         self.guard_counts: dict = {}           # (tool name + exact arguments) -> rejections; cleared when the session closes
         self.guard_total = 0                   # rejections in this session across all argument variants (R-5 cap)
         self.audit: list = []                  # grounding decisions: literal / model_span / read_back_confirmed / degraded (also logged)
+        self.rejected: dict = {}               # argument name -> values the guard refused in this session (a read-back may only confirm one of these)
+        self.judge = None                      # independent (span, value) judge; None = coordinator.span_judge.judge (tests inject a stub)
         self.spoken: list = []                 # (text the assistant said aloud, len(self.heard) at that moment): the read-back provenance
         self.degraded_warned = False
         self.calls: dict = {}                  # call_id -> response id
@@ -501,6 +504,11 @@ class RealtimeSession:
         if not r["done"] and not r["audio"] and not r["calls"]:
             await self._finish(r)
 
+    def _audit(self, rec: dict) -> None:
+        """Keep a grounding decision in memory AND write it to the structured log now: the table is cleared when the session closes (N-8)."""
+        self.audit.append(rec)
+        log.info("realtime %s: grounding audit %s", self.id, json.dumps(rec, ensure_ascii=False, default=str)[:500])
+
     async def _guard(self, e: dict) -> bool:
         """True = call rejected and sent back to the model (not shown to the client)."""
         if os.environ.get("SOPHON_LIVE_UNKNOWN_TOOL", "1") != "0":
@@ -529,7 +537,7 @@ class RealtimeSession:
             if not self.degraded_warned:
                 self.degraded_warned = True
                 log.warning("realtime %s: GROUNDING UNAVAILABLE (%s): tool calls are passed on UNCHECKED for this session", self.id, reason)
-            self.audit.append({"call": e.get("name"), "grounding": "unavailable", "reason": reason})
+            self._audit({"call": e.get("name"), "grounding": "unavailable", "reason": reason})
             log.info("realtime %s: grounding degraded (%s): %s passed unchecked", self.id, reason, e.get("name"))
             return False
         pend = [t for t in self.asr_tasks if not t.done()]
@@ -537,13 +545,25 @@ class RealtimeSession:
             await asyncio.wait(pend, timeout=2.5)
         self.asr_tasks = [t for t in self.asr_tasks if not t.done()]
         decisions: list = []
-        bad = grounding.check(e.get("name", ""), args, self.heard, self.seen, evidence=raw_ev, spoken=self.spoken, audit=decisions)
+
+        def _verdict(p: dict, ans) -> None:
+            log.info("realtime %s: independent check %s %s=%r span=%r -> %s", self.id, p["kind"], p["argument"], p["value"], p["span"], ans)
+        bad = await grounding.check_async(e.get("name", ""), args, self.heard, self.seen, evidence=raw_ev, spoken=self.spoken, audit=decisions,
+                                          judge=getattr(self, "judge", None) or span_judge.judge,
+                                          schema=grounding.tool_parameters(self.cfg.get("tools"), e.get("name", "")),
+                                          rejected=getattr(self, "rejected", {}), on_verdict=_verdict)
         for d in decisions:
             if d.get("how") != "literal":                         # the model-judged acceptances are the ones to audit
                 log.info("realtime %s: grounding accepted %s=%r on the model's evidence: %s", self.id, d["argument"], d["value"], json.dumps(d, ensure_ascii=False)[:300])
-                self.audit.append(dict(d, call=e.get("name")))
+                self._audit(dict(d, call=e.get("name")))
         if not bad:
+            self.guard_total = 0                                  # the session cap counts rejections IN A ROW since the last call the guard let through (N-6)
             return False
+        rej = getattr(self, "rejected", None)
+        if rej is not None:
+            for k_, v_, _ in bad:
+                if len(rej) < 64:
+                    rej.setdefault(k_, set()).add(v_)
         key = e.get("name", "") + json.dumps(args, sort_keys=True)
         self.guard_total += 1
         capped = self.guard_total > GUARD_SESSION_MAX_REJECTIONS
@@ -553,7 +573,7 @@ class RealtimeSession:
         if capped or n > GUARD_MAX_REJECTIONS:                  # never released: the caller has to give or confirm the value
             log.info("realtime %s: grounding guard needs_input (%s, %d session rejections, not released): %s", self.id,
                      "session cap" if capped else f"{n} identical", self.guard_total, key[:160])
-            self.audit.append({"call": e.get("name"), "grounding": "needs_input", "capped": capped})
+            self._audit({"call": e.get("name"), "grounding": "needs_input", "capped": capped})
             await self.engine.tool_result(e.get("call_id"), json.dumps({"ok": False, "status": "needs_input", "message": grounding.needs_input_message(bad, give_up=capped)}), speak=True)
             return True
         msg = grounding.guard_message(bad, self.heard)
@@ -686,4 +706,4 @@ class RealtimeSession:
         if self.engine is not None:
             await self.engine.close()
         log.info("realtime %s closed (grounding: %d rejections, %d audit records)", self.id, self.guard_total, len(self.audit))
-        self.guard_counts.clear(); self.audit.clear(); self.spoken.clear()
+        self.guard_counts.clear(); self.audit.clear(); self.spoken.clear(); getattr(self, "rejected", {}).clear()

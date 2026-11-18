@@ -10,6 +10,7 @@ Needs ``node``. Without it the test is skipped (reported as skipped, never as pa
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import unittest
@@ -25,8 +26,25 @@ CASES = ([{"name": f"{b}:{k}", "delegation": {"backend": b, "task": v}} for b in
             for b in (None, "builtin", "something-else") for k, v in TASKS.items()])
 
 
+HARNESS_TIMEOUT_S = float(os.environ.get("SOPHON_PAGE_HARNESS_TIMEOUT", "240"))      # was a fixed 60 s: a busy machine (mutation runs, a second suite) killed it (N-9)
+
+
+HARNESS_TIMEOUT_MARKER = "the page harness did not finish in"      # appears in the output only when the harness really timed out (twice)
+
+
+class HarnessTimeout(Exception):
+    """The node harness did not finish in time (twice). That is a problem with the machine or the script, never a statement about the page: it is raised as
+    an ERROR, not as a failed assertion, so a mutation run cannot count it as a kill and the release gate reports it as a script error."""
+
+
 def run_page(page: Path = PAGE) -> dict:
-    r = subprocess.run(["node", str(HARNESS), str(page), json.dumps(CASES)], capture_output=True, text=True, timeout=60)
+    for attempt in (1, 2):
+        try:
+            r = subprocess.run(["node", str(HARNESS), str(page), json.dumps(CASES)], capture_output=True, text=True, timeout=HARNESS_TIMEOUT_S)
+            break
+        except subprocess.TimeoutExpired:
+            if attempt == 2:
+                raise HarnessTimeout(f"HarnessTimeout: {HARNESS_TIMEOUT_MARKER} {HARNESS_TIMEOUT_S:.0f} s (twice); the machine is busy or the script hangs") from None
     if r.returncode != 0:
         raise AssertionError(r.stderr[-800:])
     return json.loads(r.stdout)

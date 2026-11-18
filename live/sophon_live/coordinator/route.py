@@ -5,6 +5,7 @@ import re
 from typing import Any
 
 from .ledger import Ledger
+from . import slots as _slots
 from .schemas import ControlDecision, TaskStatus
 
 # Interactive routes (Jarvis-inspired, Path-1 subset)
@@ -141,3 +142,44 @@ def heuristic_route(text: str, ledger: Ledger) -> str:
     if "别说了" in t or "先停" in t or "闭嘴" in t:
         return "STOP_SPEAKING"
     return "FAST"
+
+
+_EDIT_CUES = ("改成", "换成", "改为", "不对", "不是", "还是")
+_EDITABLE = (TaskStatus.QUEUED, TaskStatus.RUNNING, TaskStatus.COMPLETED, TaskStatus.DELIVERED)
+_SAME_SHAPE = 0.8    # skeletons this alike = the same request
+
+
+def current_ask(objective: str) -> str:
+    """The latest wording of a task's objective (refined objectives chain the user's words)."""
+    for marker in ("以新说法为准：", "用户补充："):
+        if marker in objective:
+            objective = objective.rsplit(marker, 1)[1]
+    return objective.strip()
+
+
+def slot_edit(text: str, raw_text: str, ledger: Ledger) -> ControlDecision | None:
+    """Deterministic guard: the utterance repeats the latest task with exactly one slot changed → REFINE it.
+
+    「明天上海会下雨吗」→「明天北京会下雨吗」(the front rewrites 「改成北京的」 into a full new request, which JEV
+    keeps judging NEW). Only the Ledger's most recent live/just-delivered task qualifies; the words never pick
+    the target. Ambiguous input (several cities, no changed slot) returns None and JEV decides as before.
+    """
+    t = (text or "").strip()
+    latest = ledger.latest()
+    if not t or latest is None or latest.status not in _EDITABLE:
+        return None
+    ask = current_ask(latest.objective)
+    changed = False
+    for words in (_slots.CITY_NAMES, _slots.DAY_WORDS):
+        old, new = _slots.find(ask, words), _slots.find(t, words)
+        if len(old) == 1 and len(new) == 1 and old[0] != new[0]:
+            changed = True
+        elif len(old) > 1 or len(new) > 1:
+            return None
+    if not changed:
+        return None
+    cued = any(c in (raw_text or "") for c in _EDIT_CUES)
+    sim = _slots.similarity(ask, t)
+    if cued or sim >= _SAME_SHAPE:
+        return ControlDecision(op="REFINE", task_id=latest.task_id, version=latest.version, via="guard")  # type: ignore[arg-type]
+    return None

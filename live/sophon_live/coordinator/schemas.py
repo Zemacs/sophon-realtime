@@ -29,6 +29,7 @@ class AdmitRequest:
     delegate_task: str | None = None
     playback_active: bool = False
     now_ms: int = 0
+    raw_text: str = ""  # what the user actually said (ASR), when known; `text` may be the front's rewrite
 
 
 @dataclass
@@ -75,7 +76,7 @@ class ControlDecision:
     op: Literal["CANCEL", "STATUS", "REFINE"]
     task_id: str
     version: int
-    via: Literal["jev", "heuristic"] = "heuristic"
+    via: Literal["jev", "heuristic", "guard"] = "heuristic"
 
     @property
     def key(self) -> str:

@@ -499,6 +499,7 @@ class LiveSession:
         for i, p in enumerate(pieces):
             await self.send({"type": "session.input_transcript.delta", "delta": p, "start_ms": start + i * step, "end_ms": start + (i + 1) * step})
         log.info("session %s user: %s", self.id, text)
+        self.last_user = (text, time.monotonic())  # the user's own words, for the Coordinator's refine guard
 
     # ------------------------------------------------------------- engine events
     async def _engine_events(self) -> None:
@@ -599,6 +600,12 @@ class LiveSession:
             d["timer"].cancel()
         await self._flush_deleg(did)
 
+    def _recent_user_text(self, max_age_s: float = 20.0) -> str:
+        last = getattr(self, "last_user", None)
+        if last and time.monotonic() - last[1] <= max_age_s:
+            return str(last[0] or "")
+        return ""
+
     async def _coord_resolve(self, did: str, what: str | None) -> None:
         """Path-1 Coordinator: Karpo/JEV route + ledger, then Worker orch for TOOL jobs."""
         from .coordinator import AdmitRequest, Ledger, TaskContext, admit, bind_task, finish_job
@@ -620,6 +627,7 @@ class LiveSession:
                     text=what or "",
                     delegate_task=what,
                     playback_active=bool(getattr(self, "playing", False)),
+                    raw_text=self._recent_user_text(),
                 ),
                 ledger,
             )

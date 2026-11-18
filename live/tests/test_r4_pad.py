@@ -143,5 +143,26 @@ class PadTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(s.deleg["p1"].get("pad_task"))
 
 
+class RuntimeBannerTests(unittest.TestCase):
+    """Critic S-6: SOPHON_LIVE_COORD is off by default in code; a restart without it must say so loudly."""
+
+    def test_default_env_is_flagged_as_the_legacy_path(self) -> None:
+        text, intended = gw.runtime_banner({})
+        self.assertFalse(intended)
+        self.assertIn("SOPHON_LIVE_COORD OFF", text)
+        self.assertIn("SOPHON_LIVE_COORD=1", text)
+
+    def test_coord_on_is_reported_with_the_other_switches(self) -> None:
+        text, intended = gw.runtime_banner({"SOPHON_LIVE_COORD": "1", "SOPHON_LIVE_JEV": "1", "SOPHON_LIVE_ORCH": "1"})
+        self.assertTrue(intended)
+        self.assertIn("COORD on", text)
+        self.assertIn("JEV=1", text)
+        self.assertIn("ORCH=1", text)
+
+    def test_falsy_values_do_not_count_as_on(self) -> None:
+        for v in ("0", "", "false", "no"):
+            self.assertFalse(gw.runtime_banner({"SOPHON_LIVE_COORD": v})[1], v)
+
+
 if __name__ == "__main__":
     unittest.main()

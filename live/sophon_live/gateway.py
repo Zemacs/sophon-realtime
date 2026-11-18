@@ -936,6 +936,24 @@ class LiveSession:
         log.info("session %s closed (%s)", self.id, reason)
 
 
+def _flag(name: str, env=None) -> bool:  # noqa: ANN001
+    return (env if env is not None else os.environ).get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def runtime_banner(env=None) -> tuple[str, bool]:  # noqa: ANN001
+    """One startup line saying which delegation path this process will run, and whether that is the intended one.
+
+    SOPHON_LIVE_COORD defaults to OFF in code (Critic S-6): a restart without it silently falls back to the legacy orch path.
+    The line makes that visible in the log (and in the runbook's post-start check)."""
+    coord = _flag("SOPHON_LIVE_COORD", env)
+    orch = _flag("SOPHON_LIVE_ORCH", env)
+    jev = os.environ.get("SOPHON_LIVE_JEV", "1") if env is None else env.get("SOPHON_LIVE_JEV", "1")
+    if coord:
+        return f"SOPHON_LIVE_COORD on (Coordinator path) JEV={jev} ORCH={int(orch)}", True
+    return ("SOPHON_LIVE_COORD OFF: legacy path (no Ledger / REFINE / CANCEL / tool-evidence guard). "
+            f"Set SOPHON_LIVE_COORD=1 (see docs/runbook-path1-coord.md); ORCH={int(orch)}"), False
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="0.0.0.0"); ap.add_argument("--port", type=int, default=8780)
@@ -1026,6 +1044,8 @@ def main() -> None:
     async def run():
         async with websockets.serve(handler, args.host, args.port, max_size=None, compression=None, process_request=process_request):
             log.info("Sophon Live gateway on ws://%s:%d%s -> %s", args.host, args.port, args.path, args.engine)
+            banner, intended = runtime_banner()
+            (log.info if intended else log.warning)("%s", banner)
             await asyncio.Future()
     asyncio.run(run())
 

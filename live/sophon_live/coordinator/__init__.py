@@ -6,6 +6,7 @@ See deplux docs/sophon-jarvis-frontend-backend-architecture.md.
 
 from .api import AdmitResult, admit, complete_job, on_playback_receipt
 from .delivery import DeliveryTracker
+from .memory_gate import MemoryGate, TaskContext, bind_task
 from .ledger import Ledger
 from .schemas import (
     AdmitRequest,
@@ -33,4 +34,7 @@ __all__ = [
     "complete_job",
     "on_playback_receipt",
     "DeliveryTracker",
+    "MemoryGate",
+    "TaskContext",
+    "bind_task",
 ]

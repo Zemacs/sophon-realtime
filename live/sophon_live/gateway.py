@@ -601,7 +601,7 @@ class LiveSession:
 
     async def _coord_resolve(self, did: str, what: str | None) -> None:
         """Path-1 Coordinator: Karpo/JEV route + ledger, then Worker orch for TOOL jobs."""
-        from .coordinator import AdmitRequest, Ledger, admit, complete_job
+        from .coordinator import AdmitRequest, Ledger, TaskContext, admit, bind_task, complete_job
         from .assistant_tools import resolve_task_orch
 
         if not hasattr(self, "coord_ledger"):
@@ -656,9 +656,11 @@ class LiveSession:
             # FAST (thanks / ok): nothing to run, nothing to say. Close the delegation silently.
             await self._ack_delegation(did, "这句话不需要后台办事，不用再说什么。")
             return
-        worker = asyncio.ensure_future(
-            resolve_task_orch(job.objective, instructions=self.instructions or "", history=getattr(self, "orch_history", None) or [])
-        )
+        with bind_task(TaskContext(task_id=job.task_id, version=job.version, utterance=job.objective, ledger=ledger)):
+            # the worker task copies this context: its memory writes go through memory_gate, its tool args become task slots
+            worker = asyncio.ensure_future(
+                resolve_task_orch(job.objective, instructions=self.instructions or "", history=getattr(self, "orch_history", None) or [])
+            )
         self.coord_workers[job.task_id] = worker
         try:
             text = await worker

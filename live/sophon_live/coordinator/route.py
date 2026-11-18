@@ -90,6 +90,15 @@ _STATUS_HINTS = (
 _REFINE_HINTS = ("改成", "换成", "改为", "不对", "再讲", "再来一个", "换一个", "另一个", "不一样的", "不好笑", "重新讲")
 _SWAP_RE = re.compile(r"(那|换成|改成)?[一-鿿]{2,4}(的呢|的|呢)")
 _SLOT_MAX_CHARS = 10
+_ACK_WORDS = ("好的", "好吧", "好嘞", "好", "嗯", "哦", "行", "可以", "谢谢", "多谢", "知道了", "明白", "收到", "ok", "OK")
+
+
+def _is_ack(t: str) -> bool:
+    """「好的」「谢谢」「好的谢谢」: an acknowledgement is never the answer to a pending question."""
+    rest = t
+    for w in sorted(_ACK_WORDS, key=len, reverse=True):
+        rest = rest.replace(w, "")
+    return rest.strip("，,。.！!？? ") == ""
 
 
 def heuristic_control(text: str, ledger: Ledger) -> ControlDecision | None:
@@ -112,7 +121,7 @@ def heuristic_control(text: str, ledger: Ledger) -> ControlDecision | None:
     if any(h in t for h in _STATUS_HINTS):
         return pick("STATUS", latest)
     waiting = ledger.pending_input()
-    if waiting is not None and len(t) <= _SLOT_MAX_CHARS and not any(h in t for h in _NEW_REQUEST_HINTS):
+    if waiting is not None and len(t) <= _SLOT_MAX_CHARS and not _is_ack(t) and not any(h in t for h in _NEW_REQUEST_HINTS):
         return pick("REFINE", waiting)
     if any(h in t for h in _REFINE_HINTS):
         return pick("REFINE", latest)

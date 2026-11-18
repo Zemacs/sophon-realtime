@@ -195,6 +195,7 @@ def _refined_objective(old: str, utterance: str, *, slot_fill: bool) -> str:
 
 
 def _new_job(ledger: Ledger, objective: str, *, language: str = "zh") -> WorkerJob:
+    ledger.supersede_pending_input()  # a fresh request replaces any open clarification
     rec = ledger.create(objective)
     ledger.mark_running(rec.task_id)
     return WorkerJob(

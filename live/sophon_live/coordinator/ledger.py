@@ -43,6 +43,17 @@ class Ledger:
                 return rec
         return None
 
+    def supersede_pending_input(self) -> int:
+        """The user moved on: open clarifications are replaced by the new request and can no longer capture answers."""
+        n = 0
+        for tid in self.order:
+            rec = self.tasks[tid]
+            if rec.status == TaskStatus.NEEDS_INPUT:
+                rec.status = TaskStatus.SUPERSEDED
+                self.superseded.append(rec)
+                n += 1
+        return n
+
     def create(self, objective: str, *, constraints: list | None = None) -> TaskRecord:
         tid = _new_id()
         rec = TaskRecord(
@@ -106,6 +117,18 @@ class Ledger:
             return False
         rec.status = TaskStatus.CANCELLED
         return True
+
+    def set_slot(self, task_id: str, version: int, key: str, value: str) -> bool:
+        """Record a task-scoped slot (e.g. city) on a live pending task at exactly this version."""
+        rec = self.tasks.get(task_id)
+        if rec is None or rec.version != version or rec.status not in _PENDING:
+            return False
+        rec.slots[str(key)] = str(value)
+        return True
+
+    def get_slots(self, task_id: str) -> dict[str, str]:
+        rec = self.tasks.get(task_id)
+        return dict(rec.slots) if rec else {}
 
     def mark_delivered(self, task_id: str, version: int) -> bool:
         """The answer was heard to the end. Only a completed task at this version can become DELIVERED."""

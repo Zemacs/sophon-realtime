@@ -65,12 +65,12 @@ class Q3ThroughEveryLayerTests(unittest.IsolatedAsyncioTestCase):
         led, rec = _ledger("明天上海会下雨吗", status=TaskStatus.COMPLETED)
         job = _refine_job(led, rec)
         res = WorkerResult(task_id=job.task_id, version=job.version, status="completed", spoken_answer=Q3_FAKE, evidence=[], freshness_token=job.freshness_token)
-        with mock.patch.object(api, "_ungrounded", return_value=False):
+        with mock.patch.object(api, "_ungrounded", return_value=False), mock.patch.object(api, "_unverified_numbers", return_value=[]):
             out = finish_job(led, job, res)
         self.assertEqual(out.text, Q3_FAKE)
 
     async def test_layer3_gateway_speaks_the_honest_sentence_for_a_refine(self) -> None:
-        """Shanghai weather done -> user says 改成北京的 -> real admit (REFINE guard) -> real Worker with a lying LLM."""
+        """Shanghai weather done -> user says 改成北京的 -> real admit (the scripted model says REFINE) -> real Worker with a lying LLM."""
         import sophon_live.coordinator as coord  # noqa: F401
 
         session = _session()
@@ -80,7 +80,10 @@ class Q3ThroughEveryLayerTests(unittest.IsolatedAsyncioTestCase):
         _arm(session, "d2", "明天北京会下雨吗")
         session._trace().start("d2")
         session.last_user = ("改成北京的。", 1e12)
-        with mock.patch.object(api, "USE_JEV", False), mock.patch.object(orch.aiohttp, "ClientSession", return_value=sess), \
+        from tests.test_refine_guard import _jev
+
+        with mock.patch.object(api, "USE_JEV", True), mock.patch.object(orch.aiohttp, "ClientSession", return_value=sess), \
+                mock.patch.object(api.jev_client, "system_one", new=_jev("WORKER", f"REFINE:{rec.task_id}:1", tool="get_weather")), \
                 mock.patch.object(orch, "run_tool", new=mock.AsyncMock(return_value="never")), \
                 mock.patch.object(session, "_recent_user_text", return_value="改成北京的。"):
             await session._coord_resolve("d2", "明天北京会下雨吗")

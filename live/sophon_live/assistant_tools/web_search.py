@@ -51,12 +51,16 @@ def _clamp_max(n: Any, default: int = 3) -> int:
 
 
 def _network_error(zh: bool) -> str:
+    from . import toolmeta
+    toolmeta.note(ok=False)             # structured outcome
     if zh:
         return "网络暂时不可用，没法完成网页搜索，请稍后再试。"
     return "Web search is unavailable right now due to a network problem. Please try again later."
 
 
 def _no_results(query: str, *, zh: bool) -> str:
+    from . import toolmeta
+    toolmeta.note(ok=False)             # structured outcome: searched, found nothing (not evidence for a factual answer, Critic S-11)
     if zh:
         return f"没有搜到关于「{query}」的可靠摘要。"
     return f"I couldn't find useful snippets for '{query}'."
@@ -152,7 +156,8 @@ def _snippets_from_bing(html: str, limit: int) -> list[str]:
     return out
 
 
-_BING_HEDGE_S = 1.5      # a Bing attempt that has not answered by then gets a second, independent connection (max 3)
+_BING_HEDGE_S = 1.0      # a Bing attempt that has not answered by then gets another independent connection (max 4)
+_BING_ATTEMPTS = 4
 
 
 async def _bing(query: str, max_results: int, zh: bool, timeout: float) -> list[str]:
@@ -164,12 +169,12 @@ async def _bing(query: str, max_results: int, zh: bool, timeout: float) -> list[
     last: BaseException = asyncio.TimeoutError()
     empty_pages = 0
     try:
-        for attempt in range(3):
+        for attempt in range(_BING_ATTEMPTS):
             left = deadline - time.monotonic()
             if left <= 0.3:
                 break
             pending.add(asyncio.ensure_future(_fetch_bytes(url, left)))
-            wait_s = _BING_HEDGE_S if attempt < 2 else max(0.0, deadline - time.monotonic())
+            wait_s = _BING_HEDGE_S if attempt < _BING_ATTEMPTS - 1 else max(0.0, deadline - time.monotonic())
             done, pending = await asyncio.wait(pending, timeout=wait_s, return_when=asyncio.FIRST_COMPLETED)
             for d in done:
                 if d.exception() is None:

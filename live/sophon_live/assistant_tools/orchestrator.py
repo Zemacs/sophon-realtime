@@ -16,6 +16,7 @@ from typing import Any
 
 import aiohttp
 
+from .. import model_client
 from ..coordinator import slots
 from ..coordinator.clarify import clarify_for_slots
 from ..coordinator.schemas import NO_TOOL_ANSWER, WorkerJob, WorkerResult, tool_succeeded
@@ -29,7 +30,7 @@ _DEFAULT_URL = "http://127.0.0.1:8101/v1/chat/completions"
 _DEFAULT_MODEL = "qwen3.8-27b-bo"
 _DEFAULT_KEY = "local"
 _DEFAULT_STEPS = 6
-_DEFAULT_TIMEOUT = 120.0
+_DEFAULT_TIMEOUT = 30.0   # measured Worker p50 0.66 s / p95 2.23 s; see model_client for the evidence (was 120 s)
 
 SYS = (
     "You are the tool-executing worker behind a voice assistant. "
@@ -227,7 +228,7 @@ async def run_job(
                 body["tool_choice"] = choice          # the Coordinator says this answer needs its tool: do not let the model skip it
             # Prefer non-thinking for low-latency spoken answers when the server supports it.
             body["chat_template_kwargs"] = {"enable_thinking": False}
-            try:
+            async def _step(body=body) -> tuple[int, Any]:
                 async with cs.post(url, json=body, headers=headers) as r:
                     status = r.status
                     try:
@@ -235,29 +236,34 @@ async def run_job(
                     except Exception as e:  # noqa: BLE001
                         raw = await r.text()
                         log.warning("orch LLM bad JSON HTTP %s: %r body=%s", status, e, raw[:300])
-                        return _result(job, "failed", unavailable, evidence)
-                if status >= 400:
+                        raise RuntimeError("orch bad json") from e
+                if status == 400 and ("chat_template_kwargs" in body or "tool_choice" in body):
                     # retry once without chat_template_kwargs / tool_choice if rejected (the guard below still applies)
-                    if status == 400 and ("chat_template_kwargs" in body or "tool_choice" in body):
-                        body.pop("chat_template_kwargs", None)
-                        body.pop("tool_choice", None)
-                        async with cs.post(url, json=body, headers=headers) as r2:
-                            status = r2.status
-                            j = await r2.json(content_type=None)
-                        if status >= 400:
-                            log.warning("orch LLM HTTP %s: %s", status, str(j)[:300])
-                            return _result(job, "failed", unavailable, evidence)
-                    else:
-                        log.warning("orch LLM HTTP %s: %s", status, str(j)[:300])
-                        return _result(job, "failed", unavailable, evidence)
-                choices = j.get("choices") if isinstance(j, dict) else None
-                if not choices:
-                    log.warning("orch LLM empty choices: %s", str(j)[:300])
-                    return _result(job, "failed", unavailable, evidence)
-                m = choices[0].get("message") or {}
+                    body.pop("chat_template_kwargs", None)
+                    body.pop("tool_choice", None)
+                    async with cs.post(url, json=body, headers=headers) as r2:
+                        status = r2.status
+                        j = await r2.json(content_type=None)
+                if status >= 500:
+                    raise RuntimeError(f"orch HTTP {status}")      # the service is sick: counts against the breaker
+                return status, j
+
+            try:
+                status, j = await model_client.call("orch", _step, retries=1, total_s=timeout)
+            except model_client.ModelUnavailable as e:
+                log.warning("orch LLM unavailable (%s): %s", e.reason, e)
+                return _result(job, "failed", "后台模型连接失败，请稍后再试。" if e.reason == "connection" else unavailable, evidence)
             except Exception as e:  # noqa: BLE001
                 log.warning("orch LLM call failed: %r", e)
                 return _result(job, "failed", "后台模型连接失败，请稍后再试。", evidence)
+            if status >= 400:
+                log.warning("orch LLM HTTP %s: %s", status, str(j)[:300])
+                return _result(job, "failed", unavailable, evidence)
+            choices = j.get("choices") if isinstance(j, dict) else None
+            if not choices:
+                log.warning("orch LLM empty choices: %s", str(j)[:300])
+                return _result(job, "failed", unavailable, evidence)
+            m = choices[0].get("message") or {}
             tcs = m.get("tool_calls") or []
             if not tcs:
                 if not _evidence_has_required(job, evidence):

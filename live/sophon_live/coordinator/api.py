@@ -6,10 +6,11 @@ import os
 import time
 from dataclasses import dataclass
 
+from .. import model_client
 from . import intent, jev_client
 from .clarify import clarify_for_slots, missing_slots_for_text
 from .ledger import Ledger
-from .route import build_route_questions, build_state, heuristic_control, heuristic_route, slot_edit
+from .route import build_route_questions, build_state, heuristic_control, slot_edit
 from .schemas import AdmitRequest, ControlDecision, PlaybackReceipt, SpeakPlan, TaskStatus, WorkerJob, WorkerResult, freshness_token_for
 from .schemas import FAILED_GENERIC, FIXED_FAILURES, NO_TOOL_ANSWER, tool_succeeded
 
@@ -17,6 +18,11 @@ log = logging.getLogger("sophon_live.coordinator")
 
 USE_JEV = os.environ.get("SOPHON_LIVE_JEV", "1").strip().lower() in ("1", "true", "yes", "on")
 REFINE_GUARD = os.environ.get("SOPHON_LIVE_REFINE_GUARD", "1").strip().lower() in ("1", "true", "yes", "on")
+
+
+_ROUTES = frozenset({"STOP_SPEAKING", "CLARIFY", "FAST", "CONTROL", "WORKER"})
+# Fixed, model-free sentence used when the router is unavailable and a task is already live: asking is safer than guessing.
+DEGRADED_CLARIFY = "我没完全听明白，你是想改刚才那件事，还是问一件新的事？"
 
 
 @dataclass
@@ -29,6 +35,7 @@ class AdmitResult:
     stale_task: tuple[str, int] | None = None  # (task_id, version) whose in-flight worker must stop
     via: str = "heuristic"  # who decided: guard | jev | heuristic
     jev_ms: float | None = None  # Karpo round trip, when JEV was asked
+    degraded_reason: str = ""  # via=degraded: breaker_open | timeout | connection | error | non_option_answer | jev_disabled
 
 
 def _clarify_text(text: str) -> str:
@@ -63,9 +70,10 @@ async def admit(req: AdmitRequest, ledger: Ledger) -> AdmitResult:
     res = await _admit(req, ledger, meta)
     res.via = meta["via"]
     res.jev_ms = meta["jev_ms"]
+    res.degraded_reason = meta.get("degraded_reason", "")
     log.info(
-        "coord admit session=%s utt=%r route=%s decision=%s via=%s admit_ms=%d jev_ms=%s",
-        req.session_id, (req.delegate_task or req.text or "")[:60], res.route, _decision_label(res), res.via,
+        "coord admit session=%s utt=%r route=%s decision=%s via=%s%s admit_ms=%d jev_ms=%s",
+        req.session_id, (req.delegate_task or req.text or "")[:60], res.route, _decision_label(res), res.via, (":" + res.degraded_reason) if res.degraded_reason else "",
         (time.monotonic() - t0) * 1000, "-" if meta["jev_ms"] is None else int(meta["jev_ms"]),
     )
     return res
@@ -83,6 +91,11 @@ async def _admit(req: AdmitRequest, ledger: Ledger, meta: dict) -> AdmitResult:
             log.info("refine guard: %r edits %s v%s", text[:60], edit.task_id, edit.version)
             return _apply_control(edit, text, req, ledger)
 
+    # JEV decides the route. When it cannot (down, slow, breaker open, or an answer that is not one of the offered options)
+    # the Coordinator never guesses from keywords: it degrades to a model-free safe behaviour (see _degrade).
+    route: str | None = None
+    control_key: str | None = None
+    reason = "jev_disabled"
     if USE_JEV:
         try:
             state = build_state(text, ledger, playback_active=req.playback_active)
@@ -90,15 +103,21 @@ async def _admit(req: AdmitRequest, ledger: Ledger, meta: dict) -> AdmitResult:
             t_jev = time.monotonic()
             resp = await jev_client.system_one(state, questions)
             meta["jev_ms"] = (time.monotonic() - t_jev) * 1000
-            route = jev_client.choice_answer(resp, "route") or heuristic_route(text, ledger)
-            control_key = jev_client.choice_answer(resp, "control")
-            meta["via"] = "jev"
-            log.info("jev route=%s control=%s utterance=%r", route, control_key, text[:80])
+            route = jev_client.choice_answer(resp, "route")
+            if route in _ROUTES:
+                control_key = jev_client.choice_answer(resp, "control")
+                meta["via"] = "jev"
+                log.info("jev route=%s control=%s utterance=%r", route, control_key, text[:80])
+            else:
+                route, reason = None, "non_option_answer"
+        except model_client.ModelUnavailable as e:
+            reason = e.reason
+            log.warning("jev unavailable (%s): %s", e.reason, e)
         except Exception as e:  # noqa: BLE001
-            log.warning("jev unavailable, heuristic: %r", e)
-            route = heuristic_route(text, ledger)
-    else:
-        route = heuristic_route(text, ledger)
+            reason = "error"
+            log.warning("jev call failed: %r", e)
+    if route is None:
+        return _degrade(text, req, ledger, meta, reason)
 
     if route == "STOP_SPEAKING":
         return AdmitResult(
@@ -149,6 +168,25 @@ async def _admit(req: AdmitRequest, ledger: Ledger, meta: dict) -> AdmitResult:
         job=job,
         route="WORKER",
         ledger=ledger,
+    )
+
+
+def _degrade(text: str, req: AdmitRequest, ledger: Ledger, meta: dict, reason: str) -> AdmitResult:
+    """Router unavailable: model-free safe behaviour, no keyword semantics.
+
+    No live task -> the utterance is a new task for the orchestrator (a model reads it). A live task -> one fixed
+    clarify sentence, because only the router could tell a refinement/cancel from a new request.
+    """
+    meta["via"] = "degraded"
+    meta["degraded_reason"] = reason
+    if ledger.active():
+        log.warning("coord degraded (%s): live task -> fixed clarify", reason)
+        return AdmitResult(speak=SpeakPlan(kind="clarify", text=DEGRADED_CLARIFY), route="CLARIFY", ledger=ledger)
+    log.warning("coord degraded (%s): no live task -> new task for orch", reason)
+    job = _new_job(ledger, text, language=req.language)
+    return AdmitResult(
+        speak=SpeakPlan(kind="pad", text=intent.pad_for(text), task_id=job.task_id, version=job.version),
+        job=job, route="WORKER", ledger=ledger,
     )
 
 

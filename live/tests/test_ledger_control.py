@@ -147,7 +147,7 @@ class HeuristicControlTests(unittest.TestCase):
 
 class AdmitControlTests(unittest.IsolatedAsyncioTestCase):
     async def test_cancel_marks_task_and_starts_no_worker(self) -> None:
-        with mock.patch.object(api, "USE_JEV", False):
+        with mock.patch.object(api, "USE_JEV", True):
             led = Ledger()
             started = await admit(_req("北京明天天气", uid="w"), led)
             res = await admit(_req("取消刚才那个", uid="c"), led)
@@ -159,7 +159,7 @@ class AdmitControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(led.tasks), 1)
 
     async def test_cancel_of_finished_task_says_so(self) -> None:
-        with mock.patch.object(api, "USE_JEV", False):
+        with mock.patch.object(api, "USE_JEV", True):
             led = Ledger()
             started = await admit(_req("现在几点了"), led)
             complete_job(led, started.job, "三点整")  # type: ignore[arg-type]
@@ -169,7 +169,7 @@ class AdmitControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(led.tasks[started.job.task_id].status, TaskStatus.COMPLETED)  # type: ignore[union-attr]
 
     async def test_status_returns_stored_answer(self) -> None:
-        with mock.patch.object(api, "USE_JEV", False):
+        with mock.patch.object(api, "USE_JEV", True):
             led = Ledger()
             started = await admit(_req("北京明天天气"), led)
             complete_job(led, started.job, "北京明天晴，12到18度。")  # type: ignore[arg-type]
@@ -180,7 +180,7 @@ class AdmitControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(led.tasks), 1)
 
     async def test_status_while_running_says_still_working(self) -> None:
-        with mock.patch.object(api, "USE_JEV", False):
+        with mock.patch.object(api, "USE_JEV", True):
             led = Ledger()
             await admit(_req("北京明天天气"), led)
             res = await admit(_req("查到了吗"), led)
@@ -188,7 +188,7 @@ class AdmitControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("还在", res.speak.text)
 
     async def test_refine_city_bumps_version_and_new_job_carries_both(self) -> None:
-        with mock.patch.object(api, "USE_JEV", False):
+        with mock.patch.object(api, "USE_JEV", True):
             led = Ledger()
             first = await admit(_req("上海明天天气"), led)
             complete_job(led, first.job, "上海明天多云。")  # type: ignore[arg-type]
@@ -205,7 +205,7 @@ class AdmitControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(complete_job(led, first.job, "上海明天多云。"))
 
     async def test_slot_fill_refines_the_needs_input_task(self) -> None:
-        with mock.patch.object(api, "USE_JEV", False):
+        with mock.patch.object(api, "USE_JEV", True):
             led = Ledger()
             clar = await admit(_req("明天天气怎么样"), led)
             self.assertEqual(clar.speak.kind, "clarify")
@@ -218,7 +218,7 @@ class AdmitControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(led.tasks), 1)
 
     async def test_joke_again_refines_same_task(self) -> None:
-        with mock.patch.object(api, "USE_JEV", False):
+        with mock.patch.object(api, "USE_JEV", True):
             led = Ledger()
             j1 = await admit(_req("讲个笑话"), led)
             complete_job(led, j1.job, "笑话一。")  # type: ignore[arg-type]
@@ -227,7 +227,7 @@ class AdmitControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(j2.job.version, 2)
 
     async def test_fresh_request_after_task_creates_new_task(self) -> None:
-        with mock.patch.object(api, "USE_JEV", False):
+        with mock.patch.object(api, "USE_JEV", True):
             led = Ledger()
             a = await admit(_req("现在几点了"), led)
             complete_job(led, a.job, "三点")  # type: ignore[arg-type]

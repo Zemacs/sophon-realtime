@@ -150,6 +150,12 @@ def split_pieces(text: str) -> list[str]:
     return [p for p in out if p]
 
 
+def _health_detail() -> bytes:
+    """/health?detail=1: breaker state of every downstream model (Tag / orch / JEV) as seen by this gateway process."""
+    from . import model_client
+    return json.dumps({"gateway": "ok", "downstream": model_client.snapshot()}, ensure_ascii=False).encode()
+
+
 class ASR:
     """Input transcript (GPT-Live sends session.input_transcript.delta; duplex clients build the delegated task from it)."""
 
@@ -1012,7 +1018,9 @@ def main() -> None:
             return Response(200, "OK", Headers([("Content-Type", "text/html; charset=utf-8"), ("Content-Length", str(len(body))),
                                                 ("Cache-Control", "no-cache")]), body)
         if path == "/health":
-            return conn.respond(200, "ok\n")
+            if "detail=1" in req.path.partition("?")[2].split("&"):
+                return Response(200, "OK", Headers([("Content-Type", "application/json")]), _health_detail())
+            return conn.respond(200, "ok\n")                      # plain liveness of this gateway, unchanged
         if path not in (args.path, "/v1/realtime"):
             return conn.respond(404, "Not Found\n")
         if path == "/v1/realtime" and realtime_keys:              # keyed access for external evaluators (e.g. Artificial Analysis)

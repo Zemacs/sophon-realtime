@@ -135,7 +135,7 @@ class AdmitGuardTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_decision_log_line_is_machine_readable(self) -> None:
         led, rec = _ledger()
-        with mock.patch.object(api, "USE_JEV", False), self.assertLogs("sophon_live.coordinator", "INFO") as cm:
+        with mock.patch.object(api, "USE_JEV", True), self.assertLogs("sophon_live.coordinator", "INFO") as cm:
             await admit(self._req("明天北京会下雨吗", "改成北京的。"), led)
         line = next(l for l in cm.output if "coord admit" in l)
         m = re.search(r"coord admit session=(\S+) .*?route=(\S+) .*?decision=(\S+) via=(\S+) admit_ms=(\d+) jev_ms=(\S+)", line)

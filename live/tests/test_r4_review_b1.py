@@ -79,7 +79,7 @@ class Q3ThroughEveryLayerTests(unittest.IsolatedAsyncioTestCase):
         _arm(session, "d2", "明天北京会下雨吗")
         session._trace().start("d2")
         session.last_user = ("改成北京的。", 1e12)
-        with mock.patch.object(api, "USE_JEV", False), mock.patch.object(orch.aiohttp, "ClientSession", return_value=sess), \
+        with mock.patch.object(api, "USE_JEV", True), mock.patch.object(orch.aiohttp, "ClientSession", return_value=sess), \
                 mock.patch.object(orch, "run_tool", new=mock.AsyncMock(return_value="never")), \
                 mock.patch.object(session, "_recent_user_text", return_value="改成北京的。"):
             await session._coord_resolve("d2", "明天北京会下雨吗")
@@ -205,7 +205,7 @@ class ToolFactsInTraceTests(unittest.IsolatedAsyncioTestCase):
             return WorkerResult(task_id=job.task_id, version=job.version, status="completed", spoken_answer=REAL, evidence=[ev],
                                 freshness_token=job.freshness_token)
 
-        with mock.patch.object(api, "USE_JEV", False), mock.patch.object(tools, "run_worker_job", worker):
+        with mock.patch.object(api, "USE_JEV", True), mock.patch.object(tools, "run_worker_job", worker):
             await session._coord_resolve("d1", "北京明天天气")
         tool = session._trace().get("d1").as_dict()["tools"][0]
         self.assertEqual((tool["city"], tool["tmin"], tool["tmax"]), ("北京", 1, 8))

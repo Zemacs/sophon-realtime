@@ -78,11 +78,29 @@ def _titles_from_rss(xml_bytes: bytes) -> list[str]:
         title_el = item.find("title")
         if title_el is None or not (title_el.text or "").strip():
             continue
-        title = (title_el.text or "").strip()
-        if " - " in title:
-            title = title.rsplit(" - ", 1)[0].strip() or title
-        titles.append(title)
+        titles.append(_strip_publisher(item, (title_el.text or "").strip()))
     return titles
+
+
+def _strip_publisher(item: ET.Element, title: str) -> str:
+    """Drop the publisher from a feed title without guessing which side of " - " it is on.
+
+    Real feeds (Google News) carry the publisher in ``<source>``: remove exactly that, as suffix (「标题 - 来源」) or
+    prefix (「来源 - 标题」), and leave the title alone when it does not match. Only an item with no ``<source>``
+    falls back to the old rule (drop the last " - " segment), which assumes the 「标题 - 来源」 order."""
+    src_el = item.find("source")
+    src = (src_el.text or "").strip() if src_el is not None else ""
+    if src:
+        for cut in (f" - {src}", f" – {src}", f" | {src}"):
+            if title.endswith(cut) and title[: -len(cut)].strip():
+                return title[: -len(cut)].strip()
+        for cut in (f"{src} - ", f"{src} – ", f"{src} | "):
+            if title.startswith(cut) and title[len(cut):].strip():
+                return title[len(cut):].strip()
+        return title
+    if " - " in title:
+        return title.rsplit(" - ", 1)[0].strip() or title
+    return title
 
 
 def _urlopen(url: str) -> bytes:

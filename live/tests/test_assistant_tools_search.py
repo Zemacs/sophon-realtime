@@ -102,6 +102,18 @@ class NewsTests(unittest.TestCase):
         self.assertIn("第1条", out)
         self.assertIn("第2条", out)
 
+    def test_publisher_is_taken_from_the_source_element_in_either_order(self) -> None:
+        """Critic S-1: with <source>, remove exactly the publisher, whichever side of " - " it is on; never the headline."""
+        rss = """<?xml version="1.0" encoding="UTF-8"?>
+        <rss version="2.0"><channel>
+        <item><title>芯片出口新规 - 新华社</title><source url="https://x">新华社</source></item>
+        <item><title>路透社 - 特斯拉发布新电池</title><source url="https://y">路透社</source></item>
+        <item><title>特斯拉 - 马斯克新计划 - 路透社</title><source url="https://y">路透社</source></item>
+        <item><title>某某报 - 与来源不符的标题</title><source url="https://z">别家</source></item>
+        </channel></rss>""".encode("utf-8")
+        titles = news._titles_from_rss(rss)
+        self.assertEqual(titles, ["芯片出口新规", "特斯拉发布新电池", "特斯拉 - 马斯克新计划", "某某报 - 与来源不符的标题"])
+
     def test_title_keeps_inner_dashes_and_untagged_titles(self) -> None:
         rss = """<?xml version="1.0" encoding="UTF-8"?>
         <rss version="2.0"><channel>

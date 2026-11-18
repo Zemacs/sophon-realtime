@@ -1,9 +1,17 @@
-"""Public web search via DuckDuckGo (Instant Answer API + lite HTML fallback)."""
+"""Public web search: Bing China (reachable from the GPU box) and DuckDuckGo (Instant Answer API + lite HTML).
+
+DuckDuckGo is unreachable from mainland-hosted GPU boxes (every request times out), so a Chinese query asks Bing
+China first and DuckDuckGo is only the second choice; an English query is the other way round. Both providers are
+started at once and the answer is taken by priority; the whole search has a hard budget (default 6 s,
+``SOPHON_SEARCH_BUDGET``), after which it fails honestly instead of hanging for ~20 s.
+"""
 from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -13,6 +21,15 @@ from typing import Any
 _INSTANT_URL = "https://api.duckduckgo.com/"
 _LITE_URL = "https://lite.duckduckgo.com/lite/"
 _UA = "sophon-live-assistant/1.0"
+_BING_URL = "https://cn.bing.com/search?q={q}&ensearch={en}"
+_BROWSER_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+
+
+def _budget_s() -> float:
+    try:
+        return max(1.0, float(os.environ.get("SOPHON_SEARCH_BUDGET", "6")))
+    except ValueError:
+        return 6.0
 
 
 def _is_zh(text: str) -> bool:
@@ -39,14 +56,17 @@ def _no_results(query: str, *, zh: bool) -> str:
     return f"I couldn't find useful snippets for '{query}'."
 
 
-def _urlopen(url: str) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": _UA})
-    with urllib.request.urlopen(req, timeout=20) as resp:
+def _urlopen(url: str, timeout: float = 20.0) -> bytes:
+    bing = "bing.com" in url
+    headers = {"User-Agent": _BROWSER_UA, "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.5"} if bing else {"User-Agent": _UA}
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read()
 
 
-async def _fetch_bytes(url: str) -> bytes:
-    return await asyncio.to_thread(_urlopen, url)
+async def _fetch_bytes(url: str, timeout: float = 5.5) -> bytes:
+    """One attempt bounded by ``timeout`` (the socket timeout in the thread and the awaiting side)."""
+    return await asyncio.wait_for(asyncio.to_thread(_urlopen, url, timeout), timeout + 0.5)
 
 
 def _snippets_from_instant(data: dict[str, Any]) -> list[str]:
@@ -91,6 +111,61 @@ def _snippets_from_lite(html: str, limit: int) -> list[str]:
     return out
 
 
+_TAG = re.compile(r"<[^>]+>")
+_AGE = re.compile(r"^\s*\d+\s*(小时|分钟|天|周|个月|年)(之)?前\s*[·・]\s*")
+
+
+def _text(fragment: str) -> str:
+    return re.sub(r"\s+", " ", unescape(_TAG.sub("", fragment))).strip()
+
+
+def _snippets_from_bing(html: str, limit: int) -> list[str]:
+    """Title — snippet for each organic Bing result (``li.b_algo``)."""
+    out: list[str] = []
+    for block in re.findall(r'<li class="b_algo"[\s\S]*?</li>', html):
+        m = re.search(r"<h2[^>]*>\s*<a[^>]*>([\s\S]*?)</a>", block)
+        title = _text(m.group(1)) if m else ""
+        p = re.search(r'<p[^>]*class="[^"]*b_lineclamp[^"]*"[^>]*>([\s\S]*?)</p>', block) or re.search(
+            r'<div class="b_caption"[^>]*>[\s\S]*?<p[^>]*>([\s\S]*?)</p>', block
+        )
+        snippet = _AGE.sub("", _text(p.group(1))) if p else ""
+        if not title:
+            continue
+        out.append(f"{title} — {snippet[:140]}" if snippet else title)
+        if len(out) >= limit:
+            break
+    return out
+
+
+async def _bing(query: str, max_results: int, zh: bool, timeout: float) -> list[str]:
+    q = urllib.parse.quote_plus(query)
+    html = (await _fetch_bytes(_BING_URL.format(q=q, en=0 if zh else 1), timeout)).decode("utf-8", errors="replace")
+    return _snippets_from_bing(html, max_results)
+
+
+async def _ddg(query: str, max_results: int, zh: bool, timeout: float) -> list[str]:
+    """Instant Answer then lite HTML. Raises OSError only when nothing could be fetched at all."""
+    snippets: list[str] = []
+    q = urllib.parse.quote_plus(query)
+    errors: list[Exception] = []
+    try:
+        raw = await _fetch_bytes(f"{_INSTANT_URL}?q={q}&format=json&no_redirect=1&no_html=1&skip_disambig=1", timeout)
+        snippets = _snippets_from_instant(json.loads(raw.decode("utf-8", errors="replace")))
+    except (OSError, urllib.error.URLError, json.JSONDecodeError, UnicodeDecodeError, asyncio.TimeoutError) as e:
+        errors.append(e)
+    if len(snippets) < max_results:
+        try:
+            lite_html = (await _fetch_bytes(f"{_LITE_URL}?q={q}", timeout)).decode("utf-8", errors="replace")
+            for line in _snippets_from_lite(lite_html, max_results):
+                if line not in snippets:
+                    snippets.append(line)
+        except (OSError, urllib.error.URLError, UnicodeDecodeError, asyncio.TimeoutError) as e:
+            errors.append(e)
+    if not snippets and len(errors) >= 2:
+        raise OSError("duckduckgo unreachable")
+    return snippets
+
+
 async def run(args: dict[str, Any] | None = None) -> str:
     args = args or {}
     query = (args.get("query") or "").strip()
@@ -100,32 +175,45 @@ async def run(args: dict[str, Any] | None = None) -> str:
     max_results = _clamp_max(args.get("max_results"), 3)
     zh = _is_zh(query) or args.get("lang") == "zh"
 
+    budget = _budget_s()
+    t_end = time.monotonic() + budget
+    per_source = max(0.5, budget - 0.5)
+    providers = [("bing", _bing), ("duckduckgo", _ddg)] if zh else [("duckduckgo", _ddg), ("bing", _bing)]
+    tasks = [(name, asyncio.ensure_future(fn(query, max_results, zh, per_source))) for name, fn in providers]
     snippets: list[str] = []
+    errored = empty = 0
     try:
-        q = urllib.parse.quote_plus(query)
-        raw = await _fetch_bytes(
-            f"{_INSTANT_URL}?q={q}&format=json&no_redirect=1&no_html=1&skip_disambig=1"
-        )
-        instant = json.loads(raw.decode("utf-8", errors="replace"))
-        snippets = _snippets_from_instant(instant)
-    except (OSError, urllib.error.URLError, json.JSONDecodeError, UnicodeDecodeError):
+        for name, task in tasks:                     # priority order, all already running
+            left = t_end - time.monotonic()
+            try:
+                if left > 0:
+                    got = await asyncio.wait_for(asyncio.shield(task), left)
+                elif task.done() and not task.cancelled():
+                    got = task.result()
+                else:
+                    raise asyncio.TimeoutError
+            except asyncio.TimeoutError:
+                errored += 1
+                continue
+            except Exception:  # noqa: BLE001  (a provider that broke is just not available)
+                errored += 1
+                continue
+            if got:
+                snippets = list(got)
+                break
+            empty += 1
+    finally:
+        for _, task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*(t for _, t in tasks), return_exceptions=True)
+
+    if not snippets:
+        if empty:
+            return _no_results(query, zh=zh)
         return _network_error(zh)
 
-    if len(snippets) < max_results:
-        try:
-            q = urllib.parse.quote_plus(query)
-            lite_html = (await _fetch_bytes(f"{_LITE_URL}?q={q}")).decode("utf-8", errors="replace")
-            for line in _snippets_from_lite(lite_html, max_results):
-                if line not in snippets:
-                    snippets.append(line)
-        except (OSError, urllib.error.URLError, UnicodeDecodeError):
-            if not snippets:
-                return _network_error(zh)
-
     snippets = snippets[:max_results]
-    if not snippets:
-        return _no_results(query, zh=zh)
-
     intro = f"关于「{query}」，" if zh else f"On '{query}', "
     body = "；".join(snippets) if zh else "; ".join(snippets)
     return intro + body + ("。" if zh else ".")

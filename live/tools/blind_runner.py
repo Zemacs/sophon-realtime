@@ -73,10 +73,20 @@ Modes
   gateway URL     NOT available: the GPT-Live gateway and the Realtime face take speech only (text items are ignored), so there is no text
                   turn interface to drive. ``--mode gateway`` exits with code 3 and says so.
 
-Exit codes: 0 done; 2 bad arguments, an unreadable or invalid input file (bad JSON / empty text / duplicate ids / bad history line: one line on
-stderr naming the line NUMBER, never its content), or an output that cannot be created (e.g. no such directory); 3 gateway mode;
+Exit codes: 0 done; 2 bad arguments, an unreadable or invalid input file (bad JSON / empty text / duplicate id / bad history line / not valid UTF-8,
+in the sentences, --instructions-file or --history-jsonl: one line on stderr naming the line NUMBER (and, for UTF-8, the byte offset), never its
+content and never an id's value), or an output that cannot be created (e.g. no such directory); 3 gateway mode;
 4 real mode refused; 5 output refused (exists / is the input); 6 the run finished but OUT.jsonl.done could not be created (it appeared during the run).
 A run that finished also writes ``OUT.jsonl.done`` (counts only); a run that was interrupted has none.
+
+What the runner can and cannot do with a sentence (Opaque)
+  Every sentence (and ``task``) is wrapped by ``read_sentences`` in ``Opaque``: not iterable, not comparable, not hashable, no ``len``/truth value/
+  string methods, not formattable/copyable/picklable, and not a ``str``. ``re.search(p, s)``, ``json.dumps(s)``, ``bytes(s)``, ``str.find(s, x)`` (unbound),
+  ``x in s``, ``s == x``, ``f"{s}"`` ... all raise ``TypeError``, C-level paths included, so a runner that tries them CRASHES instead of forking. The
+  only way out is ``reveal()``, called from ``_admit_request`` (the one place that builds the production ``AdmitRequest``); a test asserts that, and that
+  nothing touches the wrapper's slot.  Still relying on REVIEW: whatever happens to the revealed ``str`` inside ``_admit_request`` (3 lines), code that
+  gets the text some other way (re-reading the input file, a global), and code that calls ``reveal`` from the allowlisted function. Production code
+  receives a real ``str`` by design: what it does with it is exactly what is being tested.
 
 Privacy (what the runner guarantees, and the tests that pin it: ``tests/test_blind_runner.py::Privacy``)
   * sentence text is written to no place except the reply field of OUT.jsonl (the sentence itself is not even echoed there);
@@ -105,15 +115,56 @@ HISTORY_KEEP = 12          # the gateway keeps the last 12 (gateway.py)
 EXIT_BAD_ARGS, EXIT_GATEWAY, EXIT_REAL_REFUSED, EXIT_OUT_REFUSED, EXIT_DONE_FAILED = 2, 3, 4, 5, 6
 
 
+class Opaque:
+    """A sentence the runner can carry but not read. It is not iterable, not comparable, not hashable, has no ``len``/truth value/string methods,
+    cannot be formatted, copied or pickled, and is no ``str``: ``re.search``, ``json.dumps``, ``bytes()``, an unbound ``str.find(x, ...)``, ``in``,
+    ``==`` and every other way of looking inside raise ``TypeError`` (C-level paths included). The ONE way out is ``reveal``, which only
+    ``_admit_request`` may call (a test asserts it); production code then receives a real ``str``, as it must."""
+    __slots__ = ("_v",)
+
+    def __init__(self, v: str) -> None:
+        self._v = v
+
+    def _no(self, *a: Any, **k: Any):   # noqa: ANN002, ANN003
+        raise TypeError("a blind-test sentence is opaque to the runner")
+    __iter__ = __len__ = __bool__ = __contains__ = __getitem__ = __eq__ = __ne__ = __lt__ = __le__ = __gt__ = __ge__ = _no
+    __hash__ = __str__ = __format__ = __bytes__ = __reduce__ = __reduce_ex__ = __copy__ = __deepcopy__ = __add__ = __radd__ = __mod__ = __mul__ = _no
+    __int__ = __float__ = __index__ = __fspath__ = __getstate__ = _no
+
+    def __repr__(self) -> str:
+        return "<Opaque sentence>"                  # neutral: no content, not even the length
+
+
+def reveal(o: Opaque) -> str:
+    """The only unwrap. Called from ``_admit_request`` and nowhere else (tests/test_blind_runner.py::RunnerHoldsNoJudgment pins that)."""
+    if type(o) is not Opaque:
+        raise TypeError("reveal() takes an Opaque sentence")
+    return o._v
+
+
 class Sentence(NamedTuple):
     id: str
-    text: str
-    task: str | None = None
+    text: Opaque
+    task: Opaque | None = None
+
+
+def _utf8_or_exit(path: str, what: str) -> None:
+    """Refuse a file that is not valid UTF-8 with ONE line naming the position, never the content (the line number counts newline bytes)."""
+    with open(path, "rb") as fb:
+        data = fb.read()
+    try:
+        data.decode("utf-8-sig")
+    except UnicodeDecodeError as e:
+        line_no = data[:e.start].count(b"\n") + 1
+        raise SystemExit(f"{what} is not valid UTF-8 (line {line_no}, byte offset {e.start})")
 
 
 def read_sentences(path: str) -> list[Sentence]:
-    """[(id, text, task)]. A line that starts with ``{`` is JSON ({"id", "text", "task"}); anything else is a plain sentence."""
+    """[(id, text, task)], text and task wrapped in ``Opaque``. A line that starts with ``{`` is JSON ({"id", "text", "task"}); anything else is a
+    plain sentence."""
+    _utf8_or_exit(path, "input file")
     out: list[Sentence] = []
+    seen: set[str] = set()
     with open(path, encoding="utf-8-sig") as f:
         for n, line in enumerate(f, 1):
             line = line.strip()
@@ -128,17 +179,20 @@ def read_sentences(path: str) -> list[Sentence]:
                     sid = str(o["id"]) if o.get("id") is not None else f"s{len(out) + 1:04d}"
                 except (ValueError, KeyError, TypeError, AttributeError):
                     raise SystemExit(f"input line {n}: expected JSON with a non-empty string 'text' (optional string 'task')")   # never echo the line
-                out.append(Sentence(sid, text, task))
+                item = Sentence(sid, Opaque(text), Opaque(task) if task is not None else None)
             else:
-                out.append(Sentence(f"s{len(out) + 1:04d}", line, None))
-    ids = [s.id for s in out]
-    if len(set(ids)) != len(ids):
-        raise SystemExit("input ids are not unique")
+                sid = f"s{len(out) + 1:04d}"
+                item = Sentence(sid, Opaque(line), None)
+            if sid in seen:
+                raise SystemExit(f"input line {n}: id is not unique")            # the line number, never the id's value
+            seen.add(sid)
+            out.append(item)
     return out
 
 
 def read_history(path: str) -> list[dict[str, str]]:
     """``{"task": "...", "answer": "..."}`` per line, the shape the gateway keeps in ``orch_history``. Never echoed."""
+    _utf8_or_exit(path, "history file")
     out: list[dict[str, str]] = []
     with open(path, encoding="utf-8-sig") as f:
         for n, line in enumerate(f, 1):
@@ -261,7 +315,17 @@ def _control_via(res, jev_route: str | None, jev_control: str | None) -> str | N
     return "heuristic"                          # no usable target: heuristic_control ran and found nothing
 
 
-async def run_one(sid: str, text: str, *, ledger, jev, worker, language: str = "zh", mode: str = "fake", task: str | None = None,
+def _admit_request(sid: str, text: Opaque, task: Opaque | None, language: str, playback_active: bool):
+    """THE unwrap site: builds the production AdmitRequest from the opaque sentence (``task`` = the front's rewrite when the input gives one;
+    ``raw_text`` stays the original sentence). Nothing else in this file may call ``reveal``."""
+    from sophon_live import coordinator as C
+    raw = reveal(text)
+    delegate = raw if task is None else reveal(task)
+    return C.AdmitRequest(session_id="blind", utterance_id=sid, text=delegate, delegate_task=delegate, language=language,
+                          playback_active=playback_active, raw_text=raw)
+
+
+async def run_one(sid: str, text: Opaque, *, ledger, jev, worker, language: str = "zh", mode: str = "fake", task: Opaque | None = None,
                   instructions: str = "", history: list[dict[str, str]] | None = None, playback_active: bool = False,
                   fidelity: list[str] | None = None, history_sink: list[dict[str, str]] | None = None) -> dict[str, Any]:
     """Run one sentence; ALWAYS returns a row (on an error the fields obtained so far are kept, plus ``error``/``error_stage``)."""
@@ -298,9 +362,7 @@ async def run_one(sid: str, text: str, *, ledger, jev, worker, language: str = "
     for o, n, f in patches:
         setattr(o, n, f)
     try:
-        delegate = task if task is not None else text
-        res = await C.admit(C.AdmitRequest(session_id="blind", utterance_id=sid, text=delegate, delegate_task=delegate, language=language,
-                                           playback_active=playback_active, raw_text=text), ledger)
+        res = await C.admit(_admit_request(sid, text, task, language, playback_active), ledger)
         use_jev = bool(api.USE_JEV)
         row["jev_route"], row["jev_control"] = rec.route, rec.control
         row["route"], row["via"] = res.route, res.via
@@ -442,6 +504,7 @@ def main(argv: list[str] | None = None) -> int:
         sents = read_sentences(a.sentences)
         instructions = ""
         if a.instructions_file:
+            _utf8_or_exit(a.instructions_file, "instructions file")
             with open(a.instructions_file, encoding="utf-8-sig") as fh:
                 instructions = fh.read()
         history = read_history(a.history_jsonl) if a.history_jsonl else []

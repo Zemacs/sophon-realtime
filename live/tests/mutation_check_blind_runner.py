@@ -70,9 +70,9 @@ M = [
  ("R2a history not passed to the worker", "history=list((history or [])[-HISTORY_TURNS:])", "history=[]"),
  ("R2b instructions not passed to the worker", "instructions=instructions, history=list(", 'instructions="", history=list('),
  ("R2c more than the last 6 turns", "HISTORY_TURNS = 6", "HISTORY_TURNS = 12"),
- ("R2d the rewritten task ignored", "delegate = task if task is not None else text", "delegate = text"),
- ("R2e raw_text is the rewrite", "raw_text=text), ledger)", "raw_text=delegate), ledger)"),
- ("R2f playback_active not passed", "playback_active=playback_active, raw_text", "playback_active=False, raw_text"),
+ ("R2d the rewritten task ignored", "delegate = raw if task is None else reveal(task)", "delegate = raw"),
+ ("R2e raw_text is the rewrite", "playback_active=playback_active, raw_text=raw)", "playback_active=playback_active, raw_text=delegate)"),
+ ("R2f playback_active not passed", "playback_active=playback_active, raw_text=raw)", "playback_active=False, raw_text=raw)"),
  ("R2g history never accumulates with --shared-ledger", "            history_sink.append(", "            (lambda *_: None)("),
  ("R2i fidelity codes dropped", '"no_asr_transcript"]\n    codes.append("rewrite_from_input"', '"x"]\n    codes.append("rewrite_from_input"'),
  ("S1a playback_active value not recorded", 'str(bool(playback_active)).lower()', '"false"'),
@@ -94,7 +94,7 @@ M = [
  # --- S-2 input handling ----------------------------------------------------------------------------------------------------------
  ("S2a BOM not skipped", 'with open(path, encoding="utf-8-sig") as f:\n        for n, line in enumerate(f, 1):\n            line = line.strip()', 'with open(path, encoding="utf-8") as f:\n        for n, line in enumerate(f, 1):\n            line = line.strip()'),
  ("S2b text may be null/non-string", "if not isinstance(text, str) or not text.strip() or", "if False or"),
- ("S2c ids number file lines", "out.append(Sentence(f\"s{len(out) + 1:04d}\", line, None))", "out.append(Sentence(f\"s{n:04d}\", line, None))"),
+ ("S2c ids number file lines", 'sid = f"s{len(out) + 1:04d}"\n                item = Sentence(sid, Opaque(line), None)', 'sid = f"s{n:04d}"\n                item = Sentence(sid, Opaque(line), None)'),
  ("S2d --fake-route not validated", "if a.fake_route not in ROUTE_CRITERIA:", "if False:"),
  ("S2e history lines not validated", "if not isinstance(o, dict) or not isinstance(o.get(\"task\", \"\"), str) or not isinstance(o.get(\"answer\", \"\"), str):", "if False:"),
  # --- S-3 the no-judgment guard sees what it should --------------------------------------------------------------------------------
@@ -136,6 +136,30 @@ M = [
  ("H6 sys.modules['re'].search changes required_tools (C-level: only the metamorphic test sees it)", WRITE, "                if sys.modules['re'].search('a', s.text): row['required_tools'] = []\n" + WRITE),
  # --- S-2' invalid input exits 2 ------------------------------------------------------------------------------------------------------
  ("S2'a invalid input JSON is not mapped to exit 2", "        if isinstance(e.code, str):\n            print(\"blind_runner: \" + e.code, file=sys.stderr)\n            return EXIT_BAD_ARGS\n", "        if False:\n            return EXIT_BAD_ARGS\n"),
+ # --- I-1'' the sentence is Opaque: Critic's surviving bypasses (and G3/G7) now crash or are caught, none can run ---------------------------------
+ ("J3 sys.modules['re'].search on a multi-char word changes required_tools", WRITE, "                if sys.modules['re'].search('qzxw', s.text): row['required_tools'] = []\n" + WRITE),
+ ("J5 json.dumps(sentence) alias compare changes via", WRITE, "                d_ = json.dumps(s.text)\n                if 'qzxw' in d_: row['via'] = 'guard'\n" + WRITE),
+ ("J6 bytes(sentence) alias compare changes via", WRITE, "                b_ = bytes(s.text, 'utf-8')\n                if b'qzxw' in b_: row['via'] = 'guard'\n" + WRITE),
+ ("J9 module-level helper with unbound str.startswith changes via", WRITE, "                if _h(s.text): row['via'] = 'guard'\n" + WRITE),
+ ("G3 unbound str.find(s.text, 'x') (no output effect)", WRITE, "                _ = str.find(s.text, 'x')\n" + WRITE),
+ ("G7 sys.modules['re'].search (no output effect)", WRITE, "                _ = sys.modules['re'].search('x', s.text)\n" + WRITE),
+ ("K1 reaching into the wrapper's slot", WRITE, "                if s.text._v.startswith('qzxw'): row['via'] = 'guard'\n" + WRITE),
+ ("K2 reveal() called outside _admit_request (no effect)", WRITE, "                _ = reveal(s.text)\n" + WRITE),
+ ("K3 the wrapper is iterable again", "    __iter__ = __len__ = __bool__", "    __len__ = __bool__"),
+ ("K4 the wrapper can be compared again", "__getitem__ = __eq__ = __ne__", "__getitem__ = __ne__"),
+ ("K5 str(wrapper) works again", "    __hash__ = __str__ = __format__", "    __hash__ = __format__"),
+ ("K6 the wrapper's repr leaks the content", 'return "<Opaque sentence>"', 'return f"<Opaque {self._v}>"'),
+ ("K7 reveal accepts anything", "    if type(o) is not Opaque:\n        raise TypeError(\"reveal() takes an Opaque sentence\")\n", ""),
+ ("K8 the reader does not wrap a plain line", "item = Sentence(sid, Opaque(line), None)", "item = Sentence(sid, line, None)"),
+ ("K9 the reader does not wrap a JSON text", "item = Sentence(sid, Opaque(text),", "item = Sentence(sid, text,"),
+ ("U1 an invalid UTF-8 input file is not checked", '    _utf8_or_exit(path, "input file")\n', "    pass\n"),
+ ("U2 an invalid UTF-8 history file is not checked", '    _utf8_or_exit(path, "history file")\n', "    pass\n"),
+ ("U3 an invalid UTF-8 instructions file is not checked", '            _utf8_or_exit(a.instructions_file, "instructions file")\n', "            pass\n"),
+ ("U4 the UTF-8 message line number is off by one", "count(b\"\\n\") + 1", "count(b\"\\n\")"),
+ ("U5 the UTF-8 message names no byte offset", ", byte offset {e.start})", ")"),
+ ("D1 duplicate ids are not detected", "            if sid in seen:\n", "            if False:\n"),
+ ("D2 the duplicate-id message has no line number", 'raise SystemExit(f"input line {n}: id is not unique")', 'raise SystemExit("input ids are not unique")'),
+ ("D3 the duplicate-id message echoes the id", 'raise SystemExit(f"input line {n}: id is not unique")', 'raise SystemExit(f"input line {n}: id {sid} is not unique")'),
 ]
 # Mutants that are equivalent to the unmutated runner BY CONSTRUCTION (the tests cannot, and must not, see them). They must survive.
 EQUIVALENT = [
@@ -144,13 +168,15 @@ EQUIVALENT = [
 # G2 / H5 need the helper that Critic's bypass used (a renamed parameter)
 ANCHOR = "\nALLOW_REAL_ENV"
 HELPER_G2 = "\nasync def _chk(q):\n    return q.startswith('x')\n"
+HELPER_J9 = "\n_h = lambda q: str.startswith(q, 'qzxw')\n"
 HELPER_H5 = "\nasync def _chk(q):\n    return q.startswith('a')\n"
 # M14 needs the weaker seal to be observable (see the module docstring)
 COMBO = {"M14w ERROR-level log of the sentence in the error branch (with the seal at WARNING)": ("    logging.disable(logging.CRITICAL)\n", "    logging.disable(logging.WARNING)\n")}
 # M9b needs the warning itself
 EXTRA = {"M9b warnings not ignored and warn(sentence)": (WRITE, "                warnings.warn(s.text)\n" + WRITE),
          "G2 async helper(q).startswith, no output effect (probe)": (ANCHOR, HELPER_G2 + ANCHOR),
-         "H5 async helper(q) changes via": (ANCHOR, HELPER_H5 + ANCHOR)}
+         "H5 async helper(q) changes via": (ANCHOR, HELPER_H5 + ANCHOR),
+         "J9 module-level helper with unbound str.startswith changes via": (ANCHOR, HELPER_J9 + ANCHOR)}
 
 
 WORK = tempfile.mkdtemp(prefix="blind_runner_mut_")      # the cwd of every pytest run; deleted at the end

@@ -73,7 +73,9 @@ class _Base(unittest.TestCase):
         api.USE_JEV = use_jev
         try:
             with br.quiet_and_sealed(False):
-                return asyncio.run(br.run_one(kw.pop("sid", "x"), text, ledger=ledger or C.Ledger(), jev=jev, worker=worker or br._fake_worker, **kw))
+                task = kw.pop("task", None)
+                return asyncio.run(br.run_one(kw.pop("sid", "x"), br.Opaque(text), ledger=ledger or C.Ledger(), jev=jev, worker=worker or br._fake_worker,
+                                              task=br.Opaque(task) if task is not None else None, **kw))
         finally:
             api.USE_JEV = prev
 
@@ -361,7 +363,7 @@ class Behaviour(_Base):
         from sophon_live import coordinator as C
         async def go():
             for k in range(3):
-                await br.run_one(f"s{k}", f"句{k}", ledger=C.Ledger(), jev=_jev_answering("WORKER"), worker=br._fake_worker, history=sink, history_sink=sink)
+                await br.run_one(f"s{k}", br.Opaque(f"句{k}"), ledger=C.Ledger(), jev=_jev_answering("WORKER"), worker=br._fake_worker, history=sink, history_sink=sink)
         with br.quiet_and_sealed(False):
             asyncio.run(go())
         self.assertEqual(len(sink), 12)
@@ -553,7 +555,7 @@ class Behaviour(_Base):
         orig_run_one = br.run_one
         async def run_one(sid, text, **kw):   # noqa: ANN001
             row = await orig_run_one(sid, text, **kw)
-            if "x" in text:                                            # a planted judgment (in the TEST, never in the runner)
+            if "x" in br.reveal(text):                                 # a planted judgment (in the TEST, never in the runner)
                 row["handled_by"] = "fast"
             return row
         with mock.patch.object(br, "run_one", run_one):
@@ -604,7 +606,8 @@ class Behaviour(_Base):
         async def fake_jev_failing(route):   # noqa: ANN001, ARG001
             return _jev_raising(RuntimeError("down"))
         async def go(route, shared, worker, jev_factory=None):
-            sents = [br.Sentence("a", T("今天天气怎么样 zq"), None), br.Sentence("b", T("好的谢谢"), T("改写后的任务")), br.Sentence("c", T("取消吧"), None)]
+            sents = [br.Sentence("a", br.Opaque(T("今天天气怎么样 zq")), None), br.Sentence("b", br.Opaque(T("好的谢谢")), br.Opaque(T("改写后的任务"))),
+                     br.Sentence("c", br.Opaque(T("取消吧")), None)]
             with tempfile.TemporaryDirectory() as d:
                 with mock.patch.object(br, "_fake_worker", worker):
                     if jev_factory is not None:
@@ -624,7 +627,7 @@ class Behaviour(_Base):
         with tempfile.TemporaryDirectory() as d:
             bom = os.path.join(d, "bom.jsonl")
             open(bom, "w", encoding="utf-8-sig").write(json.dumps({"id": "b", "text": "ZQXV7731"}) + "\n")
-            self.assertEqual([(s.id, s.text) for s in br.read_sentences(bom)], [("b", "ZQXV7731")])           # parsed as JSON, not taken as a sentence
+            self.assertEqual([(s.id, br.reveal(s.text)) for s in br.read_sentences(bom)], [("b", "ZQXV7731")])           # parsed as JSON, not taken as a sentence
             for bad in ({"id": "a", "text": None}, {"id": "a", "text": ""}, {"id": "a", "text": "  "}, {"id": "a", "text": 5}, {"id": "a"},
                         {"id": "a", "text": "ZQXV7731", "task": 7}, {"id": "a", "text": "ZQXV7731", "task": ""}):
                 p = _write(d, [json.dumps(bad)], "bad.jsonl")
@@ -664,6 +667,45 @@ class Behaviour(_Base):
             with mock.patch("sys.stderr", se):
                 self.assertEqual(br.main([_write(d, ["ok"], "okin.txt"), os.path.join(d, "o10.jsonl"), "--history-jsonl", h]), 2)
             self.assertNotIn("ZQXV7731", se.getvalue()); self.assertEqual(len(se.getvalue().strip().splitlines()), 1)
+
+    def test_a_file_that_is_not_utf8_exits_2_with_one_line_naming_the_position_for_all_three_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            def bad(name: str, before: bytes) -> str:
+                path = os.path.join(d, name)
+                open(path, "wb").write(before + b"\xff\xfe tail\n")
+                return path
+            ok = _write(d, ["fine"], "ok.txt")
+            def case(name, what, prefix, line_no, argv_fn):
+                return name, (argv_fn(bad(name.replace(" ", "_") + ".bin", prefix)), what, line_no, len(prefix))
+            cases = dict([
+                case("input", "input file", b"", 1, lambda f: [f, os.path.join(d, "o1.jsonl")]),
+                case("input line 3", "input file", b"ZQXV7731 fine\nsecond\n", 3, lambda f: [f, os.path.join(d, "o2.jsonl")]),
+                case("instructions", "instructions file", b"SYSZQXV7731 ", 1, lambda f: [ok, os.path.join(d, "o3.jsonl"), "--instructions-file", f]),
+                case("history", "history file", b'{"task": "a", "answer": "ZQXV7731"}\n', 2, lambda f: [ok, os.path.join(d, "o4.jsonl"), "--history-jsonl", f]),
+            ])
+            for name, (argv, what, line_no, offset) in cases.items():
+                se = io.StringIO()
+                with mock.patch("sys.stderr", se):
+                    self.assertEqual(br.main(argv), 2, name)
+                err = se.getvalue()
+                self.assertEqual(err.strip(), f"blind_runner: {what} is not valid UTF-8 (line {line_no}, byte offset {offset})", name)
+                self.assertNotIn("Traceback", err); self.assertNotIn("ZQXV7731", err)
+                self.assertFalse(os.path.exists(argv[1]) or os.path.exists(argv[1] + ".done"), name)
+
+    def test_a_duplicate_id_is_reported_with_its_line_number_never_its_value(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            inp = _write(d, [json.dumps({"id": "SECRETID77", "text": "a"}), "", json.dumps({"id": "b", "text": "c"}), json.dumps({"id": "SECRETID77", "text": "z"})], "dup.jsonl")
+            with self.assertRaises(SystemExit) as cm:
+                br.read_sentences(inp)
+            self.assertEqual(str(cm.exception), "input line 4: id is not unique")
+            se = io.StringIO()
+            with mock.patch("sys.stderr", se):
+                self.assertEqual(br.main([inp, os.path.join(d, "o.jsonl")]), 2)
+            self.assertEqual(se.getvalue().strip(), "blind_runner: input line 4: id is not unique")
+            clash = _write(d, ["plain one", json.dumps({"id": "s0001", "text": "x"})], "clash.jsonl")        # a manual id that collides with an automatic one
+            with self.assertRaises(SystemExit) as cm:
+                br.read_sentences(clash)
+            self.assertEqual(str(cm.exception), "input line 2: id is not unique")
 
     def test_duplicate_ids_and_bad_json_are_refused_without_echoing_the_line(self) -> None:
         with tempfile.TemporaryDirectory() as d:
@@ -876,6 +918,66 @@ class Privacy(_Base):
                 self.assertEqual(str(memory._memory_path()), mine)               # restored
 
 
+class OpaqueSentence(unittest.TestCase):
+    """I-1'': the runner carries each sentence as an Opaque object; every way of looking inside it raises TypeError (C-level paths included)."""
+
+    def test_every_way_of_looking_inside_raises_type_error(self) -> None:
+        import copy
+        import operator
+        import pickle
+        o = br.Opaque("qzxw 天气 SECRETOPAQUE")
+        other = br.Opaque("x")
+        probes = {
+            "re.search": lambda: re.search("qzxw", o), "re.match": lambda: re.match("q", o), "re.compile.search": lambda: re.compile("q").search(o),
+            "json.dumps": lambda: json.dumps(o), "json.dumps(list)": lambda: json.dumps([o]), "bytes()": lambda: bytes(o), "bytes(o, enc)": lambda: bytes(o, "utf-8"),
+            "str()": lambda: str(o), "format": lambda: format(o), "f-string": lambda: f"{o}", "%": lambda: "%s" % o, "str.format": lambda: "{}".format(o),
+            "unbound str.find": lambda: str.find(o, "x"), "unbound str.startswith": lambda: str.startswith(o, "q"), "unbound str.__contains__": lambda: str.__contains__(o, "q"),
+            "in": lambda: "q" in o, "operator.contains": lambda: operator.contains(o, "q"), "iter": lambda: iter(o), "for": lambda: [c for c in o], "list()": lambda: list(o),
+            "len": lambda: len(o), "bool": lambda: bool(o), "not": lambda: not o, "if": lambda: 1 if o else 2, "index": lambda: o[0], "slice": lambda: o[:3],
+            "==": lambda: o == "x", "== opaque": lambda: o == other, "!=": lambda: o != "x", "<": lambda: o < "x", ">=": lambda: o >= other, "hash": lambda: hash(o),
+            "dict key": lambda: {o: 1}, "set": lambda: {o}, "list.index": lambda: [o].index(other), "x in list": lambda: "x" in [o], "+": lambda: o + "x", "radd": lambda: "x" + o,
+            "*": lambda: o * 2, "int": lambda: int(o), "float": lambda: float(o), "operator.index": lambda: operator.index(o), "os.fspath": lambda: os.fspath(o),
+            "copy": lambda: copy.copy(o), "deepcopy": lambda: copy.deepcopy(o), "pickle": lambda: pickle.dumps(o), "sorted": lambda: sorted([o, other]),
+            "max": lambda: max(o, other), "str.join": lambda: "".join([o]), "sep.join": lambda: ",".join(o), "print": lambda: print(o, file=io.StringIO()),
+            "open": lambda: open(o), "encode": lambda: o.encode(), "find": lambda: o.find("q"), "startswith": lambda: o.startswith("q"), "split": lambda: o.split(),
+            "__dict__": lambda: o.__dict__, "vars": lambda: vars(o), "setattr": lambda: setattr(o, "extra", 1),
+        }
+        for name, fn in probes.items():
+            with self.assertRaises((TypeError, AttributeError), msg=name):
+                fn()
+        for name, fn in probes.items():                                       # not merely "raises something": the sentence is never in the error text either
+            try:
+                fn()
+            except (TypeError, AttributeError, ValueError) as e:
+                self.assertNotIn("SECRETOPAQUE", str(e), name)
+
+    def test_repr_is_neutral_and_reveal_is_the_one_way_out_and_only_for_an_opaque(self) -> None:
+        o = br.Opaque("SECRETOPAQUE abc")
+        self.assertEqual(repr(o), "<Opaque sentence>")
+        self.assertEqual(repr(br.Opaque("x")), repr(br.Opaque("a much longer sentence")))          # not even the length
+        self.assertEqual(br.reveal(o), "SECRETOPAQUE abc")
+        for bad in ("a plain str", None, 3, ["x"]):
+            with self.assertRaises(TypeError):
+                br.reveal(bad)  # type: ignore[arg-type]
+
+    def test_the_reader_wraps_every_sentence_and_the_runner_hands_production_a_real_str(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            inp = _write(d, ["plain", json.dumps({"id": "j", "text": "json one", "task": "a rewrite"})])
+            sents = br.read_sentences(inp)
+        self.assertTrue(all(type(s.text) is br.Opaque for s in sents))
+        self.assertTrue(type(sents[1].task) is br.Opaque and sents[0].task is None)
+        got: list = []
+        from sophon_live.coordinator import api
+        real_admit = api.admit
+        async def spy(req, ledger):   # noqa: ANN001
+            got.append((type(req.text), type(req.delegate_task), type(req.raw_text)))
+            return await real_admit(req, ledger)
+        with mock.patch.object(api, "admit", spy), mock.patch("sophon_live.coordinator.admit", spy):
+            with tempfile.TemporaryDirectory() as d:
+                self.assertEqual(br.main([_write(d, ["plain"]), os.path.join(d, "o.jsonl")]), 0)
+        self.assertEqual(got, [(str, str, str)])
+
+
 class RunnerHoldsNoJudgment(unittest.TestCase):
     """A self-check guard, NOT a security boundary: it stops the obvious ways of putting a rule about the sentence into the runner."""
     SRC = (LIVE / "tools" / "blind_runner.py").read_text(encoding="utf-8")
@@ -910,6 +1012,29 @@ class RunnerHoldsNoJudgment(unittest.TestCase):
                     self.assertIn((fn.name, n.attr), {("run", "id"), ("run", "text"), ("run", "task")}, f"{fn.name}: method/attribute use on a sentence variable")
                 if isinstance(n, ast.Subscript) and isinstance(n.value, ast.Name):
                     self.assertNotIn(n.value.id, self.SENTENCE_NAMES, f"{fn.name}: indexing a sentence variable")
+
+    def test_reveal_is_called_from_exactly_one_function_and_nothing_reaches_into_the_wrapper(self) -> None:
+        tree = self.TREE
+        funcs = {n.name: n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        def inside(node: ast.AST, fn: ast.AST) -> bool:
+            return any(x is node for x in ast.walk(fn))
+        opaque_init = [n for c in ast.walk(tree) if isinstance(c, ast.ClassDef) and c.name == "Opaque" for n in c.body if isinstance(n, ast.FunctionDef) and n.name == "__init__"][0]
+        calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "reveal"]
+        self.assertTrue(calls)
+        for c in calls:
+            self.assertTrue(inside(c, funcs["_admit_request"]), f"reveal() called outside _admit_request at line {c.lineno}")
+        names = [n for n in ast.walk(tree) if isinstance(n, ast.Name) and n.id == "reveal"]
+        self.assertEqual(len(names), len(calls), "reveal is referenced other than by a direct call (an alias)")
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Attribute) and n.attr == "_v":
+                self.assertTrue(inside(n, funcs["reveal"]) or inside(n, opaque_init), f"the wrapper's slot is touched at line {n.lineno}")
+        for n in ast.walk(tree):                      # reflection on a sentence (the patching code's getattr(module, name) is fine)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in ("getattr", "setattr", "delattr", "vars", "object", "type"):
+                for arg in n.args:
+                    for x in ast.walk(arg):
+                        self.assertFalse(isinstance(x, ast.Name) and x.id in self.SENTENCE_NAMES, f"reflection on a sentence variable at line {n.lineno}")
+                        self.assertFalse(isinstance(x, ast.Attribute) and x.attr in ("text", "task"), f"reflection on a sentence field at line {n.lineno}")
+        self.assertEqual(len([n for n in ast.walk(tree) if isinstance(n, ast.Constant) and n.value == "_v"]), 1)         # only Opaque's ``__slots__ = ("_v",)``
 
     def test_the_guard_is_not_vacuous_it_sees_a_planted_comparison_and_a_from_import(self) -> None:
         planted = ast.parse("from re import search\ndef f(text):\n    return 'x' in text\n")

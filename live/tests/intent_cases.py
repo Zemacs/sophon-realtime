@@ -70,3 +70,11 @@ HELDOUT_FREE = (
     "航班上能带充电宝吗", "火车上怎么睡觉比较舒服", "我想学英语怎么提高", "现在我想听歌", "今天的作业怎么写", "谁是你的创造者",
     "帮我算一下100乘以3", "基金经理是做什么的",
 )
+
+# I-9 acceptance: 「换算」 excludes unit conversion but not currency conversion (found while checking: the first I-9 version vetoed both).
+CONVERSION_REALTIME = (
+    "把一百美元换算成人民币", "帮我把100欧元换算成日元", "现在一百美元换算成人民币是多少", "一万日元折合多少人民币", "美元怎么换算成人民币",
+)
+CONVERSION_FREE = (
+    "一公里换算成米", "一斤折合多少克", "一英里等于多少公里", "摄氏度怎么换算成华氏度",
+)

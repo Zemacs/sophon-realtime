@@ -41,7 +41,10 @@ _EN = (r"exchange rate|stock price|share price|box office|live score|market (?:i
        r"how much is [^.?!]{0,20}(?:bitcoin|btc|dollar|euro|yen|pound|gold|oil|tesla|nvidia|stock|share)")
 _REALTIME_RE = re.compile("|".join((_ASSET_QUOTE, _PRICE_NOUN, _CHARTS, rf"(?:{_SPORT_NOW})(?=.*(?:{_SPORT_ASK}))", _OUTCOME_NOW, _EVENT, _TRANSPORT, _OFFICE, _FRESH, _EN)), re.I)
 # an explanatory / definitional / how-to sentence is knowledge, not a lookup, even when it carries a topic word
-_STRONG_VETO = re.compile(r"什么意思|什么是|有什么(?:区别|不同|风险|影响)|区别|的历史|原理|由来|换算成|stand for|哪一年|多久[办开]|多长时间|怎么(?:换算|统计|排)")
+_STRONG_VETO = re.compile(r"什么意思|什么是|有什么(?:区别|不同|风险|影响)|区别|的历史|原理|由来|stand for|哪一年|多久[办开]|多长时间|怎么(?:统计|排)")
+# unit conversion (厘米→英寸, 斤→克) is arithmetic, not a lookup; the same words with a currency / metal / coin ARE (一百美元换算成人民币)
+_UNIT_CONVERT = re.compile(r"换算|折合|等于多少")
+_MONEYISH = re.compile(r"美元|美金|欧元|日元|英镑|港币|港元|澳元|加元|韩元|卢布|人民币|比特币|以太坊|狗狗币|BTC|ETH|USDT|黄金|白银")
 # ...softer ones are cancelled by a "now" word ("为什么今天A股跌这么多" is still a lookup)
 _WEAK_VETO = re.compile(r"为什么|如何|怎么(?!样)|是怎么|怎样(?!了)")
 _NOW = re.compile(_TIME)
@@ -51,7 +54,10 @@ def is_realtime_fact(text: str) -> bool:
     t = (text or "").strip()
     if not t or not _REALTIME_RE.search(t) or _STRONG_VETO.search(t):
         return False
-    return not (_WEAK_VETO.search(t) and not _NOW.search(t))
+    if _UNIT_CONVERT.search(t) and not _MONEYISH.search(t):
+        return False
+    currency_conversion = bool(_UNIT_CONVERT.search(t) and _MONEYISH.search(t))     # 「美元怎么换算成人民币」 wants today's rate
+    return not (_WEAK_VETO.search(t) and not _NOW.search(t) and not currency_conversion)
 
 
 # (tool name, pattern) in priority order; the first matching pattern wins for the *primary* tool.

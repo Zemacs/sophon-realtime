@@ -5,7 +5,7 @@ Two error kinds, with different tolerance:
   * a knowledge / chit-chat question routed to web_search costs a lookup (latency, outbound requests, a spoken lead-in): a small
     rate is tolerated, not a large one. Round 4b's first I-8 version over-triggered on 15/15 of Critic's probes (100%) and 21/44
     (48%) of the harder set written for I-9.
-Numbers at the commit that added this gate: realtime 95/95 routed, free 98/98 clean (0.0% over-trigger). The gate allows <= 3%.
+Numbers now: realtime 100/100 routed, free 102/102 clean (101 scored: 1 weather-keyword case excluded) (0.0% over-trigger). The gate allows <= 3%.
 The set sizes are asserted too, so the gate cannot be passed by shrinking the sets.
 """
 from __future__ import annotations
@@ -24,6 +24,8 @@ from tests import intent_cases as c
 # 「今天天气好适合打球」 is routed to get_weather by the long-standing weather keyword (not a realtime-fact decision, not web_search).
 OUT_OF_SCOPE_FREE = {"今天天气好适合打球"}
 MAX_OVER_TRIGGER_RATE = 0.03
+POS = c.REALTIME + c.HELDOUT_REALTIME + c.CONVERSION_REALTIME
+NEG = c.FREE + c.HELDOUT_FREE + c.CONVERSION_FREE
 
 
 def _routes_to_search(text: str) -> bool:
@@ -32,19 +34,19 @@ def _routes_to_search(text: str) -> bool:
 
 class IntentGate(unittest.TestCase):
     def test_label_sets_are_not_shrunk(self) -> None:
-        self.assertGreaterEqual(len(c.REALTIME) + len(c.HELDOUT_REALTIME), 95)
-        self.assertGreaterEqual(len(c.FREE) + len(c.HELDOUT_FREE), 98)
+        self.assertGreaterEqual(len(POS), 100)
+        self.assertGreaterEqual(len(NEG), 102)
         self.assertEqual((len(c.OFFICIAL_REALTIME), len(c.OFFICIAL_FREE), len(c.CRITIC_REALTIME), len(c.CRITIC_FREE)), (29, 19, 12, 15))
-        everything = c.REALTIME + c.HELDOUT_REALTIME + c.FREE + c.HELDOUT_FREE
+        everything = POS + NEG
         self.assertEqual(len(everything), len(set(everything)), "a question is labeled twice")
 
     def test_no_realtime_question_is_missed(self) -> None:
-        pos = c.REALTIME + c.HELDOUT_REALTIME
+        pos = POS
         missed = [t for t in pos if intent.required_tools(t)[:1] != ["web_search"]]
         self.assertEqual(missed, [], f"{len(missed)}/{len(pos)} realtime questions not routed to web_search")
 
     def test_over_trigger_rate_stays_under_the_gate(self) -> None:
-        neg = [t for t in c.FREE + c.HELDOUT_FREE if t not in OUT_OF_SCOPE_FREE]
+        neg = [t for t in NEG if t not in OUT_OF_SCOPE_FREE]
         over = [t for t in neg if _routes_to_search(t)]
         rate = len(over) / len(neg)
         self.assertLessEqual(rate, MAX_OVER_TRIGGER_RATE, f"{len(over)}/{len(neg)} = {rate:.1%} over-triggered: {over}")
@@ -62,6 +64,23 @@ class IntentGate(unittest.TestCase):
         self.assertTrue(_routes_to_search("为什么今天油价涨了"))
         self.assertFalse(_routes_to_search("汇率是什么意思"))
         self.assertTrue(_routes_to_search("今天汇率是多少"))
+
+    def test_conversion_words_exclude_unit_conversion_but_not_currency(self) -> None:
+        """Critic I-9 acceptance: 「换算」 must not turn unit conversion into a lookup; currency conversion still is one."""
+        for t in c.CONVERSION_FREE:
+            self.assertEqual(intent.required_tools(t), [], t)
+        for t in c.CONVERSION_REALTIME:
+            self.assertEqual(intent.required_tools(t)[:1], ["web_search"], t)
+
+    def test_acceptance_critics_15_free_and_12_realtime(self) -> None:
+        """The two numbers the acceptance is stated in: the 15 over-triggered probes no longer go online, the 12 extra realtime phrasings 0 misses."""
+        self.assertEqual((len(c.CRITIC_FREE), len(c.CRITIC_REALTIME)), (15, 12))
+        self.assertEqual([t for t in c.CRITIC_FREE if intent.required_tools(t)], [])
+        self.assertEqual([t for t in c.CRITIC_REALTIME if intent.required_tools(t)[:1] != ["web_search"]], [])
+        for t in ("地震", "地震是怎么形成的"):
+            self.assertEqual(intent.required_tools(t), [], t)                              # topic alone: no
+        self.assertEqual(intent.required_tools("刚才地震了吗")[:1], ["web_search"])          # happening now: yes
+        self.assertEqual(intent.required_tools("今天是谁的生日"), [])
 
     def test_explicit_search_requests_still_search(self) -> None:
         for t in ("帮我搜索一下地震是怎么形成的", "搜一下NBA是什么意思", "google 一下光速"):

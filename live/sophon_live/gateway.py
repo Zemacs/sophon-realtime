@@ -112,6 +112,8 @@ UPDATE_FMT = {
 ASK_PREFIX = {"zh": "（这是要向用户追问的问题，请直接把这个问题问出口，不要改成陈述句）", "en": "(This is a question to ask the user: ask it out loud, do not turn it into a statement) "}
 UPDATE_PARTS = {"zh": ("要转达给用户的内容：", "后端的进度 / 思考（不用照读）：", "（还没有新内容）"),
                 "en": ("Content to pass on to the user: ", "Backend progress / thinking (don't read it out): ", "(nothing new yet)")}
+PAD_GRACE_S = float(os.environ.get("SOPHON_LIVE_PAD_GRACE", "0.8"))            # Coordinator pad (SpeakPlan kind=pad): posted this long after a worker starts, if the answer is not in yet
+PAD_FRONT_QUIET_S = float(os.environ.get("SOPHON_LIVE_PAD_FRONT_QUIET", "4.0"))  # ...and the voice front has not just spoken its own lead-in (it was heard within this window)
 RESULT_MIN_CHARS = int(os.environ.get("SOPHON_LIVE_RESULT_MIN_CHARS", "15"))    # shorter commentary = a progress line
 PROGRESS_AFTER_S = float(os.environ.get("SOPHON_LIVE_PROGRESS_AFTER", "5.0"))  # speak held progress once if no result by then
 RESULT_MERGE_S = float(os.environ.get("SOPHON_LIVE_RESULT_MERGE", "1.6"))     # multi-stage backends: merge result pieces arriving this close together
@@ -319,8 +321,20 @@ class LiveSession:
             return
         await self._post_update(did, chunks)
 
-    async def _post_update(self, did: str, chunks: list) -> None:
+    async def _post_update(self, did: str, chunks: list, *, pad: bool = False) -> bool:
         d = self.deleg[did]
+        # One delegation posts one update at a time, in order. A pad takes its turn only while no result has been handed
+        # over and it has not been cancelled; checked HERE, under the lock, right before the engine call (Critic I-6), so a
+        # Worker that finishes while the pad waits or posts can never put the pad behind the result.
+        async with d.setdefault("post_lock", asyncio.Lock()):
+            if pad and (d.get("said_result") or d.get("pad_cancelled")):
+                return False
+            await self._post_update_locked(did, d, chunks, pad=pad)
+            if pad:
+                d["pad_sent"] = True
+            return True
+
+    async def _post_update_locked(self, did: str, d: dict, chunks: list, *, pad: bool) -> None:
         if d.get("idle_timer") is not None:
             d["idle_timer"].cancel(); d["idle_timer"] = None
         pc, pt, pn = UPDATE_PARTS[self.lang]
@@ -332,9 +346,9 @@ class LiveSession:
         out = UPDATE_FMT[self.lang].format(t=time.monotonic() - d["t0"], gap=gap_s, body=body, last=(self.last_said or "")[-80:])
         d["posted_any"] = True
         ok = await self.engine.tool_result(d["call_id"], out, speak=True)
-        if ok:
-            self._delivery_armed(did)
-        log.info("delegation %s -> update posted ok=%s (%d commentary chars, %d thinking chars)", did, ok, len(com), len(thk))
+        if ok and not pad:
+            self._delivery_armed(did)          # a pad is not the result: no receipt is armed and the trace's "posted" stays for the answer
+        log.info("delegation %s -> %s posted ok=%s (%d commentary chars, %d thinking chars)", did, "pad" if pad else "update", ok, len(com), len(thk))
 
     async def _idle_update(self, did: str) -> None:
         d = self.deleg.get(did)
@@ -622,8 +636,10 @@ class LiveSession:
         d = self.deleg.get(did)
         if d is None or getattr(self, "engine", None) is None:
             return
+        self._cancel_pad(d)
         try:
-            await self.engine.tool_result(d["call_id"], note, speak=False)
+            async with d.setdefault("post_lock", asyncio.Lock()):      # after any pad already on its way
+                await self.engine.tool_result(d["call_id"], note, speak=False)
         except Exception as e:  # noqa: BLE001
             log.warning("session %s ack delegation %s failed: %s", self.id, did, e)
         self._trace().silent(did)
@@ -632,6 +648,8 @@ class LiveSession:
         d = self.deleg.get(did)
         if d is None:
             return
+        d["said_result"] = True
+        self._cancel_pad(d)                          # the real thing is here: a filler would only delay it
         if ask:                                      # a C-layer question: the front must voice the question itself, not paraphrase it away
             text = ASK_PREFIX[self.lang] + text
         tr = self._trace().get(did)
@@ -646,6 +664,51 @@ class LiveSession:
         if d.get("timer"):
             d["timer"].cancel()
         await self._flush_deleg(did)
+
+    @staticmethod
+    def _cancel_pad(d: dict) -> None:
+        """No pad from now on. Also stops a pad still sleeping; one already inside its post is left to finish (cancelling a
+        half-sent request is worse) and, because posts are serialized, the result goes out after it, never before."""
+        d["pad_cancelled"] = True
+        t = d.get("pad_task")
+        if t is not None and not d.get("pad_posting"):
+            d.pop("pad_task", None)
+            if not t.done():
+                t.cancel()
+
+    async def _coord_pad(self, did: str, text: str) -> None:
+        """Deliver the Coordinator's SpeakPlan(kind="pad") while the Worker runs (Critic I-2).
+
+        The voice front usually says its own lead-in before it calls delegate (see DELEGATE); the pad is the Coordinator's
+        guarantee for when it did not. So: wait PAD_GRACE_S, and only if the answer is still not in and the front has not
+        just spoken, post the pad as a backend update (the model words it, or stays silent with <wait>). It is not the
+        result: no delivery receipt is armed, the trace's "posted" is left for the answer. A result arriving first cancels it."""
+        try:
+            await asyncio.sleep(PAD_GRACE_S)
+        except asyncio.CancelledError:
+            return
+        d = self.deleg.get(did)
+        if d is None or getattr(self, "engine", None) is None or d.get("said_result"):
+            return
+        if DELEG_MODE != "model":
+            self._trace_pad(did, text, "rules_mode")      # rules mode words its own progress lines (PROGRESS_AFTER_S)
+            return
+        heard = getattr(self, "last_voice_t", None)
+        if heard and time.monotonic() - heard < PAD_FRONT_QUIET_S:
+            self._trace_pad(did, text, "front_spoke")
+            return
+        d["pad_posting"] = True                        # from here cancel() leaves the task alone; _post_update re-checks under its lock
+        try:
+            sent = await self._post_update(did, [("commentary", text)], pad=True)
+        finally:
+            d["pad_posting"] = False
+            d.pop("pad_task", None)
+        self._trace_pad(did, text, "posted" if sent else "skipped_result_first")
+
+    def _trace_pad(self, did: str, text: str, outcome: str) -> None:
+        tr = self._trace().get(did)
+        if tr is not None:
+            tr.set(pad=outcome, pad_text=text)
 
     def _recent_user_text(self, max_age_s: float = 20.0) -> str:
         last = getattr(self, "last_user", None)
@@ -723,6 +786,9 @@ class LiveSession:
                 run_worker_job(job, instructions=self.instructions or "", history=getattr(self, "orch_history", None) or [])
             )
         self.coord_workers[job.task_id] = worker
+        pad = result.speak.text if result.speak.kind == "pad" else ""
+        if pad and d is not None:
+            d["pad_task"] = asyncio.ensure_future(self._coord_pad(did, pad))
         if tr is not None:
             tr.mark("worker_start")
             tr.set(task_id=job.task_id, version=job.version)
@@ -740,6 +806,7 @@ class LiveSession:
             from .coordinator import WorkerResult
             result = WorkerResult(task_id=job.task_id, version=job.version, status="failed", spoken_answer="后台编排出错了，请稍后再试。")
         finally:
+            self._cancel_pad(d) if d is not None else None   # the Worker is done: a filler now would only get in the answer's way
             if self.coord_workers.get(job.task_id) is worker:
                 self.coord_workers.pop(job.task_id, None)
         if tr is not None:
@@ -747,7 +814,8 @@ class LiveSession:
             tr.set(worker=result.status)
             for ev in result.evidence:
                 tr.add_tool(ev.get("tool", "?"), ev.get("ms"), bool(ev.get("ok")), source=ev.get("source"), fallbacks=ev.get("fallbacks"),
-                            orig_source=ev.get("orig_source"), age_s=ev.get("age_s"))
+                            orig_source=ev.get("orig_source"), age_s=ev.get("age_s"),
+                            city=ev.get("city"), tmin=ev.get("tmin"), tmax=ev.get("tmax"), now=ev.get("now"))
         outcome = finish_job(ledger, job, result)    # the Coordinator decides what gets said; stale results are dropped
         if tr is not None and job.require_tools:
             tr.set(require=",".join(job.require_tools), **({"guard": outcome.rejected} if outcome.rejected else {}))
@@ -897,6 +965,24 @@ class LiveSession:
         log.info("session %s closed (%s)", self.id, reason)
 
 
+def _flag(name: str, env=None) -> bool:  # noqa: ANN001
+    return (env if env is not None else os.environ).get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def runtime_banner(env=None) -> tuple[str, bool]:  # noqa: ANN001
+    """One startup line saying which delegation path this process will run, and whether that is the intended one.
+
+    SOPHON_LIVE_COORD defaults to OFF in code (Critic S-6): a restart without it silently falls back to the legacy orch path.
+    The line makes that visible in the log (and in the runbook's post-start check)."""
+    coord = _flag("SOPHON_LIVE_COORD", env)
+    orch = _flag("SOPHON_LIVE_ORCH", env)
+    jev = os.environ.get("SOPHON_LIVE_JEV", "1") if env is None else env.get("SOPHON_LIVE_JEV", "1")
+    if coord:
+        return f"SOPHON_LIVE_COORD on (Coordinator path) JEV={jev} ORCH={int(orch)}", True
+    return ("SOPHON_LIVE_COORD OFF: legacy path (no Ledger / REFINE / CANCEL / tool-evidence guard). "
+            f"Set SOPHON_LIVE_COORD=1 (see docs/runbook-path1-coord.md); ORCH={int(orch)}"), False
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="0.0.0.0"); ap.add_argument("--port", type=int, default=8780)
@@ -987,6 +1073,8 @@ def main() -> None:
     async def run():
         async with websockets.serve(handler, args.host, args.port, max_size=None, compression=None, process_request=process_request):
             log.info("Sophon Live gateway on ws://%s:%d%s -> %s", args.host, args.port, args.path, args.engine)
+            banner, intended = runtime_banner()
+            (log.info if intended else log.warning)("%s", banner)
             await asyncio.Future()
     asyncio.run(run())
 

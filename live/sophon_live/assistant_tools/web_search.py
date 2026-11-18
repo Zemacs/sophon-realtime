@@ -12,6 +12,7 @@ import gzip
 import json
 import os
 import re
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -57,7 +58,23 @@ def _no_results(query: str, *, zh: bool) -> str:
     return f"I couldn't find useful snippets for '{query}'."
 
 
+# urllib cannot be interrupted: a cancelled hedge leaves its thread running until its own socket timeout (<= the attempt's remaining
+# budget, <= 5.5 s). So the number of such threads in flight is capped (Critic S-9): beyond it an attempt fails at once instead
+# of piling up sockets and starving the shared thread pool when searches arrive faster than the stragglers finish.
+_INFLIGHT_MAX = int(os.environ.get("SOPHON_SEARCH_MAX_INFLIGHT", "12"))
+_inflight = threading.BoundedSemaphore(_INFLIGHT_MAX)
+
+
 def _urlopen(url: str, timeout: float = 20.0) -> bytes:
+    if not _inflight.acquire(blocking=False):
+        raise OSError("too many web-search requests in flight")
+    try:
+        return _urlopen_unbounded(url, timeout)
+    finally:
+        _inflight.release()
+
+
+def _urlopen_unbounded(url: str, timeout: float) -> bytes:
     bing = "bing.com" in url
     headers = {"User-Agent": _BROWSER_UA, "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.5", "Accept-Encoding": "gzip"} if bing else {"User-Agent": _UA}
     req = urllib.request.Request(url, headers=headers)
@@ -152,6 +169,7 @@ async def _bing(query: str, max_results: int, zh: bool, timeout: float) -> list[
     deadline = time.monotonic() + timeout
     pending: set[asyncio.Future] = set()
     last: BaseException = asyncio.TimeoutError()
+    empty_pages = 0
     try:
         for attempt in range(_BING_ATTEMPTS):
             left = deadline - time.monotonic()
@@ -162,19 +180,29 @@ async def _bing(query: str, max_results: int, zh: bool, timeout: float) -> list[
             done, pending = await asyncio.wait(pending, timeout=wait_s, return_when=asyncio.FIRST_COMPLETED)
             for d in done:
                 if d.exception() is None:
-                    return _snippets_from_bing(d.result().decode("utf-8", errors="replace"), max_results)
+                    got = _snippets_from_bing(d.result().decode("utf-8", errors="replace"), max_results)
+                    if got:
+                        return got
+                    empty_pages += 1       # HTTP 200 but nothing parsed (captcha / consent / layout change): not an answer, keep hedging
+                    continue
                 last = d.exception()  # type: ignore[assignment]
         while pending and deadline - time.monotonic() > 0:
             done, pending = await asyncio.wait(pending, timeout=deadline - time.monotonic(), return_when=asyncio.FIRST_COMPLETED)
             for d in done:
                 if d.exception() is None:
-                    return _snippets_from_bing(d.result().decode("utf-8", errors="replace"), max_results)
+                    got = _snippets_from_bing(d.result().decode("utf-8", errors="replace"), max_results)
+                    if got:
+                        return got
+                    empty_pages += 1
+                    continue
                 last = d.exception()  # type: ignore[assignment]
     finally:
         for f in pending:
             f.cancel()
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
+    if empty_pages:
+        return []                  # Bing was reached on every try that answered and had nothing usable: "no results", not an outage
     raise last
 
 

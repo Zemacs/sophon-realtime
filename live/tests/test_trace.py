@@ -125,7 +125,8 @@ class GatewayTraceTests(unittest.IsolatedAsyncioTestCase):
 
         async def worker(job, instructions="", history=None):
             return WorkerResult(job.task_id, job.version, "completed", "北京明天晴。",
-                                evidence=[{"tool": "get_weather", "args": {}, "ok": True, "ms": 812, "source": "sojson"}])
+                                evidence=[{"tool": "get_weather", "args": {}, "ok": True, "ms": 812, "source": "sojson"}],
+                                freshness_token=job.freshness_token)
 
         session._trace().start("d1").set(task="北京明天天气")
         _arm(session, "d1", "北京明天天气")

@@ -10,7 +10,8 @@ from . import intent, jev_client
 from .clarify import clarify_for_slots, missing_slots_for_text
 from .ledger import Ledger
 from .route import build_route_questions, build_state, heuristic_control, heuristic_route, slot_edit
-from .schemas import AdmitRequest, ControlDecision, PlaybackReceipt, SpeakPlan, TaskStatus, WorkerJob, WorkerResult
+from .schemas import AdmitRequest, ControlDecision, PlaybackReceipt, SpeakPlan, TaskStatus, WorkerJob, WorkerResult, freshness_token_for
+from .schemas import FAILED_GENERIC, FIXED_FAILURES, NO_TOOL_ANSWER, tool_succeeded
 
 log = logging.getLogger("sophon_live.coordinator")
 
@@ -216,7 +217,7 @@ def _apply_control(decision: ControlDecision, text: str, req: AdmitRequest, ledg
             version=new.version,
             objective=new.objective,
             language=req.language,
-            freshness_token=f"{new.task_id}:{new.version}",
+            freshness_token=freshness_token_for(new.task_id, new.version),
             # a REFINE re-runs the job with the new slots: what the new words ask for, else what the old task needed
             require_tools=intent.required_tools(text) or intent.required_tools(rec.objective),
         ),
@@ -243,7 +244,7 @@ def _new_job(ledger: Ledger, objective: str, *, language: str = "zh") -> WorkerJ
         version=rec.version,
         objective=objective,
         language=language,
-        freshness_token=f"{rec.task_id}:{rec.version}",
+        freshness_token=freshness_token_for(rec.task_id, rec.version),
         require_tools=intent.required_tools(objective),
     )
 
@@ -259,9 +260,6 @@ def complete_job(ledger: Ledger, job: WorkerJob, answer: str) -> bool:
     return ledger.mark_completed(job.task_id, answer)
 
 
-NO_TOOL_ANSWER = "这个我这边没查到准确结果，你再问我一次吧。"
-
-
 @dataclass
 class JobOutcome:
     """What the Coordinator wants said for a finished WorkerResult."""
@@ -274,10 +272,24 @@ class JobOutcome:
 
 
 def _ungrounded(job: WorkerJob, result: WorkerResult) -> bool:
-    """A completed answer for a tool-scoped job with no evidence of any of its tools being called."""
+    """A completed answer for a tool-scoped job with no evidence of a *successful* call of one of its tools.
+
+    A call that failed (``ok`` false) is not evidence either: after a failed tool the model would only be guessing."""
     if not job.require_tools or result.status != "completed":
         return False
-    return not any(ev.get("tool") in job.require_tools for ev in result.evidence)
+    return not any(ev.get("tool") in job.require_tools and tool_succeeded(ev) for ev in result.evidence)
+
+
+def _failure_text(job: WorkerJob, result: WorkerResult) -> str:
+    """What may be said for a FAILED result: a fixed honest sentence, or the failed required tool's own sentence
+    (recorded by the Worker as evidence ``failure_text``). Anything else is model free text: replaced (Critic I-5)."""
+    said = (result.spoken_answer or "").strip()
+    if said in FIXED_FAILURES:
+        return said
+    if said and any(ev.get("tool") in (job.require_tools or []) and ev.get("ok") is False and ev.get("failure_text") == said
+                    for ev in result.evidence):
+        return said
+    return NO_TOOL_ANSWER if job.require_tools else FAILED_GENERIC
 
 
 def finish_job(ledger: Ledger, job: WorkerJob, result: WorkerResult) -> JobOutcome:
@@ -288,6 +300,11 @@ def finish_job(ledger: Ledger, job: WorkerJob, result: WorkerResult) -> JobOutco
     rec = ledger.tasks.get(job.task_id)
     stale = JobOutcome(kind="stale", task_id=job.task_id, version=job.version)
     if rec is None or (result.task_id, result.version) != (job.task_id, job.version):
+        return stale
+    if job.freshness_token and (job.freshness_token != freshness_token_for(job.task_id, job.version) or result.freshness_token != job.freshness_token):
+        # the token was written by the Coordinator for exactly this (task_id, version); a result that does not echo it
+        # is not an answer to this job (S-3: the token used to be written and never checked)
+        log.warning("drop worker result %s v%s: freshness token mismatch (job=%r result=%r)", job.task_id, job.version, job.freshness_token, result.freshness_token)
         return stale
     if rec.version != job.version or rec.status in (TaskStatus.SUPERSEDED, TaskStatus.CANCELLED):
         log.info("drop stale worker result %s v%s (task now v%s %s)", job.task_id, job.version, rec.version, rec.status.value)
@@ -302,10 +319,19 @@ def finish_job(ledger: Ledger, job: WorkerJob, result: WorkerResult) -> JobOutco
         log.warning("reject ungrounded worker answer task=%s v%s require=%s answer=%r", job.task_id, job.version, job.require_tools, (result.spoken_answer or "")[:60])
         if not ledger.mark_failed(job.task_id, NO_TOOL_ANSWER):
             return stale
-        return JobOutcome(kind="answer", text=NO_TOOL_ANSWER, task_id=job.task_id, version=job.version, rejected="no_tool_result")
+        tried = any(ev.get("tool") in job.require_tools for ev in result.evidence)
+        return JobOutcome(kind="answer", text=NO_TOOL_ANSWER, task_id=job.task_id, version=job.version,
+                          rejected="tool_failed" if tried else "no_tool_result")
+    if result.status == "failed":
+        text = _failure_text(job, result)
+        replaced = text != (result.spoken_answer or "").strip()
+        if replaced:
+            log.warning("replace free-text failure task=%s v%s answer=%r", job.task_id, job.version, (result.spoken_answer or "")[:60])
+        if not ledger.mark_failed(job.task_id, text):
+            return stale
+        return JobOutcome(kind="answer", text=text, task_id=job.task_id, version=job.version, rejected="failed_text" if replaced else "")
     text = (result.spoken_answer or "").strip() or "好的，我这边查过了。"
-    ok = ledger.mark_failed(job.task_id, text) if result.status == "failed" else ledger.mark_completed(job.task_id, text)
-    if not ok:
+    if not ledger.mark_completed(job.task_id, text):
         return stale
     return JobOutcome(kind="answer", text=text, task_id=job.task_id, version=job.version)
 

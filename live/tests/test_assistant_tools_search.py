@@ -102,13 +102,46 @@ class NewsTests(unittest.TestCase):
         self.assertIn("第1条", out)
         self.assertIn("第2条", out)
 
+    def test_publisher_is_taken_from_the_source_element_in_either_order(self) -> None:
+        """Critic S-1: with <source>, remove exactly the publisher, whichever side of " - " it is on; never the headline."""
+        rss = """<?xml version="1.0" encoding="UTF-8"?>
+        <rss version="2.0"><channel>
+        <item><title>芯片出口新规 - 新华社</title><source url="https://x">新华社</source></item>
+        <item><title>路透社 - 特斯拉发布新电池</title><source url="https://y">路透社</source></item>
+        <item><title>特斯拉 - 马斯克新计划 - 路透社</title><source url="https://y">路透社</source></item>
+        <item><title>某某报 - 与来源不符的标题</title><source url="https://z">别家</source></item>
+        </channel></rss>""".encode("utf-8")
+        titles = news._titles_from_rss(rss)
+        self.assertEqual(titles, ["芯片出口新规", "特斯拉发布新电池", "特斯拉 - 马斯克新计划", "某某报 - 与来源不符的标题"])
+
     def test_title_keeps_inner_dashes_and_untagged_titles(self) -> None:
         rss = """<?xml version="1.0" encoding="UTF-8"?>
         <rss version="2.0"><channel>
-        <item><title>特斯拉 - 马斯克新计划 - 路透社</title></item>
+        <item><title>特斯拉明年将量产新电池，马斯克称成本大降 - 路透社</title></item>
         <item><title>没有来源后缀的标题</title></item>
         </channel></rss>""".encode("utf-8")
-        self.assertEqual(news._titles_from_rss(rss), ["特斯拉 - 马斯克新计划", "没有来源后缀的标题"])
+        self.assertEqual(news._titles_from_rss(rss), ["特斯拉明年将量产新电池，马斯克称成本大降", "没有来源后缀的标题"])
+
+    def test_without_source_the_headline_is_never_cut_away(self) -> None:
+        """Critic S-8: no <source> -> the old rsplit(" - ", 1) dropped the HEADLINE whenever the feed wrote 「来源 - 标题」.
+        (Changed expectation, on purpose: the untagged 「特斯拉 - 马斯克新计划 - 路透社」 used to become 「特斯拉 - 马斯克新计划」; both ends
+        look like a publisher there, which is exactly the ambiguous case, so it is now kept whole.)"""
+        strip = lambda t: news._strip_publisher(news.ET.fromstring("<item/>"), t)  # noqa: E731
+        cases = {
+            "路透社 - 特斯拉明年将量产新电池，马斯克称成本大降": "特斯拉明年将量产新电池，马斯克称成本大降",      # 「来源 - 标题」: the SOURCE goes
+            "特斯拉明年将量产新电池，马斯克称成本大降 - 路透社": "特斯拉明年将量产新电池，马斯克称成本大降",      # 「标题 - 来源」
+            "特斯拉 - 马斯克新计划 - 路透社": "特斯拉 - 马斯克新计划 - 路透社",                              # both ends short: ambiguous -> whole
+            "苹果发布会 - 全程回顾": "苹果发布会 - 全程回顾",                                                # ambiguous -> whole
+            "央行：下调存款准备金率 - 新华社": "央行：下调存款准备金率",
+            "A 股收盘：沪指涨 1.2% - 创业板指涨 2% - 北向资金净流入超百亿": "A 股收盘：沪指涨 1.2% - 创业板指涨 2% - 北向资金净流入超百亿",   # no publisher at all
+            "Nvidia unveils new chip for data centers - Reuters": "Nvidia unveils new chip for data centers",
+            "Reuters - Nvidia unveils new chip for data centers": "Nvidia unveils new chip for data centers",
+            "没有分隔符": "没有分隔符",
+            " - ": " - ",
+        }
+        for src, want in cases.items():
+            self.assertEqual(strip(src), want, src)
+            self.assertTrue(strip(src), src)                                                             # never an empty headline
 
     def test_network_error_en(self) -> None:
         with mock.patch("urllib.request.urlopen", side_effect=OSError("down")):

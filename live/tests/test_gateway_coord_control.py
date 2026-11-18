@@ -145,6 +145,25 @@ class GatewayCoordControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.deleg["d1"]["chunks"], [])
         self.assertEqual(session.deleg["d2"]["chunks"], [("commentary", "北京晴")])
 
+    async def test_every_finished_worker_goes_through_the_number_backstop_before_it_is_spoken(self) -> None:
+        """RC2-6: the gateway must call review_numbers(job, result) before finish_job (mutant RC2-6d removes the call)."""
+        import sophon_live.assistant_tools as tools
+
+        session = _session()
+        seen: list[tuple[str, str]] = []
+
+        async def spy(job, result):  # noqa: ANN001
+            seen.append((job.task_id, result.spoken_answer))
+
+        async def orch(task, instructions="", history=None):
+            return "北京晴"
+
+        _arm(session, "d1", "北京明天天气")
+        with mock.patch.object(api, "USE_JEV", True), mock.patch.object(api, "review_numbers", spy), \
+                mock.patch.object(tools, "run_worker_job", as_worker(orch)):
+            await session._coord_resolve("d1", "北京明天天气")
+        self.assertEqual([a for _, a in seen], ["北京晴"])
+
 
 if __name__ == "__main__":
     unittest.main()

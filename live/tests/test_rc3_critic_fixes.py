@@ -104,6 +104,15 @@ class BreakerCancelTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((cm.exception.reason, n["c"]), ("timeout", 1))
 
 
+class ConnectionClassifierTests(unittest.TestCase):
+    def test_a_timeout_is_never_a_connection_error_F3b(self) -> None:
+        from sophon_live import model_client as mc
+        self.assertFalse(mc.is_connection_error(asyncio.TimeoutError()))
+        self.assertFalse(mc.is_connection_error(TimeoutError()))
+        self.assertTrue(mc.is_connection_error(ConnectionResetError()))
+        self.assertFalse(mc.is_connection_error(ValueError("bad body")))
+
+
 class NumbersTests(unittest.TestCase):
     """RC2-7: one normalisation entry; no "the source mentions 一/两 so 1 and 2 are sourced"."""
 

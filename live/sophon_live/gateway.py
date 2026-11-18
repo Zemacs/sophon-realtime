@@ -601,8 +601,8 @@ class LiveSession:
 
     async def _coord_resolve(self, did: str, what: str | None) -> None:
         """Path-1 Coordinator: Karpo/JEV route + ledger, then Worker orch for TOOL jobs."""
-        from .coordinator import AdmitRequest, Ledger, TaskContext, admit, bind_task, complete_job
-        from .assistant_tools import resolve_task_orch
+        from .coordinator import AdmitRequest, Ledger, TaskContext, admit, bind_task, finish_job
+        from .assistant_tools import run_worker_job
 
         if not hasattr(self, "coord_ledger"):
             self.coord_ledger = Ledger()
@@ -659,11 +659,11 @@ class LiveSession:
         with bind_task(TaskContext(task_id=job.task_id, version=job.version, utterance=job.objective, ledger=ledger)):
             # the worker task copies this context: its memory writes go through memory_gate, its tool args become task slots
             worker = asyncio.ensure_future(
-                resolve_task_orch(job.objective, instructions=self.instructions or "", history=getattr(self, "orch_history", None) or [])
+                run_worker_job(job, instructions=self.instructions or "", history=getattr(self, "orch_history", None) or [])
             )
         self.coord_workers[job.task_id] = worker
         try:
-            text = await worker
+            result = await worker                    # a WorkerResult: status + answer or missing slots, nothing else
         except asyncio.CancelledError:
             if worker.cancelled():                   # cancelled by a later CANCEL/REFINE, not by us shutting down
                 log.info("session %s worker for %s v%s cancelled", self.id, job.task_id, job.version)
@@ -673,14 +673,19 @@ class LiveSession:
             raise
         except Exception as e:  # noqa: BLE001
             log.warning("session %s coord worker error: %s", self.id, e)
-            text = "后台编排出错了，请稍后再试。"
+            from .coordinator import WorkerResult
+            result = WorkerResult(task_id=job.task_id, version=job.version, status="failed", spoken_answer="后台编排出错了，请稍后再试。")
         finally:
             if self.coord_workers.get(job.task_id) is worker:
                 self.coord_workers.pop(job.task_id, None)
-        text = (text or "").strip() or "好的，我这边查过了。"
-        if not complete_job(ledger, job, text):      # cancelled or superseded while running
+        outcome = finish_job(ledger, job, result)    # the Coordinator decides what gets said; stale results are dropped
+        if outcome.kind == "stale":                  # cancelled or superseded while running
             await self._ack_delegation(did, "这个任务已被取消或改口，不用再说什么。")
             return
+        if outcome.kind == "clarify":                # Worker reported missing slots; C layer words the question
+            await self._coord_say(did, outcome.text)
+            return
+        text = outcome.text
         if not hasattr(self, "orch_history"):
             self.orch_history = []
         self.orch_history.append({"task": job.objective, "answer": text})

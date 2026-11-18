@@ -21,6 +21,7 @@ from sophon_live.coordinator.api import complete_job, on_playback_receipt
 from sophon_live.coordinator.delivery import DeliveryTracker
 from sophon_live.coordinator.schemas import TaskStatus
 from tests.test_gateway_coord_control import FakeEngine, _commentary, _session
+from tests.worker_stub import as_worker
 from tests.test_r0_coord_boundary import _arm
 
 
@@ -134,7 +135,7 @@ class GatewayDeliveryTests(unittest.IsolatedAsyncioTestCase):
             return "北京明天晴。"
 
         _arm(session, "d1", "北京明天天气")
-        with mock.patch.object(api, "USE_JEV", False), mock.patch.object(tools, "resolve_task_orch", orch):
+        with mock.patch.object(api, "USE_JEV", False), mock.patch.object(tools, "run_worker_job", as_worker(orch)):
             t1 = asyncio.create_task(session._coord_resolve("d1", "北京明天天气"))
             await asyncio.sleep(0.05)
             # real LiveSession._drop_playback needs these
@@ -163,7 +164,7 @@ class GatewayDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
         _arm(session, "d1", "北京明天天气")
         _arm(session, "d2", "取消刚才那个")
-        with mock.patch.object(api, "USE_JEV", False), mock.patch.object(tools, "resolve_task_orch", orch):
+        with mock.patch.object(api, "USE_JEV", False), mock.patch.object(tools, "run_worker_job", as_worker(orch)):
             t1 = asyncio.create_task(session._coord_resolve("d1", "北京明天天气"))
             await asyncio.sleep(0.05)
             await session._coord_resolve("d2", "取消刚才那个")

@@ -1,7 +1,9 @@
 """Path-1 co-located delegation orchestrator: text LLM selects tools; tools run on the GPU host.
 
-Used when ``SOPHON_LIVE_ORCH=1``. Replaces keyword ``run_task`` routing. Speaks OpenAI Chat
-Completions + tools against a local vLLM (see docs/sophon-path1-colocated-backend.md).
+The orchestrator is the Worker: it executes one ``WorkerJob`` and returns a ``WorkerResult``.
+It makes no routing, cancel/refine or keyword decisions. Those belong to the Coordinator (C layer / JEV);
+a missing required slot is reported as ``needs_input`` and the C layer words the CLARIFY.
+Speaks OpenAI Chat Completions + tools against a local vLLM (see docs/sophon-path1-colocated-backend.md).
 """
 from __future__ import annotations
 
@@ -13,6 +15,8 @@ from typing import Any
 
 import aiohttp
 
+from ..coordinator.clarify import clarify_for_slots
+from ..coordinator.schemas import WorkerJob, WorkerResult
 from .registry import TOOL_SCHEMAS
 from .runner import run_tool
 
@@ -25,21 +29,19 @@ _DEFAULT_STEPS = 6
 _DEFAULT_TIMEOUT = 120.0
 
 SYS = (
-    "You are the back-office agent behind a voice assistant on a live call. "
-    "The voice front already heard the caller; you only see the task text it relayed "
-    "(plus optional recent turn history). "
-    "Use tools when you need facts or device/memory actions. "
-    "Rules:\n"
-    "- Weather: call get_weather with an explicit city. If the task has no city, ask which city "
-    "in one short sentence; do NOT call memory_note for preferred_city unless the history shows "
-    "the user already saved one.\n"
-    "- Time/date: call get_datetime.\n"
-    "- Device: call device_control.\n"
-    "- Chat / jokes / chit-chat with no tool need: answer directly. If history shows a previous "
-    "joke the caller disliked, tell a different one.\n"
-    "- If a tool returns headlines or weather facts, speak them immediately; never call the same tool again in that turn.\n"
+    "You are the tool-executing worker behind a voice assistant. "
+    "You receive ONE job objective that the coordinator already routed and refined; "
+    "you never decide whether to ask, cancel, refine or remember anything. "
+    "Do exactly the objective with the tools you are given.\n"
+    "- Pick the tool that fits the objective (time/date: get_datetime; weather: get_weather; news: get_news; "
+    "search: web_search; device: device_control).\n"
+    "- If a required tool parameter is not in the objective, call the tool WITHOUT that parameter. "
+    "Never guess it and never ask the caller; the coordinator asks.\n"
+    "- If the objective says the caller changed their mind or added detail, the newest wording wins.\n"
+    "- Plain chat or jokes need no tool: answer directly, and do not repeat an answer already in the recent turns.\n"
+    "- If a tool returns headlines or weather facts, speak them immediately; never call the same tool again in that job.\n"
     "- If a tool returns an error JSON or '暂时/不可用/unreachable', apologize briefly and stop retrying the same tool.\n"
-    "- Match the caller's language; for Chinese tasks keep get_news lang=zh.\n"
+    "- Match the caller's language; for Chinese objectives keep get_news lang=zh.\n"
     "When done, reply with ONLY the short spoken answer for the caller (one or two natural sentences). "
     "No markdown, no tool names, no 'SAY:' prefix."
 )
@@ -111,27 +113,54 @@ def _history_block(history: list[dict[str, str]] | None) -> str:
     return "Recent turns in this call:\n" + "\n".join(lines)
 
 
-async def resolve_task(
-    task: str,
+def _missing_required(name: str, args: dict) -> list[str]:
+    """Required tool parameters the model left out (schema-driven, no keywords)."""
+    for t in TOOL_SCHEMAS:
+        if t["name"] == name:
+            req = (t.get("parameters") or {}).get("required") or []
+            return [k for k in req if not str(args.get(k) or "").strip()]
+    return []
+
+
+def _in_scope(job: WorkerJob, name: str) -> bool:
+    scope = job.tool_scope or ["*"]
+    return "*" in scope or name in scope
+
+
+def _result(job: WorkerJob, status: str, text: str, evidence: list[dict], slots: list[str] | None = None) -> WorkerResult:
+    return WorkerResult(
+        task_id=job.task_id,
+        version=job.version,
+        status=status,  # type: ignore[arg-type]
+        spoken_answer=text,
+        evidence=evidence,
+        needs_slots=slots or [],
+    )
+
+
+async def run_job(
+    job: WorkerJob,
     *,
     instructions: str = "",
     history: list[dict[str, str]] | None = None,
-) -> str:
-    """Run LLM tool loop for one Path-1 delegation task; return commentary text for the front."""
-    task = (task or "").strip()
+) -> WorkerResult:
+    """Run the LLM tool loop for one WorkerJob. Returns a WorkerResult stamped with the job's (task_id, version)."""
+    task = (job.objective or "").strip()
+    evidence: list[dict] = []
     if not task:
-        return "我这边没有收到具体任务，请再说一次。"
+        return _result(job, "failed", "我这边没有收到具体任务，请再说一次。", evidence)
     url, model, key, max_steps, timeout = _cfg()
     hist = _history_block(history)
-    user = f"Front relayed this task from the caller:\n{task}"
+    user = f"Job objective:\n{task}"
     if hist:
         user = hist + "\n\n" + user
     msgs: list[dict[str, Any]] = [
         {"role": "system", "content": SYS + (("\n\nExtra policy:\n" + instructions) if instructions else "")},
         {"role": "user", "content": user},
     ]
-    tools = _openai_tools()
+    tools = [t for t in _openai_tools() if _in_scope(job, t["function"]["name"])]
     headers = {"Authorization": "Bearer " + key, "Content-Type": "application/json"}
+    unavailable = "后台模型暂时不可用，请稍后再试。"
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as cs:
         for step in range(max_steps):
             body: dict[str, Any] = {
@@ -150,7 +179,7 @@ async def resolve_task(
                     except Exception as e:  # noqa: BLE001
                         raw = await r.text()
                         log.warning("orch LLM bad JSON HTTP %s: %r body=%s", status, e, raw[:300])
-                        return "后台模型暂时不可用，请稍后再试。"
+                        return _result(job, "failed", unavailable, evidence)
                 if status >= 400:
                     # retry once without chat_template_kwargs if rejected
                     if status == 400 and "chat_template_kwargs" in body:
@@ -160,26 +189,37 @@ async def resolve_task(
                             j = await r2.json(content_type=None)
                         if status >= 400:
                             log.warning("orch LLM HTTP %s: %s", status, str(j)[:300])
-                            return "后台模型暂时不可用，请稍后再试。"
+                            return _result(job, "failed", unavailable, evidence)
                     else:
                         log.warning("orch LLM HTTP %s: %s", status, str(j)[:300])
-                        return "后台模型暂时不可用，请稍后再试。"
+                        return _result(job, "failed", unavailable, evidence)
                 choices = j.get("choices") if isinstance(j, dict) else None
                 if not choices:
                     log.warning("orch LLM empty choices: %s", str(j)[:300])
-                    return "后台模型暂时不可用，请稍后再试。"
+                    return _result(job, "failed", unavailable, evidence)
                 m = choices[0].get("message") or {}
             except Exception as e:  # noqa: BLE001
                 log.warning("orch LLM call failed: %r", e)
-                return "后台模型连接失败，请稍后再试。"
+                return _result(job, "failed", "后台模型连接失败，请稍后再试。", evidence)
             tcs = m.get("tool_calls") or []
             if not tcs:
-                return _say(m.get("content") or "")
+                return _result(job, "completed", _say(m.get("content") or ""), evidence)
             msgs.append({"role": "assistant", "content": m.get("content") or "", "tool_calls": tcs})
             for tc in tcs:
                 fn = tc.get("function") or {}
                 name = fn.get("name") or ""
                 args = _parse_args(fn.get("arguments"))
+                if not _in_scope(job, name):
+                    out = json.dumps({"ok": False, "error": f"tool {name} is not permitted for this job"})
+                    evidence.append({"tool": name, "args": args, "ok": False, "refused": "out_of_scope"})
+                    msgs.append({"role": "tool", "tool_call_id": tc.get("id") or name, "content": out})
+                    continue
+                missing = _missing_required(name, args)
+                if missing:
+                    # the Worker never asks the caller: report the gap, the C layer words the CLARIFY
+                    log.info("orch step=%d tool=%s missing=%s -> needs_input", step, name, missing)
+                    evidence.append({"tool": name, "args": args, "ok": False, "missing": missing})
+                    return _result(job, "needs_input", "", evidence, missing)
                 out = await run_tool(name, args)
                 log.info(
                     "orch step=%d tool=%s args=%s out=%s",
@@ -198,6 +238,7 @@ async def resolve_task(
                     or "unavailable" in out.lower()
                     or "不可用" in out
                 )
+                evidence.append({"tool": name, "args": args, "ok": not failed})
                 news_ok = name == "get_news" and ("第1条" in out or "Headlines on" in out) and not failed
                 weather_ok = name == "get_weather" and ("度" in out or "°" in out or "°C" in out) and not failed
                 if news_ok or weather_ok:
@@ -210,4 +251,23 @@ async def resolve_task(
                         "role": "user",
                         "content": "The tool failed. Tell the caller briefly without calling the same tool again.",
                     })
-    return "我还在查，请稍等一下再问一次。"
+    return _result(job, "failed", "我还在查，请稍等一下再问一次。", evidence)
+
+
+async def resolve_task(
+    task: str,
+    *,
+    instructions: str = "",
+    history: list[dict[str, str]] | None = None,
+) -> str:
+    """Legacy text-in/text-out entry for the non-Coordinator ``SOPHON_LIVE_ORCH=1`` path.
+
+    Wraps the text as an anonymous WorkerJob; a missing slot comes back as the C layer's clarify wording.
+    """
+    task = (task or "").strip()
+    if not task:
+        return "我这边没有收到具体任务，请再说一次。"
+    res = await run_job(WorkerJob(task_id="", version=0, objective=task), instructions=instructions, history=history)
+    if res.status == "needs_input":
+        return clarify_for_slots(res.needs_slots)
+    return res.spoken_answer

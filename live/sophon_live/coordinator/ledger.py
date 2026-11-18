@@ -105,6 +105,15 @@ class Ledger:
         rec.spoken_answer = answer
         return True
 
+    def mark_failed(self, task_id: str, answer: str) -> bool:
+        """A pending task whose Worker gave up: keep the apology so STATUS can replay it."""
+        rec = self.tasks.get(task_id)
+        if rec is None or rec.status not in _PENDING:
+            return False
+        rec.status = TaskStatus.FAILED
+        rec.spoken_answer = answer
+        return True
+
     def mark_needs_input(self, task_id: str) -> None:
         rec = self.tasks.get(task_id)
         if rec and rec.status in _PENDING:

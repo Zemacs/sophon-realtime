@@ -23,6 +23,7 @@ from sophon_live.coordinator import api
 from sophon_live.coordinator import jev_client
 from sophon_live.coordinator.api import complete_job
 from sophon_live.coordinator.schemas import TaskStatus
+from tests.worker_stub import as_worker
 
 
 def record(case_id: str, actual: dict) -> None:
@@ -220,7 +221,7 @@ class GatewayBoundaryTests(unittest.IsolatedAsyncioTestCase):
         with (
             mock.patch.object(coord, "admit", fake_admit),
             mock.patch.object(capi, "_new_job", counting_new),
-            mock.patch.object(tools, "resolve_task_orch", fake_orch),
+            mock.patch.object(tools, "run_worker_job", as_worker(fake_orch)),
         ):
             await session._coord_resolve("d1", "现在几点了")
         self.assertEqual(new_jobs["n"], 0)
@@ -241,7 +242,7 @@ class GatewayBoundaryTests(unittest.IsolatedAsyncioTestCase):
         _arm(right, "b", "科技新闻")
         with (
             mock.patch.object(api, "USE_JEV", False),
-            mock.patch.object(tools, "resolve_task_orch", fake_orch),
+            mock.patch.object(tools, "run_worker_job", as_worker(fake_orch)),
         ):
             await left._coord_resolve("a", "现在几点了")
             await right._coord_resolve("b", "科技新闻")
@@ -275,7 +276,7 @@ class GatewayBoundaryTests(unittest.IsolatedAsyncioTestCase):
         with (
             mock.patch.object(coord, "admit", fake_admit),
             mock.patch.object(capi, "_new_job", counting_new),
-            mock.patch.object(tools, "resolve_task_orch", fake_orch),
+            mock.patch.object(tools, "run_worker_job", as_worker(fake_orch)),
         ):
             await session._coord_resolve("f", "谢谢")
         actual = {

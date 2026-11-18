@@ -6,9 +6,10 @@ import os
 from dataclasses import dataclass
 
 from . import jev_client
+from .clarify import clarify_for_slots, missing_slots_for_text
 from .ledger import Ledger
 from .route import build_route_questions, build_state, heuristic_control, heuristic_route
-from .schemas import AdmitRequest, ControlDecision, PlaybackReceipt, SpeakPlan, TaskStatus, WorkerJob
+from .schemas import AdmitRequest, ControlDecision, PlaybackReceipt, SpeakPlan, TaskStatus, WorkerJob, WorkerResult
 
 log = logging.getLogger("sophon_live.coordinator")
 
@@ -26,9 +27,7 @@ class AdmitResult:
 
 
 def _clarify_text(text: str) -> str:
-    if "天气" in text:
-        return "请问您想查哪个城市的天气？"
-    return "还缺一点信息，方便再说具体一点吗？"
+    return clarify_for_slots(missing_slots_for_text(text))
 
 
 def _parse_control_key(key: str | None) -> ControlDecision | None:
@@ -154,6 +153,8 @@ def _apply_control(decision: ControlDecision, text: str, req: AdmitRequest, ledg
             return _answer("还在查，请稍等一下。", ledger, decision, version=rec.version)
         if rec.status == TaskStatus.NEEDS_INPUT:
             return _answer(_clarify_text(rec.objective), ledger, decision, version=rec.version)
+        if rec.status == TaskStatus.FAILED and rec.spoken_answer:
+            return _answer(rec.spoken_answer, ledger, decision, version=rec.version)
         return _answer("这个任务已经取消了，没有结果。", ledger, decision, version=rec.version)
 
     # REFINE
@@ -216,6 +217,40 @@ def complete_job(ledger: Ledger, job: WorkerJob, answer: str) -> bool:
         log.info("drop stale worker result %s v%s (task now v%s %s)", job.task_id, job.version, rec.version, rec.status.value)
         return False
     return ledger.mark_completed(job.task_id, answer)
+
+
+@dataclass
+class JobOutcome:
+    """What the Coordinator wants said for a finished WorkerResult."""
+
+    kind: str  # "answer" | "clarify" | "stale"
+    text: str = ""
+    task_id: str = ""
+    version: int = 0
+
+
+def finish_job(ledger: Ledger, job: WorkerJob, result: WorkerResult) -> JobOutcome:
+    """Worker → Coordinator. Stale or cancelled results are dropped; needs_input becomes a C-worded CLARIFY.
+
+    The Worker only reports status and missing slots; wording and ledger state are decided here.
+    """
+    rec = ledger.tasks.get(job.task_id)
+    stale = JobOutcome(kind="stale", task_id=job.task_id, version=job.version)
+    if rec is None or (result.task_id, result.version) != (job.task_id, job.version):
+        return stale
+    if rec.version != job.version or rec.status in (TaskStatus.SUPERSEDED, TaskStatus.CANCELLED):
+        log.info("drop stale worker result %s v%s (task now v%s %s)", job.task_id, job.version, rec.version, rec.status.value)
+        return stale
+    if result.status == "cancelled":
+        return stale
+    if result.status == "needs_input":
+        ledger.mark_needs_input(job.task_id)
+        return JobOutcome(kind="clarify", text=clarify_for_slots(result.needs_slots), task_id=job.task_id, version=job.version)
+    text = (result.spoken_answer or "").strip() or "好的，我这边查过了。"
+    ok = ledger.mark_failed(job.task_id, text) if result.status == "failed" else ledger.mark_completed(job.task_id, text)
+    if not ok:
+        return stale
+    return JobOutcome(kind="answer", text=text, task_id=job.task_id, version=job.version)
 
 
 def on_playback_receipt(ledger: Ledger, receipt: PlaybackReceipt) -> bool:

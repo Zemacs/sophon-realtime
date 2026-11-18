@@ -17,6 +17,7 @@ if str(_LIVE_ROOT) not in sys.path:
 
 from sophon_live.coordinator import AdmitResult, SpeakPlan, api
 from sophon_live.coordinator.schemas import TaskStatus
+from tests.worker_stub import as_worker
 from tests.test_r0_coord_boundary import _arm, _bare_session
 
 
@@ -60,7 +61,7 @@ class GatewayCoordControlTests(unittest.IsolatedAsyncioTestCase):
             return "x"
 
         _arm(session, "f", "谢谢")
-        with mock.patch.object(coord, "admit", fake_admit), mock.patch.object(tools, "resolve_task_orch", fake_orch):
+        with mock.patch.object(coord, "admit", fake_admit), mock.patch.object(tools, "run_worker_job", as_worker(fake_orch)):
             await session._coord_resolve("f", "谢谢")
         self.assertEqual(orch_calls, [])
         self.assertEqual(len(session.coord_ledger.order), 0)
@@ -100,7 +101,7 @@ class GatewayCoordControlTests(unittest.IsolatedAsyncioTestCase):
 
         _arm(session, "d1", "北京明天天气")
         _arm(session, "d2", "取消刚才那个")
-        with mock.patch.object(api, "USE_JEV", False), mock.patch.object(tools, "resolve_task_orch", slow_orch):
+        with mock.patch.object(api, "USE_JEV", False), mock.patch.object(tools, "run_worker_job", as_worker(slow_orch)):
             t1 = asyncio.create_task(session._coord_resolve("d1", "北京明天天气"))
             await asyncio.wait_for(started.wait(), 5)
             await session._coord_resolve("d2", "取消刚才那个")
@@ -129,7 +130,7 @@ class GatewayCoordControlTests(unittest.IsolatedAsyncioTestCase):
 
         _arm(session, "d1", "上海明天天气")
         _arm(session, "d2", "改成北京的")
-        with mock.patch.object(api, "USE_JEV", False), mock.patch.object(tools, "resolve_task_orch", orch):
+        with mock.patch.object(api, "USE_JEV", False), mock.patch.object(tools, "run_worker_job", as_worker(orch)):
             t1 = asyncio.create_task(session._coord_resolve("d1", "上海明天天气"))
             await asyncio.wait_for(started.wait(), 5)
             await session._coord_resolve("d2", "改成北京的")

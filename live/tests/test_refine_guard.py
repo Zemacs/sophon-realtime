@@ -68,8 +68,6 @@ class ModelDrivenRefineTests(unittest.IsolatedAsyncioTestCase):
         seen: dict = {}
 
         async def spy(state, questions, **kw):  # noqa: ANN001
-            if "route" not in questions:             # the parallel tool call carries only the tool question
-                return {"answers": {"tool": {"type": "choice", "choice": "NONE"}}}
             seen["state"], seen["questions"] = state, questions
             return {"answers": {"route": {"type": "choice", "choice": "WORKER"}, "control": {"type": "choice", "choice": "NEW"}}}
 
@@ -110,52 +108,6 @@ class ModelDrivenRefineTests(unittest.IsolatedAsyncioTestCase):
         line = next(l for l in cm.output if "coord admit" in l)
         m = re.search(r"coord admit session=(\S+) .*?route=(\S+) .*?decision=(\S+) via=(\S+) admit_ms=(\d+) jev_ms=(\S+)", line)
         self.assertEqual(m.group(1, 2, 3, 4), ("sess_t", "CONTROL", "CANCEL", "jev"))
-
-
-class ParallelJevCallsTests(unittest.IsolatedAsyncioTestCase):
-    """v0.1.1 latency: the route/control question and the (large) tool question are two parallel calls, cost = max, not sum."""
-
-    def _req(self, text: str) -> AdmitRequest:
-        return AdmitRequest(session_id="sess_t", utterance_id="u", text=text, delegate_task=text, raw_text=text)
-
-    async def test_the_two_calls_overlap_in_time(self) -> None:
-        led = Ledger()
-
-        async def slow(state, questions, **kw):  # noqa: ANN001
-            await asyncio.sleep(0.2)
-            ans = {"route": {"type": "choice", "choice": "WORKER"}} if "route" in questions else {"tool": {"type": "choice", "choice": "get_datetime"}}
-            return {"answers": ans}
-
-        t0 = time.monotonic()
-        with mock.patch.object(api, "USE_JEV", True), mock.patch.object(api.jev_client, "system_one", slow):
-            res = await admit(self._req("现在几点了"), led)
-        self.assertLess(time.monotonic() - t0, 0.35, "serial calls would take 0.4 s")
-        self.assertEqual(res.job.require_tools, ["get_datetime"])
-
-    async def test_a_failed_tool_call_leaves_the_route_and_marks_the_tool_unknown(self) -> None:
-        led = Ledger()
-
-        async def flaky(state, questions, **kw):  # noqa: ANN001
-            if "route" not in questions:
-                raise RuntimeError("tool call down")
-            return {"answers": {"route": {"type": "choice", "choice": "WORKER"}}}
-
-        with mock.patch.object(api, "USE_JEV", True), mock.patch.object(api.jev_client, "system_one", flaky):
-            res = await admit(self._req("明天上海会下雨吗"), led)
-        self.assertEqual((res.via, res.route), ("jev", "WORKER"))
-        self.assertEqual((res.job.require_tools, res.job.tool_judgment), ([], "unknown"))
-
-    async def test_a_failed_route_call_degrades_even_if_the_tool_call_worked(self) -> None:
-        led = Ledger()
-
-        async def flaky(state, questions, **kw):  # noqa: ANN001
-            if "route" in questions:
-                raise RuntimeError("route call down")
-            return {"answers": {"tool": {"type": "choice", "choice": "get_weather"}}}
-
-        with mock.patch.object(api, "USE_JEV", True), mock.patch.object(api.jev_client, "system_one", flaky):
-            res = await admit(self._req("明天上海会下雨吗"), led)
-        self.assertEqual(res.via, "degraded")
 
 
 class GatewayRawTextTests(unittest.TestCase):

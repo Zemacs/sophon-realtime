@@ -1,7 +1,7 @@
 """v0.1.0-rc2: the gateway's no-delegate safety net.
 
-TRIGGER = structure only (the response is done, the front called no delegate in that turn, its output is lead-in sized, there is a fresh
-un-delegated transcript). DECISION = the router model (``coordinator.api.judge_tools``, scripted here). No keyword test of the user's words.
+TRIGGER = structure only (the response is done, the front called no delegate in that turn, there is a fresh un-delegated transcript;
+v0.1.0-rc3 / RC2-9: no text-length proxy). Whether the front only led in or already answered is the model's call too. DECISION = the router model (``coordinator.api.judge_tools``, scripted here). No keyword test of the user's words.
 """
 from __future__ import annotations
 
@@ -43,7 +43,7 @@ def _run(s) -> None:
 def _model_says(tools):
     calls: list = []
 
-    async def fake(text):
+    async def fake(text, *, front_said="", language=None):
         calls.append(text)
         return tools
 
@@ -82,8 +82,6 @@ class NoDelegateNet(unittest.TestCase):
         s, calls = _session("明天上海会下雨吗")
         s.deleg_calls = 1                                    # the front called delegate in that turn
         self.assertEqual((case(s), calls), ([], []))
-        s, calls = _session("明天上海会下雨吗", front_said="明天上海有雨，带把伞吧，气温大概十二度左右呢。")   # the front answered by itself
-        self.assertEqual((case(s), calls), ([], []))
         s, calls = _session(None)
         self.assertEqual((case(s), calls), ([], []))
         s, calls = _session("明天上海会下雨吗", age_s=60)    # a stale transcript from an earlier turn
@@ -108,6 +106,50 @@ class NoDelegateNet(unittest.TestCase):
         src = inspect.getsource(gw.LiveSession._no_delegate_net)
         self.assertNotIn("required_tools", src)
         self.assertNotIn("re.", src)
+
+
+class JudgeToolsWithFrontReplyTests(unittest.IsolatedAsyncioTestCase):
+    """RC2-9 / A3 / A4: the net's decision is the scripted model's answer and nothing in the user's words."""
+
+    async def _judge(self, text, answers, front_said="我帮你查一下。", boom=False):
+        from sophon_live.coordinator import api
+
+        seen: dict = {}
+
+        async def fake(state, questions, **kw):
+            seen["state"], seen["questions"] = state, sorted(questions)
+            if boom:
+                raise RuntimeError("router down")
+            return {"answers": {k: {"type": "choice", "choice": v} for k, v in answers.items()}}
+
+        with mock.patch.object(api.jev_client, "system_one", new=fake):
+            return await api.judge_tools(text, front_said=front_said), seen
+
+    async def test_lead_in_only_plus_a_tool_answer_delegates(self) -> None:
+        tools, seen = await self._judge("明天上海会下雨吗", {"tool": "get_weather", "front_reply": "LEAD_IN_ONLY"})
+        self.assertEqual(tools, ["get_weather"])
+        self.assertEqual(seen["state"]["front_said"], "我帮你查一下。")
+        self.assertNotIn("language", seen["state"])           # RC2-9: no hard-coded language
+
+    async def test_an_answered_front_never_gets_a_second_answer_even_for_a_tool_question(self) -> None:
+        tools, _ = await self._judge("明天上海会下雨吗", {"tool": "get_weather", "front_reply": "ANSWERED"}, front_said="晴，二十度")
+        self.assertEqual(tools, [])
+
+    async def test_no_verdict_on_the_front_reply_is_not_a_yes(self) -> None:
+        tools, _ = await self._judge("明天上海会下雨吗", {"tool": "get_weather"})
+        self.assertEqual(tools, [])
+
+    async def test_weather_words_with_a_none_answer_do_nothing_A3(self) -> None:
+        tools, _ = await self._judge("明天天气怎么样啊天气天气", {"tool": "NONE", "front_reply": "LEAD_IN_ONLY"})
+        self.assertEqual(tools, [])
+
+    async def test_router_down_is_unknown_and_never_a_keyword_guess_A4(self) -> None:
+        tools, _ = await self._judge("明天天气怎么样", {}, boom=True)
+        self.assertIsNone(tools)
+
+    async def test_invalid_tool_option_is_unknown(self) -> None:
+        tools, _ = await self._judge("明天上海会下雨吗", {"tool": "天气", "front_reply": "LEAD_IN_ONLY"})
+        self.assertIsNone(tools)
 
 
 class FrontWordedTaskTests(unittest.IsolatedAsyncioTestCase):

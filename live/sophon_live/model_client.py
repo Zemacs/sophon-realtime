@@ -96,6 +96,11 @@ class Breaker:
             log.warning("model %s recovered: breaker closed", self.name)
         self.state, self.fails, self.probing = "closed", 0, False
 
+    def release_probe(self) -> None:
+        """The caller was cancelled before the service gave a verdict: that is not a success and not a failure, but a half-open probe
+        slot must not stay taken (RC2-3: otherwise the breaker stays half_open and rejects every call until the process restarts)."""
+        self.probing = False
+
     def failure(self, reason: str) -> None:
         self.total_fail += 1
         self.last_fail_ts = time.time()
@@ -156,31 +161,36 @@ async def call(name: str, fn: Callable[[], Awaitable[Any]], *, retries: int = 1,
     total = budget(name) if total_s is None else total_s
     deadline = time.monotonic() + total
     attempt = 0
-    while True:
-        left = deadline - time.monotonic()
-        if left <= 0:
-            br.failure("timeout")
-            raise ModelUnavailable(name, "timeout", f"budget {total:.1f}s")
-        try:
-            res = await asyncio.wait_for(fn(), left)
-            br.success()
-            return res
-        except ModelUnavailable:
-            raise
-        except (asyncio.TimeoutError, TimeoutError):
-            br.failure("timeout")
-            raise ModelUnavailable(name, "timeout", f"budget {total:.1f}s") from None
-        except Exception as e:  # noqa: BLE001
-            if is_connection_error(e) and attempt < retries:
-                attempt += 1
-                pause = random.uniform(0, RETRY_BASE_S * (2 ** attempt))
-                if time.monotonic() + pause < deadline:
-                    log.info("model %s connection error %r, retry %d after %.0f ms", name, e, attempt, pause * 1000)
-                    await asyncio.sleep(pause)
-                    continue
-            reason = "connection" if is_connection_error(e) else "error"
-            br.failure(f"{reason}: {e!r}"[:200])
-            raise ModelUnavailable(name, reason, repr(e)[:200]) from e
+    try:
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                br.failure("timeout")
+                raise ModelUnavailable(name, "timeout", f"budget {total:.1f}s")
+            try:
+                res = await asyncio.wait_for(fn(), left)
+                br.success()
+                return res
+            except ModelUnavailable:
+                raise
+            except (asyncio.TimeoutError, TimeoutError):
+                br.failure("timeout")
+                raise ModelUnavailable(name, "timeout", f"budget {total:.1f}s") from None
+            except Exception as e:  # noqa: BLE001
+                if is_connection_error(e) and attempt < retries:
+                    attempt += 1
+                    pause = random.uniform(0, RETRY_BASE_S * (2 ** attempt))
+                    if time.monotonic() + pause < deadline:
+                        log.info("model %s connection error %r, retry %d after %.0f ms", name, e, attempt, pause * 1000)
+                        await asyncio.sleep(pause)
+                        continue
+                reason = "connection" if is_connection_error(e) else "error"
+                br.failure(f"{reason}: {e!r}"[:200])
+                raise ModelUnavailable(name, reason, repr(e)[:200]) from e
+    except BaseException as e:
+        if not isinstance(e, Exception):          # CancelledError / KeyboardInterrupt: no verdict from the service, free the probe slot
+            br.release_probe()
+        raise
 
 
 def snapshot() -> dict[str, Any]:

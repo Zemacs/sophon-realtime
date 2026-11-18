@@ -181,6 +181,9 @@ class WorkerJob:
     tool_judgment: str = "model"
     # The router model's judgment: did the user explicitly ask to keep this long-term? ``memory_gate`` writes long-term memory only on True.
     explicit_save: bool | None = None
+    # Set by ``api.review_numbers`` when the model judged that an answer with no tool behind it states a looked-up fact: finish_job then
+    # applies number containment to that answer too (RC2-6 backstop for a router that said "no tool" wrongly).
+    check_numbers: bool = False
 
 
 @dataclass

@@ -96,7 +96,7 @@ RESULT_FMT = {"zh": ("后端结果（只能根据这段内容回答，用你自�
 PROGRESS_FMT = {"zh": "后端还在处理（这是进度，不是结果）。用一句很短的口语让用户稍等，不要重复你刚说过的话，不要编结果：\n{c}",
                 "en": "The backend is still working (progress, not the result). Say one very short phrase asking the user to hold on; don't repeat "
                       "what you just said and don't invent a result:\n{c}"}
-NET_FILLER_MAX_CHARS = int(os.environ.get("SOPHON_LIVE_NET_FILLER_MAX", "16"))   # a turn this short is a lead-in, not an answer (structural size, not a reading of words)
+NET_STATS: dict[str, int] = {"asked": 0, "delegated": 0, "router_unavailable": 0}   # RC2-9: the net silently does nothing when the router is down; /health?detail=1 shows how often
 NET_GRACE_S = float(os.environ.get("SOPHON_LIVE_NET_GRACE", "0.8"))   # wait this long after "done" for a trailing tool call before the safety net acts
 DELEG_MODE = os.environ.get("SOPHON_LIVE_DELEG_MODE", "model")   # model: every backend update goes to the model, which decides to speak or <wait>; rules: gateway heuristics
 IDLE_UPDATE_S = float(os.environ.get("SOPHON_LIVE_IDLE_UPDATE", "7.0"))   # model mode: no backend news by then -> tell the model once, it may say a short "hold on"
@@ -155,7 +155,9 @@ def split_pieces(text: str) -> list[str]:
 def _health_detail() -> bytes:
     """/health?detail=1: breaker state of every downstream model (Tag / orch / JEV) as seen by this gateway process."""
     from . import model_client
-    return json.dumps({"gateway": "ok", "downstream": model_client.snapshot()}, ensure_ascii=False).encode()
+    from .coordinator import api as _coord_api
+    return json.dumps({"gateway": "ok", "downstream": model_client.snapshot(), "router_invalid_answers": dict(_coord_api.JUDGE_STATS),
+                       "no_delegate_net": dict(NET_STATS)}, ensure_ascii=False).encode()
 
 
 class ASR:
@@ -611,8 +613,8 @@ class LiveSession:
         """v0.1.0 safety net, structural trigger only. The voice front sometimes says only its lead-in ("我帮你查一下") and ends the
         turn without calling delegate (live: zh_memory 2 of 4, zh_light 1 of 6 on c88195c). The TRIGGER is a state-machine fact, not a
         reading of the user's words: the response is done, the front called no delegate in that turn, and what it said is lead-in sized
-        (<= NET_FILLER_MAX_CHARS, i.e. it never answered). Whether the request needs a tool is then decided by the router MODEL
-        (``coordinator.api.judge_tools``); only a model answer naming a tool makes the gateway delegate the user's own words itself."""
+        (RC2-9: no text-length proxy). The router MODEL then decides, from the user's words and what the front said, whether the front only led
+        in and which tool the request needs (``coordinator.api.judge_tools``); only a model answer naming a tool makes the gateway delegate the user's own words itself."""
         try:
             r = self.resp.get(rid)
             if r is None:
@@ -626,8 +628,6 @@ class LiveSession:
             await asyncio.sleep(NET_GRACE_S)                       # a tool call can trail the done event
             if self.closed or self.deleg_calls != r.get("deleg_n0"):
                 return
-            if len((r.get("text") or "").strip()) > NET_FILLER_MAX_CHARS:
-                return                                             # the front answered by itself: not a filler-only turn
             lu = getattr(self, "last_user", None)
             if not lu or lu[1] < r.get("t0", 0) - 10 or lu[1] <= self.last_deleg_asr_t:   # no fresh transcript, or it was already delegated
                 return
@@ -635,11 +635,15 @@ class LiveSession:
             if not text:
                 return
             from .coordinator.api import judge_tools
-            tools = await judge_tools(text)
+            NET_STATS["asked"] += 1
+            tools = await judge_tools(text, front_said=(r.get("text") or "").strip())   # the MODEL says whether the front only led in
+            if tools is None:
+                NET_STATS["router_unavailable"] += 1
             if not tools or self.closed or self.deleg_calls != r.get("deleg_n0"):
                 return                                             # the model says no tool (or is unavailable): nothing to add
             log.warning("session %s front ended the turn with a filler only; router says %s -> delegating %r", self.id, tools, text)
             self.deleg_calls += 1
+            NET_STATS["delegated"] += 1
             await self._delegate({"call_id": None, "arguments": {"task": text}, "net": "no_delegate"})
         except Exception:  # noqa: BLE001
             log.exception("no-delegate safety net failed")
@@ -799,7 +803,8 @@ class LiveSession:
         if tr is not None:
             tr.mark("route")
             tr.set(route=result.route, decision=result.control.op if result.control else ("NEW" if result.job else result.route),
-                   via=result.via, jev_ms=None if result.jev_ms is None else round(result.jev_ms))
+                   via=result.via, jev_ms=None if result.jev_ms is None else round(result.jev_ms),
+                   **({"judge_invalid": ",".join(result.judge_invalid)} if result.judge_invalid else {}))
         # CANCEL / REFINE: the old (task_id, version) must stop now; its result is never spoken.
         stale = getattr(result, "stale_task", None)
         if stale is not None:
@@ -864,6 +869,8 @@ class LiveSession:
                 tr.add_tool(ev.get("tool", "?"), ev.get("ms"), bool(ev.get("ok")), source=ev.get("source"), fallbacks=ev.get("fallbacks"),
                             orig_source=ev.get("orig_source"), age_s=ev.get("age_s"),
                             city=ev.get("city"), tmin=ev.get("tmin"), tmax=ev.get("tmax"), now=ev.get("now"))
+        from .coordinator.api import review_numbers
+        await review_numbers(job, result)            # model backstop for an un-tooled answer that states a looked-up fact (RC2-6)
         outcome = finish_job(ledger, job, result)    # the Coordinator decides what gets said; stale results are dropped
         if tr is not None and (job.require_tools or outcome.rejected or job.tool_judgment != "model"):
             tr.set(require=",".join(job.require_tools), judged=job.tool_judgment, **({"guard": outcome.rejected} if outcome.rejected else {}))

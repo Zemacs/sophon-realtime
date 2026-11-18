@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .. import model_client
 from . import grounding, intent, jev_client
@@ -35,16 +35,40 @@ def build_faithful_question() -> dict:
     }
 
 
-async def judge_tools(text: str) -> list[str] | None:
+FRONT_REPLY_KEY = "front_reply"
+
+
+def build_front_reply_question() -> dict:
+    return {
+        "type": "choice",
+        "instructions": "front_said 是语音前台对用户这句话已经说出口的话。它是不是已经回答了用户，还是只说了个开场/过渡（比如“我帮你查一下”）就停了？",
+        "criteria": {
+            "LEAD_IN_ONLY": "前台只说了开场或过渡语，没有给出用户要的内容",
+            "ANSWERED": "前台已经回答了用户的问题或完成了请求",
+        },
+    }
+
+
+async def judge_tools(text: str, *, front_said: str = "", language: str | None = None) -> list[str] | None:
     """The router model's answer to "which tool does this request need" for one utterance (used by the gateway's no-delegate net).
+    With ``front_said`` the model also says whether the front already answered; an answered turn returns ``[]`` (never a second answer).
     ``[]`` = none; ``None`` = unknown (router unavailable / non-option answer)."""
+    state: dict = {"utterance": text, "user_said": text, "playback_active": False, "tasks": []}
+    if language:
+        state["language"] = language                       # omitted when unknown: the model reads the language off the words
+    questions: dict = {intent.TOOL_KEY: intent.build_tool_question()}
+    if front_said:
+        state["front_said"] = front_said
+        questions[FRONT_REPLY_KEY] = build_front_reply_question()
     try:
-        resp = await jev_client.system_one({"utterance": text, "user_said": text, "playback_active": False, "tasks": [], "language": "zh"},
-                                           {intent.TOOL_KEY: intent.build_tool_question()})
+        resp = await jev_client.system_one(state, questions)
     except Exception as e:  # noqa: BLE001
         log.warning("tool judgment unavailable: %r", e)
         return None
-    return intent.tools_from_answer(jev_client.choice_answer(resp, intent.TOOL_KEY))
+    tools = intent.tools_from_answer(jev_client.choice_answer(resp, intent.TOOL_KEY))
+    if front_said and jev_client.choice_answer(resp, FRONT_REPLY_KEY) != "LEAD_IN_ONLY":
+        return [] if tools is not None else None           # answered (or no usable verdict): the net adds nothing
+    return tools
 
 
 _ROUTES = frozenset({"STOP_SPEAKING", "CLARIFY", "FAST", "CONTROL", "WORKER"})
@@ -62,6 +86,7 @@ class AdmitResult:
     stale_task: tuple[str, int] | None = None  # (task_id, version) whose in-flight worker must stop
     via: str = "heuristic"  # who decided: guard | jev | heuristic
     jev_ms: float | None = None  # Karpo round trip, when JEV was asked
+    judge_invalid: list = field(default_factory=list)   # RC2-8: router answers that were not an offered option ("tool:invalid", "task_faithful:missing")
     degraded_reason: str = ""  # via=degraded: breaker_open | timeout | connection | error | non_option_answer | jev_disabled
 
 
@@ -110,12 +135,25 @@ async def admit(req: AdmitRequest, ledger: Ledger) -> AdmitResult:
     res.via = meta["via"]
     res.jev_ms = meta["jev_ms"]
     res.degraded_reason = meta.get("degraded_reason", "")
+    res.judge_invalid = list(meta.get("judge_invalid", []))
     log.info(
         "coord admit session=%s utt=%r route=%s decision=%s via=%s%s admit_ms=%d jev_ms=%s",
         req.session_id, (req.delegate_task or req.text or "")[:60], res.route, _decision_label(res), res.via, (":" + res.degraded_reason) if res.degraded_reason else "",
         (time.monotonic() - t0) * 1000, "-" if meta["jev_ms"] is None else int(meta["jev_ms"]),
     )
     return res
+
+
+# RC2-8: how often the router model answers a question with something that is not an offered option (visible in /health via JUDGE_STATS
+# and per turn in the trace as ``judge_invalid``); the code never guesses a replacement.
+JUDGE_STATS: dict[str, int] = {}
+
+
+def _invalid(question: str, answer: object, meta: dict) -> None:
+    kind = "missing" if answer is None else "invalid"
+    JUDGE_STATS[f"{question}_{kind}"] = JUDGE_STATS.get(f"{question}_{kind}", 0) + 1
+    meta.setdefault("judge_invalid", []).append(f"{question}:{kind}")
+    log.warning("router gave a %s answer to the %r question (%r): treated as unknown, not guessed", kind, question, str(answer)[:40])
 
 
 async def _admit(req: AdmitRequest, ledger: Ledger, meta: dict) -> AdmitResult:
@@ -147,7 +185,13 @@ async def _admit(req: AdmitRequest, ledger: Ledger, meta: dict) -> AdmitResult:
                 tool_choice = jev_client.choice_answer(resp, intent.TOOL_KEY)
                 tools = intent.tools_from_answer(tool_choice)
                 explicit_save = intent.explicit_save_from_answer(tool_choice)
-                if jev_client.choice_answer(resp, FAITHFUL_KEY) == "DIFFERENT":
+                faithful = jev_client.choice_answer(resp, FAITHFUL_KEY)
+                # RC2-8: an answer that is not one of the offered options is never guessed AND never silent: it is counted and traced
+                if tools is None:
+                    _invalid("tool", tool_choice, meta)
+                if FAITHFUL_KEY in questions and faithful not in ("SAME", "DIFFERENT"):
+                    _invalid(FAITHFUL_KEY, faithful, meta)
+                if faithful == "DIFFERENT":
                     # model judged the front's task wording unfaithful to the user's words -> the user's own words are the task (provenance)
                     log.warning("delegate task %r judged unfaithful to what the user said; using %r", text[:60], raw[:60])
                     text = raw
@@ -377,22 +421,63 @@ def _ungrounded(job: WorkerJob, result: WorkerResult) -> bool:
     return not any(ev.get("tool") in job.require_tools and tool_succeeded(ev) for ev in result.evidence)
 
 
-# Tools whose results are numeric facts a model could misquote (the check is skipped for tools whose output is a list of headlines, a
-# device ack, a memory note or a clock reading that the speaker re-expresses, e.g. 15:10 -> 下午三点十分).
+# Tools whose results are numeric facts a model could misquote: for these the number check always runs.
 NUMERIC_TOOLS = frozenset({"get_weather", "web_search"})
+
+ANSWER_FACT_KEY = "answer_fact"
+
+
+def _successful_outputs(result: WorkerResult) -> list[dict]:
+    return [ev for ev in result.evidence if tool_succeeded(ev)]
+
+
+def _number_check_applies(job: WorkerJob, result: WorkerResult) -> bool:
+    """When the number-containment check runs (RC2-6): the router named a numeric-fact tool; or it could not judge ("unknown"); or ANY tool
+    succeeded (a news / clock / device answer may only speak numbers its tool output has); or the model judged an un-tooled answer to be a
+    looked-up fact (``review_numbers``). Only a "no tool" judgment with no tool evidence and no such review leaves the answer unchecked."""
+    if set(job.require_tools or []) & NUMERIC_TOOLS or job.tool_judgment != "model" or job.check_numbers:
+        return True
+    return bool(_successful_outputs(result))
 
 
 def _unverified_numbers(job: WorkerJob, result: WorkerResult) -> list[float]:
-    """Numbers in a completed answer that no source of this job contains. Checked when the router named a numeric-fact tool, or when it
-    could not judge at all ("unknown": the answer might be a fabricated fact, so everything is checked)."""
-    if result.status != "completed":
+    """Numbers in a completed answer that no source of this job contains (empty = nothing to hold back)."""
+    if result.status != "completed" or not _number_check_applies(job, result):
         return []
-    tools = set(job.require_tools or [])
-    if job.tool_judgment == "model" and not (tools & NUMERIC_TOOLS):
-        return []
-    sources = [str(ev.get("out") or "") for ev in result.evidence if tool_succeeded(ev)]
+    ok = _successful_outputs(result)
+    sources = [str(ev.get("out") or "") for ev in ok]
     sources.append(job.objective or "")
-    return grounding.unverified_numbers(result.spoken_answer or "", sources)
+    return grounding.unverified_numbers(result.spoken_answer or "", sources, clock12=any(ev.get("tool") == "get_datetime" for ev in ok))
+
+
+def build_answer_fact_question() -> dict:
+    return {
+        "type": "choice",
+        "instructions": "user_said 是用户的请求，answer 是助手准备说出口的回答。回答里有没有给出一个需要现查才可靠的事实（价格、行情、比分、天气、时间、新闻事实）？",
+        "criteria": {
+            "FACT": "回答里陈述了会随时间变化或需要查证的具体事实或数字",
+            "NOT_FACT": "回答是闲聊、创作、常识、转述用户自己的话，或数字只是故事/举例的一部分",
+        },
+    }
+
+
+async def review_numbers(job: WorkerJob, result: WorkerResult) -> None:
+    """RC2-6: a wrong "no tool" router answer used to leave a fabricated fact unchecked. For a completed answer with no successful tool
+    evidence whose numbers appear in none of its sources, ASK THE MODEL whether the answer states a looked-up fact. FACT, or no usable
+    answer (router down / breaker open / non-option): the check applies. NOT_FACT (a joke's 「三只小熊」): left alone. No keywords."""
+    if result.status != "completed" or _number_check_applies(job, result):
+        return
+    if not grounding.unverified_numbers(result.spoken_answer or "", [job.objective or ""]):
+        return                                              # every number is the user's own: nothing to ask
+    try:
+        resp = await jev_client.system_one({"user_said": job.objective, "answer": result.spoken_answer},
+                                           {ANSWER_FACT_KEY: build_answer_fact_question()})
+        verdict = jev_client.choice_answer(resp, ANSWER_FACT_KEY)
+    except Exception as e:  # noqa: BLE001
+        log.warning("answer-fact review unavailable (%r): the number check applies", e)
+        verdict = None
+    if verdict != "NOT_FACT":
+        job.check_numbers = True
 
 
 def _failure_text(job: WorkerJob, result: WorkerResult) -> str:

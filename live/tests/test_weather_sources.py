@@ -36,14 +36,24 @@ WTTR = {
         {"mintempC": "3", "maxtempC": "10", "hourly": [{"chanceofrain": "40", "lang_zh": [{"value": "小雨"}]}]},
     ],
 }
+SOJSON = {
+    "status": 200,
+    "data": {"wendu": "4", "forecast": [
+        {"high": "高温 9℃", "low": "低温 -1℃", "type": "多云"},
+        {"high": "高温 12℃", "low": "低温 2℃", "type": "小雨"},
+    ]},
+}
 ENV = {"SOPHON_WEATHER_TIMEOUT": "0.6", "SOPHON_WEATHER_ROUNDS": "1"}
 
 
-def _router(om=None, wttr=None, om_delay=0.0, wttr_delay=0.0):
+def _router(om=None, wttr=None, om_delay=0.0, wttr_delay=0.0, sojson=None, sj_delay=0.0):
     """A fake _fetch_json: routes by URL, optional delay, an Exception instance is raised."""
 
     async def fetch(url, timeout=5.0):  # noqa: ANN001
-        src, delay, val = ("om", om_delay, om) if "open-meteo" in url else ("wttr", wttr_delay, wttr)
+        if "sojson" in url:
+            src, delay, val = "sojson", sj_delay, sojson
+        else:
+            src, delay, val = ("om", om_delay, om) if "open-meteo" in url else ("wttr", wttr_delay, wttr)
         fetch.calls.append(src)
         if delay:
             await asyncio.sleep(delay)
@@ -115,6 +125,8 @@ class WeatherSourceTests(unittest.IsolatedAsyncioTestCase):
         calls = {"n": 0}
 
         async def fetch(url, timeout=5.0):  # noqa: ANN001
+            if "sojson" in url:
+                raise OSError("sojson down")
             if "open-meteo" in url:
                 calls["n"] += 1
                 if calls["n"] == 1:
@@ -149,6 +161,26 @@ class WeatherSourceTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.dict(os.environ, ENV), mock.patch.object(weather, "_fetch_json", fetch):
             text = await weather.run({"city": "Nowhereville", "lang": "en"})
         self.assertEqual(text, "No weather data for Nowhereville.")
+
+    async def test_cn_hosted_source_answers_when_the_overseas_ones_hang(self) -> None:
+        fetch = _router(om=OM, wttr=WTTR, om_delay=9.0, wttr_delay=9.0, sojson=SOJSON)
+        with mock.patch.dict(os.environ, ENV), mock.patch.object(weather, "_fetch_json", fetch):
+            t0 = time.monotonic()
+            text, meta = await weather.run_detailed({"city": "北京", "when": "tomorrow"})
+        self.assertLess(time.monotonic() - t0, 0.5)
+        self.assertEqual(meta["source"], "sojson")
+        # this feed has no rain probability: say nothing about it rather than invent one
+        self.assertEqual(text, "北京明天小雨，气温2到12度。")
+
+    async def test_sojson_is_skipped_for_cities_it_has_no_code_for(self) -> None:
+        fetch = _router(om=OM, wttr=WTTR, sojson=SOJSON)
+        with mock.patch.dict(os.environ, ENV), mock.patch.object(weather, "_fetch_json", fetch):
+            await weather.run({"city": "东京", "when": "tomorrow"})
+        self.assertNotIn("sojson", fetch.calls)
+
+    async def test_sojson_error_status_is_not_success(self) -> None:
+        self.assertIsNone(weather._normalize_sojson({"status": 304, "data": {}}, 1, zh=True))
+        self.assertIsNone(weather._normalize_sojson({"status": 200, "data": {"forecast": [{"high": "x"}]}}, 0, zh=True))
 
     async def test_sources_can_be_selected_for_ab_runs(self) -> None:
         fetch = _router(om=OM, wttr=WTTR)

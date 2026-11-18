@@ -1,9 +1,9 @@
-"""City weather from two independent sources, raced: Open-Meteo (no key) and wttr.in.
+"""City weather from independent sources, raced: Open-Meteo, sojson (CN-hosted, mainland cities) and wttr.in.
 
-Both are flaky from the GPU box (measured: each answers only some of the time, 2-40 s), so they run
-concurrently with a short per-source timeout; the first source that returns real data wins and the other
-is cancelled. If every source fails or times out the caller gets an honest failure sentence, never
-invented numbers. ``SOPHON_WEATHER_SOURCES`` (default ``open-meteo,wttr``) selects sources for A/B runs.
+All of them are flaky from the GPU box (measured: each answers only some of the time, 1-40 s), so they run
+concurrently with a short per-source timeout; the first source that returns real data wins and the rest
+are cancelled. If every source fails or times out the caller gets an honest failure sentence, never
+invented numbers. ``SOPHON_WEATHER_SOURCES`` (default ``open-meteo,sojson,wttr``) selects sources for A/B runs.
 """
 from __future__ import annotations
 
@@ -63,6 +63,14 @@ COORDS: dict[str, tuple[float, float]] = {
     "新加坡": (1.35, 103.82),
 }
 
+# sojson (t.weather.sojson.com): CN-hosted, no key, mainland cities by weather.com.cn city code
+_SOJSON = "http://t.weather.sojson.com/api/weather/city/{code}"
+SOJSON_CODES: dict[str, str] = {
+    "北京": "101010100", "上海": "101020100", "广州": "101280101", "深圳": "101280601", "杭州": "101210101",
+    "成都": "101270101", "南京": "101190101", "武汉": "101200101", "西安": "101110101", "重庆": "101040100",
+    "天津": "101030100", "苏州": "101190401",
+}
+
 # WMO weather interpretation codes (Open-Meteo) → (中文, English)
 _WMO: dict[int, tuple[str, str]] = {
     0: ("晴", "clear"), 1: ("大部晴朗", "mostly clear"), 2: ("多云", "partly cloudy"), 3: ("阴", "overcast"),
@@ -106,9 +114,9 @@ def _rounds() -> int:
 
 
 def _source_names() -> list[str]:
-    raw = os.environ.get("SOPHON_WEATHER_SOURCES", "open-meteo,wttr")
-    names = [x.strip() for x in raw.split(",") if x.strip() in ("open-meteo", "wttr")]
-    return names or ["open-meteo", "wttr"]
+    raw = os.environ.get("SOPHON_WEATHER_SOURCES", "open-meteo,sojson,wttr")
+    names = [x.strip() for x in raw.split(",") if x.strip() in ("open-meteo", "sojson", "wttr")]
+    return names or ["open-meteo", "sojson", "wttr"]
 
 
 def _resolve_city(city: str) -> tuple[str, str, bool]:
@@ -189,6 +197,32 @@ def _normalize_om(data: dict[str, Any], idx: int, *, zh: bool) -> dict[str, Any]
     }
 
 
+def _normalize_sojson(data: dict[str, Any], idx: int, *, zh: bool) -> dict[str, Any] | None:
+    if int(data.get("status") or 0) != 200:
+        return None
+    fc = (data.get("data") or {}).get("forecast") or []
+    if len(fc) <= idx:
+        return None
+    day = fc[idx]
+    hi = re.search(r"-?\d+", str(day.get("high") or ""))
+    lo = re.search(r"-?\d+", str(day.get("low") or ""))
+    typ = str(day.get("type") or "").strip()
+    if not (hi and lo and typ):
+        return None
+    now = (data.get("data") or {}).get("wendu")
+    return {
+        "tmin": lo.group(0), "tmax": hi.group(0), "desc": typ if zh else typ,  # the feed only speaks Chinese
+        "precip": None, "now": str(now) if now not in (None, "") else None,
+    }
+
+
+async def _from_sojson(display_name: str, idx: int, zh: bool, timeout: float) -> dict[str, Any] | None:
+    code = SOJSON_CODES.get(display_name)
+    if code is None:
+        return None
+    return _normalize_sojson(await _fetch_json(_SOJSON.format(code=code), timeout), idx, zh=zh)
+
+
 async def _from_wttr(query_name: str, idx: int, zh: bool, timeout: float) -> dict[str, Any] | None:
     data = await _fetch_json(_WTTR.format(city=urllib.parse.quote(query_name)), timeout)
     return _normalize_wttr(data, idx, zh=zh)
@@ -215,11 +249,14 @@ async def _first_ok(query_name: str, display_name: str, idx: int, zh: bool) -> t
     for rnd in range(_rounds()):
         tasks: dict[asyncio.Task, tuple[str, float]] = {}
         for name in _source_names():
-            coro = (
-                _from_open_meteo(display_name, idx, zh, timeout)
-                if name == "open-meteo"
-                else _from_wttr(query_name, idx, zh, timeout)
-            )
+            if name == "sojson" and display_name not in SOJSON_CODES:
+                continue  # mainland cities only
+            if name == "open-meteo":
+                coro = _from_open_meteo(display_name, idx, zh, timeout)
+            elif name == "sojson":
+                coro = _from_sojson(display_name, idx, zh, timeout)
+            else:
+                coro = _from_wttr(query_name, idx, zh, timeout)
             tasks[asyncio.ensure_future(asyncio.wait_for(coro, timeout + 0.5))] = (name, time.monotonic())
         pending = set(tasks)
         try:
@@ -247,6 +284,9 @@ async def _first_ok(query_name: str, display_name: str, idx: int, zh: bool) -> t
                 t.cancel()
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)  # reap: no "exception was never retrieved"
+            for t in tasks:
+                if t.done() and not t.cancelled():
+                    t.exception()  # mark retrieved (a source that failed in the same tick as the winner)
     return None, "", notes
 
 
@@ -284,12 +324,14 @@ async def run_detailed(args: dict[str, Any] | None = None) -> tuple[str, dict[st
     tmin, tmax, desc, precip, now = data["tmin"], data["tmax"], data["desc"], data["precip"], data.get("now")
     if not zh:
         day_word = "tomorrow" if when == "tomorrow" else "today"
-        msg = f"{name} {day_word}: {desc}, {tmin} to {tmax}°C, {precip}% chance of rain."
+        rain = f", {precip}% chance of rain" if precip is not None else ""
+        msg = f"{name} {day_word}: {desc}, {tmin} to {tmax}°C{rain}."
         if idx == 0 and now is not None:
             msg += f" Now {now}°C."
         return msg, meta
     day_label = "明天" if when == "tomorrow" else "今天"
-    msg = f"{name}{day_label}{desc}，气温{tmin}到{tmax}度，降水概率{precip}%。"
+    rain = f"，降水概率{precip}%" if precip is not None else ""
+    msg = f"{name}{day_label}{desc}，气温{tmin}到{tmax}度{rain}。"
     if idx == 0 and now is not None:
         msg += f"现在{now}度。"
     return msg, meta

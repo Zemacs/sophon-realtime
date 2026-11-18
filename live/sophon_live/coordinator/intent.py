@@ -12,30 +12,61 @@ from __future__ import annotations
 
 import re
 
-# Realtime facts (Critic I-8): prices, quotes, FX, whether a market is open, scores, box office, traffic, "who is the current X".
-# Their answer changes by the hour, so the model must not give one from its head: they are tool-backed (web_search) and,
-# if the tool fails or finds nothing, the user hears an honest failure. Deliberately wide: a chit-chat question wrongly
-# sent to the tool costs a lookup; a fact answered without it is a fabrication.
-_MONEY = r"美元|美金|欧元|日元|英镑|港币|港元|澳元|加元|韩元|卢布|比特币|以太坊|狗狗币|BTC|ETH|USDT|黄金|白银|金价|银价|油价|原油|汽油|柴油|铜价|白糖|猪肉价"
-_MARKET = r"A股|a股|港股|美股|沪指|深指|上证|深证|创业板|科创板|恒生|纳斯达克|纳指|道指|道琼斯|标普|大盘|指数|基金|净值|涨停|跌停|开盘|收盘|开市|休市|交易所|市值|股价|股票|股市|行情|涨了|跌了|涨幅|跌幅"
-_SPORT_ETC = r"比分|比赛结果|谁赢了|赢了没|赛程|战绩|积分榜|世界杯|欧冠|英超|西甲|NBA|CBA|奥运|票房|热搜|榜单|航班|晚点|延误|路况|堵车|限行|地震|台风|疫情"
-_PRICE = r"多少钱|什么价|价格|报价|价位|售价|汇率|兑换|换算|兑人民币|兑美元|兑[^，。！？]{1,3}(多少|汇率|换)"
-_FRESH_Q = r"(今天|今日|现在|目前|当前|最新|实时|刚刚|此刻|这会儿)[^，。！？]{0,10}(多少|几点开|几多|多高|多低|涨|跌|开盘|收盘|开了吗|开门|营业|比分|排名|第几|结果|怎么样了|什么情况|发生了什么|是谁|谁)"
-_CURRENT_OFFICE = r"现任|在任的|最新一[任届期]|当前的?(总统|首相|总理|主席|冠军|纪录)"
-_REALTIME_FACTS = "|".join((
-    rf"(?:{_MONEY})[^，。！？]{{0,8}}(?:多少|几|价|汇|涨|跌|行情|报价|兑)",    # 「比特币现在多少钱」「美元兑人民币是多少」「金价」
-    rf"(?:兑|换)[^，。！？]{{0,4}}(?:{_MONEY}|人民币)", r"人民币[^，。！？]{0,6}(?:汇|兑|多少|换)",
-    _MARKET, _SPORT_ETC, _PRICE, _FRESH_Q, _CURRENT_OFFICE,
-    r"exchange rate|stock price|share price|bitcoin|\bbtc\b|\bnasdaq\b|dow jones|s&p 500|\bscore\b|box office|\bprice of\b|how much is|live score|market open",
-))
+# Realtime facts (Critic I-8, narrowed by I-9): prices, quotes, FX, market status, scores, box office, traffic, "who is the current X".
+# Their answer changes by the hour, so the model must not give one from its head: they are tool-backed (web_search) and, if the
+# tool fails or finds nothing, the user hears an honest failure. A topic word alone is NOT a realtime signal (地震 / 世界杯 / 基金 /
+# 汇率 / NBA ... turn up in definitions, history and chit-chat): it takes a topic + a "what is it NOW" ask (price / quote / status /
+# score / alert) or a price noun, and an explanatory sentence (什么意思, 为什么, 的历史 ...) is not a lookup.
+# Misclassification is measured, not guessed: tests/test_r4_intent_gate.py (labeled set in tests/intent_cases.py).
+_TIME = r"今天|今日|现在|目前|当前|最新|实时|刚才|刚刚|此刻|这会儿|昨晚|昨天|今晚|最近|明天|本周|这周|周末|上一场|那场"
+_ASSET = (r"美元|美金|欧元|日元|英镑|港币|港元|澳元|加元|韩元|卢布|人民币|比特币|以太坊|狗狗币|BTC|ETH|USDT|黄金|白银|原油|汽油|柴油|"
+          r"基金|股票|股市|A股|a股|港股|美股|大盘|沪指|深指|上证|深证|创业板|科创板|恒生|恒指|纳斯达克|纳指|道指|道琼斯|标普|沪深300|日经|综指|成指")
+_QTY = (r"多少(?:钱|点|元|块|美元|人民币|日元|欧元|英镑|港币|盎司|一[克斤升吨桶个枚股]|[了吗呢啊？?]*$)|什么价|价格|涨|跌|点位|开盘|收盘|开市|休市|"
+        r"行情|走势|怎么样|情况|牌价|兑|换|汇")
+_ASSET_QUOTE = rf"(?:{_ASSET})[^，。！？]{{0,10}}(?:{_QTY})"
+_PRICE_NOUN = r"股价|金价|银价|油价|汇率|牌价|报价|售价|价位|开盘价|收盘价|市值|涨停|跌停|净值|多少钱|什么价|价格"
+_CHARTS = r"票房|热搜|热榜|比分|赛果|比赛结果|积分榜|赛程"
+_SPORT = r"NBA|CBA|欧冠|英超|西甲|德甲|意甲|法甲|中超|世界杯|奥运|F1|网球公开赛|温网|大满贯"
+_SPORT_NOW = rf"(?:{_SPORT})[^，。！？]{{0,12}}(?:{_TIME})|(?:{_TIME})[^，。！？]{{0,12}}(?:{_SPORT})"
+_SPORT_ASK = r"怎么样|打得|比分|战况|结果|几比几|比赛|赢|输|开赛|几点|直播|赛程"
+_OUTCOME_NOW = rf"(?:{_TIME})[^，。！？]{{0,10}}(?:赢了|输了|赢没赢|谁赢|谁输|打赢|夺冠|晋级)|(?:谁赢了|谁输了|赢了吗|赢了没)[^，。！？]{{0,6}}(?:{_SPORT})|(?:谁赢了|谁输了)[^，。！？]{{0,6}}(?:{_TIME})"
+_EVENT = rf"(?:{_TIME})[^，。！？]{{0,8}}(?:地震|台风|海啸|暴雨|山火|疫情)|(?:地震|台风|海啸|疫情|山火)[^，。！？]{{0,6}}(?:了吗|了没|预警|几级|多少级|登陆|最新|动态|路径)"
+_TRANSPORT = (r"(?:航班|高铁|火车|列车|地铁|飞机)[^，。！？]{0,12}(?:晚点|延误|正点|取消了|到哪了|几点到|起飞了吗|还有票)|[A-Za-z]{2}\d{3,4}[^，。！？]{0,8}(?:晚点|延误|起飞|到)|"
+              rf"路况|拥堵|堵车吗|堵不堵|堵吗|限不限行|限行(?:吗|尾号|规定)|(?:{_TIME})[^，。！？]{{0,6}}限行")
+_OFFICE = (r"现任[^，。！？]{0,10}(?:总统|首相|总理|主席|部长|市长|省长|CEO|总裁|主帅|教练|冠军|首富|董事长|院长|校长|书记)|最新一[任届期]|"
+           rf"(?:{_TIME})的?[^，。！？]{{0,6}}(?:首富|冠军|总统|首相|总理|主席|纪录保持者|榜首)")
+_FRESH = r"最新(?:的)?(?:消息|动态|报道|数据|价格|行情|汇率|战况|比分)|实时(?:价格|行情|汇率|数据|比分|路况)"
+_EN = (r"exchange rate|stock price|share price|box office|live score|market (?:is )?open|stock market (?:is )?open|price of|\bscore\b|who won|did the [^.?!]{0,20} win|"
+       r"(?:bitcoin|btc|ethereum|eth|gold|oil|crude|dollar|euro|yen|pound)\b[^.?!]{0,20}\b(?:price|rate|worth|trading)\b|"
+       r"how much is [^.?!]{0,20}(?:bitcoin|btc|dollar|euro|yen|pound|gold|oil|tesla|nvidia|stock|share)")
+_REALTIME_RE = re.compile("|".join((_ASSET_QUOTE, _PRICE_NOUN, _CHARTS, rf"(?:{_SPORT_NOW})(?=.*(?:{_SPORT_ASK}))", _OUTCOME_NOW, _EVENT, _TRANSPORT, _OFFICE, _FRESH, _EN)), re.I)
+# an explanatory / definitional / how-to sentence is knowledge, not a lookup, even when it carries a topic word
+_STRONG_VETO = re.compile(r"什么意思|什么是|有什么(?:区别|不同|风险|影响)|区别|的历史|原理|由来|stand for|哪一年|多久[办开]|多长时间|怎么(?:统计|排)")
+# unit conversion (厘米→英寸, 斤→克) is arithmetic, not a lookup; the same words with a currency / metal / coin ARE (一百美元换算成人民币)
+_UNIT_CONVERT = re.compile(r"换算|折合|等于多少")
+_MONEYISH = re.compile(r"美元|美金|欧元|日元|英镑|港币|港元|澳元|加元|韩元|卢布|人民币|比特币|以太坊|狗狗币|BTC|ETH|USDT|黄金|白银")
+# ...softer ones are cancelled by a "now" word ("为什么今天A股跌这么多" is still a lookup)
+_WEAK_VETO = re.compile(r"为什么|如何|怎么(?!样)|是怎么|怎样(?!了)")
+_NOW = re.compile(_TIME)
+
+
+def is_realtime_fact(text: str) -> bool:
+    t = (text or "").strip()
+    if not t or not _REALTIME_RE.search(t) or _STRONG_VETO.search(t):
+        return False
+    if _UNIT_CONVERT.search(t) and not _MONEYISH.search(t):
+        return False
+    currency_conversion = bool(_UNIT_CONVERT.search(t) and _MONEYISH.search(t))     # 「美元怎么换算成人民币」 wants today's rate
+    return not (_WEAK_VETO.search(t) and not _NOW.search(t) and not currency_conversion)
+
 
 # (tool name, pattern) in priority order; the first matching pattern wins for the *primary* tool.
 _PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("get_weather", re.compile(r"天气|下雨|下雪|下不下|气温|温度|冷不冷|热不热|带伞|穿什么|weather|rain|snow|temperature|forecast", re.I)),
     ("get_news", re.compile(r"新闻|头条|快讯|headline|\bnews\b", re.I)),
-    ("get_datetime", re.compile(r"几点|现在时间|当前时间|什么时间|几号|星期几|周几|礼拜几|今天日期|今天的日期|what time|the time|what day|today'?s date|\bdate\b", re.I)),
+    ("get_datetime", re.compile(r"几点(?!开|到|起|出|下班|上班|吃|睡|见|结束|放学|出发|降落)|现在时间|当前时间|什么时间|几号|星期几|周几|礼拜几|今天日期|今天的日期|what time|the time|what day|today'?s date|\bdate\b", re.I)),
     ("device_control", re.compile(r"(打开|关掉|关闭|关上|调高|调低|调亮|调暗|开|关)[^，。！？]{0,6}(灯|空调|窗帘|电视|风扇|插座)|(灯|空调|窗帘|电视|风扇|插座)[^，。！？]{0,3}(打开|关掉|关闭|关上|开|关)|音量|闹钟|设个提醒|设置提醒|turn (on|off)|\blights?\b|volume|alarm|curtain|\btv\b", re.I)),
-    ("web_search", re.compile(r"搜索|搜一下|搜一搜|百度一下|google|\bsearch\b|" + _REALTIME_FACTS, re.I)),
+    ("web_search", re.compile(r"搜索|搜一下|搜一搜|百度一下|google|\bsearch\b", re.I)),
     ("memory_note", re.compile(r"记住|记下|别忘了|你还?记得|上次说|之前说|我的偏好|喜欢吃什么|喜欢喝什么|remember|recall", re.I)),
 )
 
@@ -49,6 +80,8 @@ def required_tools(text: str) -> list[str]:
     for name, pat in _PATTERNS:
         if pat.search(t) and name not in out:
             out.append(name)
+    if "web_search" not in out and is_realtime_fact(t):
+        out.append("web_search")
     return out
 
 

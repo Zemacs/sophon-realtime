@@ -20,6 +20,8 @@ import urllib.request
 from html import unescape
 from typing import Any
 
+from . import inflight as _inflight_mod
+
 _INSTANT_URL = "https://api.duckduckgo.com/"
 _LITE_URL = "https://lite.duckduckgo.com/lite/"
 _UA = "sophon-live-assistant/1.0"
@@ -59,10 +61,10 @@ def _no_results(query: str, *, zh: bool) -> str:
 
 
 # urllib cannot be interrupted: a cancelled hedge leaves its thread running until its own socket timeout (<= the attempt's remaining
-# budget, <= 5.5 s). So the number of such threads in flight is capped (Critic S-9): beyond it an attempt fails at once instead
-# of piling up sockets and starving the shared thread pool when searches arrive faster than the stragglers finish.
-_INFLIGHT_MAX = int(os.environ.get("SOPHON_SEARCH_MAX_INFLIGHT", "12"))
-_inflight = threading.BoundedSemaphore(_INFLIGHT_MAX)
+# budget, <= 5.5 s). The number of such threads in flight is capped (Critic S-9), and the cap is shared with the news tool
+# (assistant_tools/inflight.py, S-14): beyond it an attempt fails at once instead of piling up sockets.
+_INFLIGHT_MAX = _inflight_mod.MAX_INFLIGHT
+_inflight = _inflight_mod.SHARED
 
 
 def _urlopen(url: str, timeout: float = 20.0) -> bytes:

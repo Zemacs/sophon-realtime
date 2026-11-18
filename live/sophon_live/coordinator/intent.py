@@ -25,7 +25,7 @@ _ASSET = (_CCY_CODE + r"|美元|美金|欧元|日元|英镑|港币|港元|澳元
 _QTY = (r"多少(?:钱|点|元|块|美元|人民币|日元|欧元|英镑|港币|盎司|一[克斤升吨桶个枚股]|[了吗呢啊？?]*$)|什么价|价格|涨|跌|点位|开盘|收盘|开市|休市|"
         r"行情|走势|怎么样|情况|牌价|兑|换|汇|折合|折算|折成")
 _ASSET_QUOTE = rf"(?:{_ASSET})[^，。！？]{{0,10}}(?:{_QTY})"
-_PRICE_NOUN = r"股价|金价|银价|油价|汇率|牌价|报价|售价|价位|开盘价|收盘价|市值|涨停|跌停|净值|多少钱|什么价|价格"
+_PRICE_NOUN = r"股价|金价|银价|油价|汇率|中间价|买入价|卖出价|牌价|报价|售价|价位|开盘价|收盘价|市值|涨停|跌停|净值|多少钱|什么价|价格"
 _CHARTS = r"票房|热搜|热榜|比分|赛果|比赛结果|积分榜|赛程"
 _SPORT = r"NBA|CBA|欧冠|英超|西甲|德甲|意甲|法甲|中超|世界杯|奥运|F1|网球公开赛|温网|大满贯"
 _SPORT_NOW = rf"(?:{_SPORT})[^，。！？]{{0,12}}(?:{_TIME})|(?:{_TIME})[^，。！？]{{0,12}}(?:{_SPORT})"
@@ -43,7 +43,7 @@ _EN = (r"exchange rate|convert [^.?!]{0,40}\b(?:" + _EN_CCY + r")\b|\bin (?:" + 
        r"how much is [^.?!]{0,20}(?:bitcoin|btc|dollar|euro|yen|pound|gold|oil|tesla|nvidia|stock|share)")
 _REALTIME_RE = re.compile("|".join((_ASSET_QUOTE, _PRICE_NOUN, _CHARTS, rf"(?:{_SPORT_NOW})(?=.*(?:{_SPORT_ASK}))", _OUTCOME_NOW, _EVENT, _TRANSPORT, _OFFICE, _FRESH, _EN)), re.I)
 # an explanatory / definitional / how-to sentence is knowledge, not a lookup, even when it carries a topic word
-_STRONG_VETO = re.compile(r"什么意思|什么是|有什么(?:区别|不同|风险|影响)|区别|的历史|原理|由来|stand for|哪一年|我[^，。！？]{0,4}有多少钱|多久[办开]|多长时间|怎么(?:统计|排)")
+_STRONG_VETO = re.compile(r"什么意思|什么是|有什么(?:区别|不同|风险|影响)|区别|的历史|原理|由来|stand for|密度|熔点|沸点|硬度|最高时速|最大时速|会不?会?影响|影响[^，。！？]{0,6}[吗呢]|哪一年|我[^，。！？]{0,4}有多少钱|多久[办开]|多长时间|怎么(?:统计|排)")
 # unit conversion (厘米→英寸, 斤→克, 一盎司黄金→克) is arithmetic, not a lookup. It stays one only when a CURRENCY / coin (美元 / USD /
 # 比特币 ...) or an explicit price word (多少钱 / 价格) is in the sentence: 黄金 / 白银 / 原油 alone are goods with a weight or volume,
 # not a currency (S-20): 把一盎司黄金换算成克 is free, 一克黄金折合多少人民币 / 一克黄金多少钱 is a lookup.
@@ -64,7 +64,7 @@ _NOW_WIDE = _TIME + r"|今年|本月|这个月|本季度|近期|眼下|当下|�
 _ENTITY = (r"汇率|利率|中间价|买入价|卖出价|LPR|降息|加息|准备金|国债|收益率|股价|股指|成交额|成交量|两市|沪深|北向|南向|涨停|跌停|净值|市值|财报|营收|ETF|"
            r"港元|离岸|在岸|金价|银价|油价|汽油|柴油|原油|布伦特|期货|比特币|以太坊|美股|港股|A股|道指|纳指|标普|恒指|沪指|上证|深证|大盘|基金|股票|"
            r"比分|赛程|比赛|开赛|联赛|杆位|排位赛|决赛|夺冠|冠军|晋级|战绩|积分榜|射手榜|世界杯|欧冠|英超|西甲|中超|NBA|CBA|F1|温网|公开赛|奥运|球赛|对阵|"
-           r"限号|限行|尾号|路况|堵车|拥堵|晚点|延误|航班|高铁|火车|动车|地铁|班次|停运|余票|车票|机票|"
+           r"对谁|打谁|限号|限行|尾号|路况|堵车|拥堵|晚点|延误|航班|高铁|火车|动车|地铁|班次|停运|余票|车票|机票|"
            r"地震|台风|寒潮|暴雨|暴雪|预警|海啸|山火|疫情|"
            r"总统|首相|总理|主席|秘书长|部长|市长|省长|总裁|CEO|得主|首富|榜首|纪录保持者|"
            r"奥斯卡|诺贝尔|格莱美|金球奖|艾美奖|金鸡奖|金马奖|最佳影片|最佳男|最佳女|热搜|热榜|票房|上映|开奖|彩票|双色球|大乐透|发售|售价|零售价|报价|多少钱|销量|发布会|失业率|CPI|PPI|GDP|PMI|通胀")
@@ -74,7 +74,7 @@ _QTY_NOW = r"多少|几[点号位个只条场度分级轮名]?|了吗|吗|了没
 _PERSONAL = re.compile(r"你(?:觉得|认为|喜欢|会|能|知道|想|的|在|是|有|吗)|(?<![帮告诉给替跟让请烦])我(?!想知道|想问|想查|想看看|想了解|要知道|要问|要查|问|查|想确认)|咱|心情|开心|难过|过得|累|困|饿|无聊|"
                        r"帮我(?:写|想|编|翻译)|教我|给我(?:讲|写|推荐)|推荐|故事|顺口溜|造句|诗|歌词|笑话|走了|睡了|吃了|喝了|花了|听到|听见|"
                        r"write|poem|story|joke|song|recommend|my |i am|i'm|do you", re.I)
-_STABLE = re.compile(r"哪年|哪一年|什么时候(?:成立|开始|发明|出现|诞生|创立)|成立|创立|创始|设立|发明|诞生|起源|由来|历史|总部|首都|最先|最早|第一届|第一个|吉祥物|全称|缩写|简称|"
+_STABLE = re.compile(r"多少年|几年一次|多久一次|举办一次|哪年|哪一年|什么时候(?:成立|开始|发明|出现|诞生|创立)|成立|创立|创始|设立|发明|诞生|起源|由来|历史|总部|首都|最先|最早|第一届|第一个|吉祥物|全称|缩写|简称|"
                      r"组成|分为|几种|原理|概率|计算|代表什么|叫什么|长什么样|颜色|任期|一般|通常|为什么|有哪些|"
                      r"光速|音速|圆周率|沸点|冰点|熔点|常数|半径|直径|周长|体积|why|history|called|stand for|invented|founded|how many players", re.I)
 _ARITH = re.compile(r"[0-9一二三四五六七八九十百千万两]+[^，。！？]{0,3}(?:加|减|乘|除|等于|\+|-|\*|/)|摄氏|华氏|公里|厘米|公斤|千克|英寸|英里|盎司|桶|小时|分钟|秒")
@@ -105,8 +105,17 @@ def _fallback_realtime(t: str) -> bool:
     return bool(_EN_NOW.search(t) and _EN_ENTITY.search(t))                          # English, same two halves
 
 
+# "我昨天看了NBA比赛很精彩" / "我昨天买了一支基金很后悔": the user telling about their own day is not asking for a value. Cancelled by
+# any question word, so "我昨天看的比赛谁赢了" is still a lookup.
+_NARRATIVE = re.compile(r"我[^，。！？]{0,6}(?:看了|看过|打了|踢了|玩了|听了|去了|买了|卖了|逛了|看完)")
+
+
+def _just_telling(t: str) -> bool:
+    return bool(_NARRATIVE.search(t)) and not _QUESTION_RE.search(t)
+
+
 def _primary_realtime(t: str) -> bool:
-    if not _REALTIME_RE.search(t) or _STRONG_VETO.search(t):
+    if not _REALTIME_RE.search(t) or _STRONG_VETO.search(t) or _just_telling(t):
         return False
     if _UNIT_CONVERT.search(t) and not _MONEYISH.search(t):
         return False                                    # unit conversion is arithmetic, never a lookup

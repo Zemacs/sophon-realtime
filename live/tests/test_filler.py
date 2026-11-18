@@ -26,8 +26,9 @@ class PadForTests(unittest.TestCase):
         for t in ("现在几点了", "讲个笑话", "讲一个不一样的笑话", "你好"):
             self.assertEqual(intent.pad_for(t), "", t)
 
-    def test_memory_recall_is_a_lookup(self) -> None:
-        self.assertEqual(intent.pad_for("用户上次说喜欢吃什么"), "我帮你查一下。")
+    def test_memory_recall_has_no_filler(self) -> None:
+        # live: with a lead-in the front sometimes ended the turn after it and never called delegate (zh_memory 4/4 failed)
+        self.assertEqual(intent.pad_for("用户上次说喜欢吃什么"), "")
 
 
 class FrontInstructionTests(unittest.TestCase):
@@ -53,10 +54,10 @@ class SystemPromptTests(unittest.TestCase):
         self.assertTrue(p.startswith("你是小助手。"))
         self.assertIn("我帮你查一下", p)
         self.assertIn("好的，马上", p)
-        self.assertIn("讲笑话，不要说任何过渡语", p)
+        self.assertIn("问我记得什么（记忆），不要说任何过渡语", p)
         self.assertIn("绝不能只说过渡语就结束", p)         # v0.1.0: lead-in alone must never end the turn (zh_memory / zh_light regression)
         s.lang = "en"
-        self.assertIn("a joke, say nothing", s._sys())
+        self.assertIn("what you remember about the user (memory), say nothing", s._sys())
 
 
 if __name__ == "__main__":

@@ -67,13 +67,13 @@ def clean_text(t: str, lang: str) -> str:
 DELEGATE = {
     "zh": {"type": "function", "name": "delegate",
            "description": "把需要后端完成的事交给后端助手：查实时或外部信息（时间、日期、天气、新闻、搜索）、查用户的记忆和资料、控制设备或调用任何功能、"
-                          "看图。调用前的过渡语按类型说：查天气、新闻、搜索、记忆这类查询，说一句「我帮你查一下」；控制设备，说「好的，马上」；"
-                          "问时间日期、讲笑话这类很快的事，不要说过渡语，直接调用。闲聊、常识和你自己就知道的知识直接回答，不要调用。",
+                          "看图。调用前的过渡语按类型说：查天气、新闻、搜索这类查询，说一句「我帮你查一下」；控制设备，说「好的，马上」；"
+                          "问时间日期、讲笑话、问你记得什么这类很快的事，不要说过渡语，直接调用。闲聊、常识和你自己就知道的知识直接回答，不要调用。",
            "parameters": {"type": "object", "properties": {"task": {"type": "string", "description": "一句话写清楚用户要什么"}}, "required": ["task"]}},
     "en": {"type": "function", "name": "delegate",
            "description": "Hand work that needs the backend to the backend assistant: live or external information (time, date, weather, news, search), "
-                          "the user's memories and profile, controlling devices or calling any function, looking at images. Before calling, say a very short lead-in that fits the request: for lookups (weather, news, search, memory) \"Let me check\"; for device control \"Sure, on it\"; "
-                          "for quick things (the time or date, a joke) say nothing and call it right away. Answer chit-chat, general "
+                          "the user's memories and profile, controlling devices or calling any function, looking at images. Before calling, say a very short lead-in that fits the request: for lookups (weather, news, search) \"Let me check\"; for device control \"Sure, on it\"; "
+                          "for quick things (the time or date, a joke, what you remember about the user) say nothing and call it right away. Answer chit-chat, general "
                           "knowledge and anything you already know yourself without calling it.",
            "parameters": {"type": "object", "properties": {"task": {"type": "string", "description": "What the user wants, in one sentence"}}, "required": ["task"]}},
 }
@@ -82,10 +82,10 @@ SPOKEN_RULE = {"zh": "\n\n你的回复会被直接合成为语音说出来：用
                      "spoken, no parenthetical notes, emoji or markdown."}
 # The Tag plugin's built-in tool preamble (vLLM :8000, not ours to change) says "say 我帮你查一下 first" for every tool, which is
 # why the lead-in was the same for jokes and the time. The session system prompt is ours: it overrides that per request type.
-FILLER_RULE = {"zh": "\n\n需要后台办的事，一定要调用 delegate。调用之前只说一句很短的过渡语，说完必须在同一轮马上调用 delegate，绝不能只说过渡语就结束。过渡语按类型：查天气、新闻、搜索、记忆，说「我帮你查一下」；控制设备，说「好的，马上」；"
-                     "问时间或日期、讲笑话，不要说任何过渡语，直接调用 delegate（这条优先于其他关于过渡语的举例）。",
-               "en": "\n\nWork that needs the backend must be handed over with delegate. Before calling it say at most one very short lead-in, and right after it call delegate in the same turn (never end the turn with only the lead-in). Choose the lead-in by type: for weather, news, search, memory \"Let me check\"; "
-                     "for device control \"Sure, on it\"; for the time or date, or a joke, say nothing and call delegate right away "
+FILLER_RULE = {"zh": "\n\n需要后台办的事一定要调用 delegate。调用 delegate 之前只说一句很短的过渡语，说完必须在同一轮马上调用 delegate，绝不能只说过渡语就结束。过渡语按类型：查天气、新闻、搜索，说「我帮你查一下」；控制设备，说「好的，马上」；"
+                     "问时间或日期、讲笑话、问我记得什么（记忆），不要说任何过渡语，直接调用 delegate（这条优先于其他关于过渡语的举例）。",
+               "en": "\n\nWork that needs the backend must be handed over with delegate. Before calling it say at most one very short lead-in, and right after it call delegate in the same turn (never end the turn with only the lead-in). Choose the lead-in by type: for weather, news, search \"Let me check\"; "
+                     "for device control \"Sure, on it\"; for the time or date, a joke, or what you remember about the user (memory), say nothing and call delegate right away "
                      "(this overrides any other example of a lead-in)."}
 RESULT_FMT = {"zh": ("后端结果（只能根据这段内容回答，用你自己的口语自然地告诉用户，不要提到后端或工具；内容里没有的信息绝对不要自己编。"
                      "如果它说没查到、想不起来或请用户再说一遍，就照这个意思告诉用户）：\n{c}",

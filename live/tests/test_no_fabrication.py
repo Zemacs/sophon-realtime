@@ -20,7 +20,7 @@ if str(_LIVE_ROOT) not in sys.path:
 from sophon_live.assistant_tools import orchestrator as orch
 from sophon_live.assistant_tools.registry import list_tool_names
 from sophon_live.coordinator import AdmitRequest, Ledger, WorkerJob, WorkerResult, admit, api, finish_job, intent
-from sophon_live.coordinator.schemas import FAILED_GENERIC, NO_TOOL_ANSWER, TaskStatus
+from sophon_live.coordinator.schemas import FAILED_GENERIC, NO_TOOL_ANSWER, TaskStatus, is_tool_failure_sentence
 from tests.intent_cases import CRITIC_FREE, CRITIC_REALTIME, OFFICIAL_FREE, OFFICIAL_REALTIME
 from tests.test_orch_worker import _job, _say, _tool_call
 from tests.test_orchestrator import _FakeResp, _FakeSession
@@ -230,6 +230,63 @@ class FinishJobGuardTests(unittest.TestCase):
         self.assertEqual((out.text, out.rejected), (sentence, ""))
         _, _, out = self._run([{"tool": "get_weather", "ok": False}], status="failed", say=sentence)          # same words, no evidence of them
         self.assertEqual((out.text, out.rejected), (NO_TOOL_ANSWER, "failed_text"))
+
+
+class FailureTextWhitelistTests(unittest.TestCase):
+    """Critic S-13: ``evidence.failure_text`` is the Worker's own claim. It is spoken only when it is one of OUR tools' failure
+    sentences (schemas.TOOL_FAILURE_TEMPLATES) and what it echoes (city / query) came from the request."""
+
+    FAKE = "北京晴，零下三到十一度。"
+
+    def _out(self, said: str, ev: dict, *, objective: str = "明天北京会下雨吗", require=("get_weather",), status: str = "failed"):
+        led = Ledger()
+        rec = led.create(objective)
+        led.mark_running(rec.task_id)
+        job = WorkerJob(task_id=rec.task_id, version=rec.version, objective=objective, require_tools=list(require))
+        res = WorkerResult(task_id=rec.task_id, version=rec.version, status=status, spoken_answer=said, evidence=[ev])
+        return finish_job(led, job, res)
+
+    def test_fabricated_sentence_written_into_failure_text_is_still_replaced(self) -> None:
+        out = self._out(self.FAKE, {"tool": "get_weather", "ok": False, "failure_text": self.FAKE})        # failure_text == spoken text
+        self.assertEqual((out.text, out.rejected), (NO_TOOL_ANSWER, "failed_text"))
+        self.assertNotIn("零下", out.text)
+
+    def test_a_template_shaped_sentence_with_smuggled_content_is_replaced(self) -> None:
+        for said in ("暂时查不到北京晴零下三度的天气，请稍后再试。", "没有搜到关于「北京晴，零下三到十一度」的可靠摘要。", "暂时查不到上海的天气，请稍后再试。"):
+            out = self._out(said, {"tool": "get_weather", "ok": False, "args": {"city": "北京"}, "failure_text": said})
+            self.assertEqual(out.text, NO_TOOL_ANSWER, said)          # (the last one: a real template, but for a city nobody asked about)
+
+    def test_the_tools_own_sentences_are_spoken(self) -> None:
+        cases = [
+            ("get_weather", "暂时查不到北京的天气，请稍后再试。", {"city": "北京"}, "明天北京会下雨吗"),
+            ("get_weather", "找不到火星的天气信息。", {"city": "火星"}, "火星的天气"),
+            ("get_weather", "Weather for Paris is unavailable right now (sojson:OSError, open-meteo:TimeoutError).", {"city": "Paris"}, "weather in Paris"),
+            ("web_search", "没有搜到关于「美元兑人民币」的可靠摘要。", {"query": "美元兑人民币"}, "今天美元兑人民币是多少"),
+            ("web_search", "网络暂时不可用，没法完成网页搜索，请稍后再试。", {"query": "x"}, "今天美元兑人民币是多少"),
+            ("get_news", "新闻源暂时连不上，稍后再帮你看看头条吧。", {"topic": "科技"}, "今天有什么科技新闻"),
+        ]
+        for tool, said, args, objective in cases:
+            out = self._out(said, {"tool": tool, "ok": False, "args": args, "failure_text": said}, objective=objective, require=(tool,))
+            self.assertEqual((out.text, out.rejected), (said, ""), said)
+
+    def test_the_sentence_must_match_the_evidence_exactly_and_the_failed_required_tool(self) -> None:
+        said = "暂时查不到北京的天气，请稍后再试。"
+        self.assertEqual(self._out(said, {"tool": "get_weather", "ok": False}).text, NO_TOOL_ANSWER)                                   # no failure_text recorded
+        self.assertEqual(self._out(said, {"tool": "get_weather", "ok": False, "failure_text": said + "。"}).text, NO_TOOL_ANSWER)      # not the same text
+        self.assertEqual(self._out(said, {"tool": "get_weather", "ok": True, "failure_text": said}).text, NO_TOOL_ANSWER)          # ok=True is not a failure
+        self.assertEqual(self._out(said, {"tool": "get_news", "ok": False, "failure_text": said}).text, NO_TOOL_ANSWER)            # not a required tool
+
+    def test_every_sentence_the_tools_can_produce_is_whitelisted(self) -> None:
+        """The templates must not drift away from the tools' real failure sentences."""
+        from sophon_live.assistant_tools import news, web_search
+
+        for text in (web_search._network_error(True), web_search._network_error(False), web_search._no_results("美元兑人民币", zh=True),
+                     web_search._no_results("usd cny", zh=False)):
+            self.assertTrue(is_tool_failure_sentence(text, {"args": {"query": "美元兑人民币 usd cny"}}), text)
+        src = Path(news.__file__).read_text(encoding="utf-8")
+        for text in ("新闻源暂时连不上，稍后再帮你看看头条吧。", "News feeds are unreachable right now. Try again in a moment."):
+            self.assertIn(text, src)
+            self.assertTrue(is_tool_failure_sentence(text, {}), text)
 
 
 class MutationFakeNeverSpokenTests(unittest.TestCase):

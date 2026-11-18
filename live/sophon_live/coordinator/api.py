@@ -73,6 +73,12 @@ async def admit(req: AdmitRequest, ledger: Ledger) -> AdmitResult:
 
 async def _admit(req: AdmitRequest, ledger: Ledger, meta: dict) -> AdmitResult:
     text = (req.delegate_task or req.text or "").strip()
+    # v0.1.0-rc1: the voice front sometimes words the task by itself ("我记得你说过你喜欢吃火锅" for "你还记得我上次说我喜欢吃什么吗"). When
+    # the user's own words are tool-backed and the front's wording is not, the user's words are the task.
+    raw = (req.raw_text or "").strip()
+    if raw and raw != text and intent.required_tools(raw) and not intent.required_tools(text):
+        log.warning("delegate task %r does not match what the user said; using %r", text[:60], raw[:60])
+        text = raw
     route = "WORKER"
     control_key: str | None = None
 

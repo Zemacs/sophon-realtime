@@ -81,3 +81,32 @@ class NoDelegateNet(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FrontWordedTaskTests(unittest.IsolatedAsyncioTestCase):
+    """Live: delegate(task='我记得你说过你喜欢吃火锅') for the user's 「你还记得我上次跟你说我喜欢吃什么吗」 was routed FAST and went silent."""
+
+    async def test_the_users_tool_backed_words_replace_a_front_task_that_is_not(self) -> None:
+        from unittest import mock
+
+        from sophon_live.coordinator import AdmitRequest, Ledger, admit
+        from sophon_live.coordinator import api
+
+        led = Ledger()
+        with mock.patch.object(api, "USE_JEV", False):
+            res = await admit(AdmitRequest(session_id="s", utterance_id="u", text="我记得你说过你喜欢吃火锅", delegate_task="我记得你说过你喜欢吃火锅",
+                                           raw_text="你还记得我上次跟你说我喜欢吃什么吗"), led)
+        self.assertIsNotNone(res.job)
+        self.assertEqual(res.job.require_tools, ["memory_note"])
+
+    async def test_a_matching_or_tool_free_pair_is_left_alone(self) -> None:
+        from unittest import mock
+
+        from sophon_live.coordinator import AdmitRequest, Ledger, admit
+        from sophon_live.coordinator import api
+
+        with mock.patch.object(api, "USE_JEV", False):
+            joke = await admit(AdmitRequest(session_id="s", utterance_id="u", text="讲个笑话", delegate_task="讲个笑话", raw_text="来个笑话吧"), Ledger())
+            no_raw = await admit(AdmitRequest(session_id="s", utterance_id="u", text="明天上海会下雨吗", delegate_task="明天上海会下雨吗"), Ledger())
+        self.assertEqual(joke.job.require_tools if joke.job else [], [])
+        self.assertEqual(no_raw.job.require_tools, ["get_weather"])

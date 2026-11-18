@@ -584,7 +584,7 @@ class LiveSession:
                 asyncio.create_task(self._delegate(e))           # never block the audio path while the transcript finishes
             elif t == "error":
                 log.warning("session %s engine: %s", self.id, e.get("message"))
-                if "closed" in (e.get("message") or ""):
+                if e.get("fatal") is True:                      # a typed flag from the adapter (connection gone), not a guess from the message text
                     await self.error("server_error", "engine connection lost"); await self.close("server_error"); return
 
     async def _delegate(self, e: dict) -> None:

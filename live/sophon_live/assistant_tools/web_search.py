@@ -128,7 +128,6 @@ def _snippets_from_lite(html: str, limit: int) -> list[str]:
 
 
 _TAG = re.compile(r"<[^>]+>")
-_AGE = re.compile(r"^\s*\d+\s*(小时|分钟|天|周|个月|年)(之)?前\s*[·・]\s*")
 
 
 def _text(fragment: str) -> str:
@@ -144,7 +143,7 @@ def _snippets_from_bing(html: str, limit: int) -> list[str]:
         p = re.search(r'<p[^>]*class="[^"]*b_lineclamp[^"]*"[^>]*>([\s\S]*?)</p>', block) or re.search(
             r'<div class="b_caption"[^>]*>[\s\S]*?<p[^>]*>([\s\S]*?)</p>', block
         )
-        snippet = _AGE.sub("", _text(p.group(1))) if p else ""
+        snippet = _text(p.group(1)) if p else ""
         if not title:
             continue
         out.append(f"{title} — {snippet[:140]}" if snippet else title)

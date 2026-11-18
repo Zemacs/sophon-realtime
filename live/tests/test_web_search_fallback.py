@@ -55,7 +55,7 @@ class BingParseTests(unittest.TestCase):
     def test_titles_and_snippets_of_organic_results_only(self) -> None:
         out = web_search._snippets_from_bing(BING_HTML.decode(), 5)
         self.assertEqual(len(out), 3)                                  # the ad (b_ad) is not an organic result
-        self.assertEqual(out[0], "中国银行网站_金融市场_外汇牌价 — 中国银行外汇牌价：美元 713.20，仅供参考。")   # tags and "1 天前 ·" stripped
+        self.assertEqual(out[0], "中国银行网站_金融市场_外汇牌价 — 1 天前 · 中国银行外汇牌价：美元 713.20，仅供参考。")   # tags stripped; the age label is kept as the page wrote it (Round 4j / B-5: the Chinese relative-time regex is gone, the model reads recency itself)
         self.assertTrue(out[1].startswith("美元兑人民币 (USDCNY)_新浪财经 — 新浪财经外汇频道"))
         self.assertEqual(out[2], "只有标题的结果")
 

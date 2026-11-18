@@ -73,8 +73,8 @@ def _strip_publisher(item: ET.Element, title: str) -> str:
     """Drop the publisher from a feed title without guessing which side of " - " it is on.
 
     Real feeds (Google News) carry the publisher in ``<source>``: remove exactly that, as suffix (「标题 - 来源」) or
-    prefix (「来源 - 标题」), and leave the title alone when it does not match. Only an item with no ``<source>``
-    falls back to the old rule (drop the last " - " segment), which assumes the 「标题 - 来源」 order."""
+    prefix (「来源 - 标题」), and leave the title alone when it does not match. An item with no ``<source>``
+    keeps its title whole (nothing is guessed from the shape of the segments)."""
     src_el = item.find("source")
     src = (src_el.text or "").strip() if src_el is not None else ""
     if src:
@@ -85,39 +85,7 @@ def _strip_publisher(item: ET.Element, title: str) -> str:
             if title.startswith(cut) and title[len(cut):].strip():
                 return title[len(cut):].strip()
         return title
-    return _strip_publisher_guess(title)
-
-
-_PUB_MAX_CJK, _PUB_MAX_LATIN = 8, 28            # 「澎湃新闻」「中国新闻网」 / 「The Wall Street Journal」
-_SENTENCE_MARKS = set("，。！？；：,.!?;:、“”\"《》")
-
-
-def _has_cjk(seg: str) -> bool:
-    return any("\u4e00" <= c <= "\u9fff" for c in seg)
-
-
-def _publisher_like(seg: str) -> bool:
-    """A feed publisher name is a short label: no sentence punctuation, no more than 8 CJK / 28 Latin characters."""
-    seg = seg.strip()
-    return 0 < len(seg) <= (_PUB_MAX_CJK if _has_cjk(seg) else _PUB_MAX_LATIN) and not any(c in _SENTENCE_MARKS for c in seg)
-
-
-def _strip_publisher_guess(title: str) -> str:
-    """No ``<source>`` to go by (Critic S-8). The order 「标题 - 来源」 vs 「来源 - 标题」 is unknown, so strip only when exactly
-    ONE end looks like a publisher (short, no sentence punctuation) and what remains is clearly the longer part (>= 2x, >= 6 chars) or is the only CJK side (a Latin label on a Chinese headline); when both or neither
-    do, keep the title whole. Worst case the publisher name stays in the headline; a headline is never cut away."""
-    parts = [p.strip() for p in title.split(" - ")]
-    if len(parts) < 2 or not all(parts):
-        return title
-    head, last = " - ".join(parts[:-1]), parts[-1]
-    first, tail = parts[0], " - ".join(parts[1:])
-    suffix_pub = _publisher_like(last) and (len(head) >= max(6, 2 * len(last)) or (_has_cjk(head) and not _has_cjk(last)))
-    prefix_pub = _publisher_like(first) and (len(tail) >= max(6, 2 * len(first)) or (_has_cjk(tail) and not _has_cjk(first)))
-    if suffix_pub and not prefix_pub:
-        return head
-    if prefix_pub and not suffix_pub:
-        return tail
-    return title
+    return title          # no <source> to go by: the title is kept whole (Round 4j / B-5: no shape guess at which end is the publisher)
 
 
 def _urlopen(url: str) -> bytes:

@@ -32,6 +32,7 @@ log = logging.getLogger("sophon_live.realtime")
 # speech_started / stopped drive client-side truncation (OpenAI Realtime clients cut our playback on speech_started),
 # so false starts from background noise mute the agent. Use Silero (robust to steady noise and bursts) when available.
 SILERO_PATH = os.environ.get("SOPHON_LIVE_SILERO", os.path.join(os.path.dirname(os.path.abspath(__file__)), "silero_vad.onnx"))
+GUARD_MAX_REJECTIONS = 2          # identical ungrounded calls rejected with the usual message; from the next one on the answer is needs_input (Round 4j / I-24)
 GROUND = os.environ.get("SOPHON_LIVE_GROUND", "1") != "0"          # tool-argument grounding guard (see grounding.py)
 VAD_KIND = os.environ.get("SOPHON_LIVE_VAD", "energy")              # energy | silero (silero misses band-limited telephony speech)
 VAD_RMS = float(os.environ.get("SOPHON_LIVE_VAD_RMS", "0.015"))       # energy VAD: minimum frame RMS threshold
@@ -521,8 +522,10 @@ class RealtimeSession:
             return False
         key = e.get("name", "") + json.dumps(args, sort_keys=True)
         self.guard_counts[key] = self.guard_counts.get(key, 0) + 1
-        if self.guard_counts[key] > 2:                          # the model insists: let it through rather than loop forever
-            log.info("realtime %s: grounding guard let through after 2 rejections: %s", self.id, key[:160]); return False
+        if self.guard_counts[key] > GUARD_MAX_REJECTIONS:       # the model insists on the same call: never release it, hand the turn to the caller
+            log.info("realtime %s: grounding guard needs_input after %d rejections (not released): %s", self.id, GUARD_MAX_REJECTIONS, key[:160])
+            await self.engine.tool_result(e.get("call_id"), json.dumps({"ok": False, "status": "needs_input", "message": grounding.needs_input_message(bad)}), speak=True)
+            return True
         msg = grounding.guard_message(bad, self.heard)
         log.info("realtime %s: grounding guard rejected %s(%s): %s", self.id, e.get("name"), json.dumps(args)[:160], [b[:2] for b in bad])
         log.info("realtime %s: heard so far: %s", self.id, " || ".join(self.heard[-4:])[-600:])
@@ -567,7 +570,7 @@ class RealtimeSession:
             try:
                 out = await asyncio.wait_for(fut, 90)
             except asyncio.TimeoutError:
-                self.bk_wait.pop(cid, None); out = "Error: no result from the system"
+                self.bk_wait.pop(cid, None); out = json.dumps({"ok": False, "error": "no_result_from_system"})
             self.seen.append(out)
             return out
         try:
@@ -641,7 +644,7 @@ class RealtimeSession:
                     await self._finish(self.resp, "cancelled")
             elif t == "error":
                 log.warning("realtime %s engine: %s", self.id, e.get("message"))
-                if "closed" in (e.get("message") or ""):
+                if e.get("fatal") is True:                      # a typed flag from the adapter (connection gone), not a guess from the message text
                     await self.error("engine connection lost", "server_error"); await self.close(); return
 
     async def close(self) -> None:

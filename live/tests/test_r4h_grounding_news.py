@@ -63,8 +63,12 @@ class GroundingIsProvenanceOnly(unittest.TestCase):
             self.assertTrue(_bad({key: "Quarterly Alpha"}, ["hello"]), key)
             self.assertEqual(_bad({key: "Quarterly Alpha"}, ["please file Quarterly Alpha"]), [], key)
 
-    def test_long_text_is_still_out_of_scope(self) -> None:
-        self.assertEqual(_bad({"summary": "the caller wants a refund for the broken blender they bought last week"}, ["hello"]), [])
+    def test_long_text_is_no_longer_out_of_scope(self) -> None:
+        """Round 4j / I-23 reverses the 4h rule "more than 3 words is out of scope": the old expectation (an invented long summary passes
+        when the caller only said "hello") is replaced on purpose. Long text now needs token provenance; see test_r4j_grounding_i23.py."""
+        self.assertTrue(_bad({"summary": "the caller wants a refund for the broken blender they bought last week"}, ["hello"]))
+        self.assertEqual(_bad({"summary": "the caller wants a refund for the broken blender they bought last week"},
+                              ["I want a refund for the blender I bought last week it is broken"]), [])
 
     def test_the_old_mode_switch_has_no_effect(self) -> None:
         """SOPHON_LIVE_GROUND_MODE=placeholder used to skip every check except the placeholder lists. The lists are gone and so is the mode."""

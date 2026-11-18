@@ -15,6 +15,8 @@ import time
 
 import aiohttp
 
+from . import grounding
+
 log = logging.getLogger("sophon_live.backend")
 
 MODEL = os.environ.get("SOPHON_LIVE_BACKEND", "")
@@ -183,12 +185,12 @@ class BackOffice:
                         args = json.loads(tc["function"].get("arguments") or "{}")
                     except Exception:  # noqa: BLE001
                         args = {}
-                    if self.fails.get(name, 0) >= MAX_FAILS and name.startswith(("get_", "find_", "search_")):
-                        out = ("Not called: this lookup already failed %d times in this call. Do not guess other variants. Ask the caller "
+                    if self.fails.get(name, 0) >= MAX_FAILS:
+                        out = ("Not called: this tool already reported failure %d times in this call. Do not guess other variants. Ask the caller "
                                "to spell the value letter by letter (or read the digits one by one) and wait for it." % self.fails[name])
                     else:
                         out = await call_tool(name, args)
-                        if out.lower().startswith("error") or "not found" in out.lower()[:200]:
+                        if grounding.output_failed({"output": out}):      # structure only (Round 4j / B-5): never the words of the output
                             self.fails[name] = self.fails.get(name, 0) + 1
                     self.actions.append(f"{name}({json.dumps(args, ensure_ascii=False)}) -> {out[:600]}")
                     msgs.append({"role": "tool", "tool_call_id": tc["id"], "content": out})

@@ -5,7 +5,8 @@
   {"t": "done", "rid": str|None, "status": str}                        a reply finished (completed / cancelled ...)
   {"t": "cancel"}                                                      barge-in: drop audio not yet played
   {"t": "tool_call", "call_id", "name", "arguments"}                   the model called a tool (e.g. delegate)
-  {"t": "error", "message": str}
+  {"t": "error", "message": str, "fatal": bool}                        fatal=True only when the engine connection itself is gone (a typed
+                                                                         event the adapter raises, never inferred from the message text)
 
 and offers: send_audio(f32 16 kHz), set_instructions(text), tool_result(call_id, output, speak), close()."""
 from __future__ import annotations
@@ -94,7 +95,7 @@ class VllmOmniAdapter:
             pass
         finally:
             if not self._closed:
-                await self.q.put({"t": "error", "message": "engine connection closed"})
+                await self.q.put({"t": "error", "message": "engine connection closed", "fatal": True})
 
     async def _poll(self) -> None:
         while not self._closed:

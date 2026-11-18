@@ -19,6 +19,10 @@ T_G = ["tests.test_r4g_failure_hint", "tests.test_assistant_tools"]
 T_H = ["tests.test_r4h_grounding_news"]
 T_I = ["tests.test_r4i_demo_removed_retired_env"]
 IDX = "sophon_live/static/index.html"
+T_JF = ["tests.test_r4j_failure_signals"]; T_JG = ["tests.test_r4j_grounding_i23_i24"]; T_JP = ["tests.test_r4j_page_behaviour"]
+T_JN = ["tests.test_assistant_tools_search", "tests.test_web_search_fallback"]
+BK = "sophon_live/backend.py"; AD = "sophon_live/adapters.py"; WS_ = "sophon_live/assistant_tools/web_search.py"
+FA = "failed = fail_code is not None"
 T_F = ["tests.test_r4e_b4_i18", "tests.test_orch_worker", "tests.test_orchestrator"]
 NEWS = "sophon_live/assistant_tools/news.py"; WS = "sophon_live/assistant_tools/web_search.py"; WX = "sophon_live/assistant_tools/weather.py"
 INF = "sophon_live/assistant_tools/inflight.py"; SCH = "sophon_live/coordinator/schemas.py"; INT = "sophon_live/coordinator/intent.py"
@@ -75,12 +79,12 @@ M = [
  ("S-24: weather says 'cannot find' when the cap refused", WX, "        if busy:\n            meta[\"failure\"] = failcodes.BUSY", "        if False:\n            meta[\"failure\"] = failcodes.BUSY", T_D),
  ("S-24: busy sentence not whitelisted for web_search", SCH, '    "web_search": tuple(re.compile(p) for p in (\n        r"网络暂时不可用，没法完成网页搜索，请稍后再试。",\n        BUSY_ZH_RE, BUSY_EN_RE,', '    "web_search": tuple(re.compile(p) for p in (\n        r"网络暂时不可用，没法完成网页搜索，请稍后再试。",', T_D),
  # Round 4h (I-20 grounding provenance only / news topic is a schema parameter)
- ("I-20: a free-text key is exempt from grounding again", GR, "        if len(v.split()) > 3:", '        if len(v.split()) > 3 or k.lower() in {"summary", "reason", "query", "note", "notes", "message", "description", "comment", "content"}:', T_H),
+ ("I-20: a free-text key is exempt from grounding again", GR, "        if len(v.split()) > 3:", '        if k.lower() in {"summary", "reason", "query", "note", "notes", "message", "description", "comment", "content"}:\n            continue\n        if len(v.split()) > 3:', T_H),
  ("I-20: placeholder-looking values are blocked even when the caller said them", GR, "        if appears_in_words(v, said):",
-  '        if nv in {"12345", "johndoe", "john", "doe", "example.com", "5551234567"}:\n            bad.append((k, v, "not said by the caller (placeholder)"))\n            continue\n        if appears_in_words(v, said):', T_H),
+  '        if nv in {"12345", "johndoe", "john", "doe", "example.com", "5551234567"}:\n            return False, 0.0\n        if appears_in_words(v, said):', T_H),
  ("I-20: placeholder-looking values are allowed even when the caller never said them", GR, "        if appears_in_words(v, said):",
-  '        if nv in {"12345", "johndoe", "john", "doe", "example.com", "testerexample.com"}:\n            continue\n        if appears_in_words(v, said):', T_H),
- ("I-20: grounding accepts everything (provenance not enforced)", GR, "        if appears_in_words(v, said):", "        if True:", T_H),
+  '        if nv in {"12345", "johndoe", "john", "doe", "example.com", "testerexample.com"}:\n            return True, 1.0\n        if appears_in_words(v, said):', T_H),
+ ("I-20: grounding accepts everything (provenance not enforced)", GR, "        if appears_in_words(v, said):", "        if nv:", T_H),
  ("news: a keyword filter decides which headlines are kept again", NEWS, "                titles = _titles_from_rss(await _fetch_rss(fb))\n",
   "                titles = [t for t in _titles_from_rss(await _fetch_rss(fb)) if topic in t or '科技' in t]\n", T_H),
  ("news: a category falls back to another category's feed", NEWS, '    "tech": ("http://www.people.com.cn/rss/it.xml",),', '    "tech": ("http://www.people.com.cn/rss/it.xml", "http://www.people.com.cn/rss/finance.xml"),', T_H),
@@ -98,6 +102,42 @@ M = [
  ("retired env: the warning is never logged", GW, "        log.warning(\"%s is set but", "        log.debug(\"%s is set but", T_I),
  ("retired env: the warning echoes the value", GW, 'remove it from the environment", n)', 'remove it from the environment" + os.environ[n], n)', T_I),
  ("retired env: an empty value is treated as unset", GW, "hit = [n for n in RETIRED_ENV_VARS if n in os.environ]", "hit = [n for n in RETIRED_ENV_VARS if os.environ.get(n)]", T_I),
+  # Round 4j (B-5 text judgments removed / I-23 provenance for CJK + long values / I-24 guard never releases / I-25 failure survivors / S-39 page behaviour)
+ ("B-5: backend counts a failure when the output starts with 'error' again", BK, 'if grounding.output_failed({"output": out}):', 'if grounding.output_failed({"output": out}) or out.lower().startswith("error") or "not found" in out.lower()[:200]:', T_JF),
+ ("B-5: backend stops only get_/find_/search_ tools again", BK, "if self.fails.get(name, 0) >= MAX_FAILS:", 'if self.fails.get(name, 0) >= MAX_FAILS and name.startswith(("get_", "find_", "search_")):', T_JF),
+ ("B-5: backend never counts a failure", BK, "self.fails[name] = self.fails.get(name, 0) + 1", "pass", T_JF),
+ ("B-5: realtime closes the session when the message says 'closed'", RT, 'if e.get("fatal") is True:', 'if "closed" in (e.get("message") or ""):', T_JF),
+ ("B-5: gateway closes the session when the message says 'closed'", GW, 'if e.get("fatal") is True:', 'if "closed" in (e.get("message") or ""):', T_JF),
+ ("B-5: realtime closes on any truthy fatal", RT, 'if e.get("fatal") is True:', 'if e.get("fatal"):', T_JF),
+ ("B-5: the adapter no longer flags a lost connection as fatal", AD, '"message": "engine connection closed", "fatal": True}', '"message": "engine connection closed"}', T_JF),
+ ("B-5: the timeout envelope is prose again", RT, 'out = json.dumps({"ok": False, "error": "no_result_from_system"})', 'out = "Error: no result from the system"', T_JF),
+ ("B-5: news guesses the publisher from segment shape again", NEWS, "    return title          # no <source> to go by", '    return title.rsplit(" - ", 1)[0] if " - " in title else title          # no <source> to go by', T_JN),
+ ("B-5: web_search strips a Chinese relative-time prefix again", WS_, 'snippet = _text(p.group(1)) if p else ""', 'snippet = re.sub(r"^\\s*\\d+\\s*天前\\s*[·・]\\s*", "", _text(p.group(1))) if p else ""', T_JN),
+ ("I-23: CJK values are not checked again", GR, "        if _CJK.search(v):", "        if False:", T_JG),
+ ("I-23: a CJK value needs no coverage (any pairs pass)", GR, "CJK_MIN_COVERAGE = 0.75", "CJK_MIN_COVERAGE = 0.0", T_JG),
+ ("I-23: a CJK value tolerates no misheard character", GR, "CJK_MIN_COVERAGE = 0.75", "CJK_MIN_COVERAGE = 1.01", T_JG),
+ ("I-23: the Latin half of a mixed value is not checked", GR, "            v = _CJK.sub(\" \", v).strip()", "            v = \"\"", T_JG),
+ ("I-23: long values pass unchecked again", GR, "ok = bool(toks) and len(grounded) / len(toks) > LONG_MIN_COVERAGE and", "ok = True or", T_JG),
+ ("I-23: digits in a long value need no provenance", GR, " and all(x in grounded for x in toks if any(c.isdigit() for c in x))", "", T_JG),
+ ("I-23: digit-by-digit ids are judged by coverage, not as one value", GR, "if toks and all(x.isdigit() for x in toks):", "if False:", T_JG),
+ ("I-23: long-value coverage threshold is 0", GR, "LONG_MIN_COVERAGE = 0.5", "LONG_MIN_COVERAGE = -1.0", T_JG),
+ ("I-24: the guard releases after 0 rejections", RT, "GUARD_MAX_REJECTIONS = 2", "GUARD_MAX_REJECTIONS = 0", T_JG),
+ ("I-24: the guard escalates only after 20 rejections", RT, "GUARD_MAX_REJECTIONS = 2", "GUARD_MAX_REJECTIONS = 20", T_JG),
+ ("I-24: after the threshold the call is released to the tool", RT, "            return True\n        msg = grounding.guard_message(bad, self.heard)", "            return False\n        msg = grounding.guard_message(bad, self.heard)", T_JG),
+ ("I-24: after the threshold there is no needs_input (same message again)", RT, "if self.guard_counts[key] > GUARD_MAX_REJECTIONS:", "if False:", T_JG),
+ ("I-24: needs_input is prose, not a structured failure", RT, 'json.dumps({"ok": False, "status": "needs_input", "message": grounding.needs_input_message(bad)})', "grounding.needs_input_message(bad)", T_JG),
+ ("I-25: orchestrator adds a NEW failure word (失败)", ORCH, FA, FA + ' or "失败" in out', T_JF),
+ ("I-25: orchestrator lowercase English probe", ORCH, FA, FA + ' or "unavail" in out.lower()', T_JF),
+ ("I-25: orchestrator regex probe", ORCH, FA, FA + ' or __import__("re").search("暂时|无法", out) is not None', T_JF),
+ ("I-25: orchestrator any() over a word tuple", ORCH, FA, FA + ' or any(k in out for k in ("连不上", "查不到"))', T_JF),
+ ("I-25: orchestrator raw substring '\"ok\": false'", ORCH, FA, FA + " or '\"ok\": false' in out", T_JF),
+ ("I-25: any truthy 'failure' key in JSON counts", ORCH, 'if isinstance(obj, dict) and obj.get("ok") is False:', 'if isinstance(obj, dict) and (obj.get("ok") is False or obj.get("failure")):', T_JF),
+ ("I-25: web_search judged a failure by its sentence", ORCH, FA, FA + ' or (name == "web_search" and "没有搜到" in out)', T_JF),
+ ("I-25: weather error code read from str(e)", "sophon_live/assistant_tools/weather.py", '    if isinstance(e, (asyncio.TimeoutError, TimeoutError)):      # before OSError: TimeoutError is an OSError', '    if "timed out" in str(e):\n        return "timeout"\n    if isinstance(e, (asyncio.TimeoutError, TimeoutError)):', T_JF),
+ ("S-39: page sends from a Promise.then (direct send)", IDX, "async function onDelegation(d) {", 'async function onDelegation(d) { Promise.resolve().then(() => send({type:"session.commentary.append",content:"x",delegation_id:d.id}));', T_JP),
+ ("S-39: page injects through an aliased setInterval", IDX, 'setR("等你手动回答…");', 'setR("等你手动回答…"); const f = inject; const iv = setInterval(() => { f(d.id, "x", "commentary", setR); clearInterval(iv); }, 300);', T_JP),
+ ("S-39: page makes a network call under another name", IDX, "async function onDelegation(d) {", "async function onDelegation(d) { globalThis['fe' + 'tch']('https://example.invalid/w');", T_JP),
+ ("S-39: coord gets the manual box / demo path (node behaviour)", IDX, 'd.backend === "orch" || d.backend === "coord"', 'd.backend === "orch"', T_JP),
 ]
 def run_group(tests, env):
     """-> (returncode, passed, failed, errors, failed_names, output). Uses pytest; module names are mapped to files."""

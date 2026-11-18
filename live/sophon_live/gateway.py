@@ -105,6 +105,8 @@ UPDATE_FMT = {
 ASK_PREFIX = {"zh": "（这是要向用户追问的问题，请直接把这个问题问出口，不要改成陈述句）", "en": "(This is a question to ask the user: ask it out loud, do not turn it into a statement) "}
 UPDATE_PARTS = {"zh": ("要转达给用户的内容：", "后端的进度 / 思考（不用照读）：", "（还没有新内容）"),
                 "en": ("Content to pass on to the user: ", "Backend progress / thinking (don't read it out): ", "(nothing new yet)")}
+PAD_GRACE_S = float(os.environ.get("SOPHON_LIVE_PAD_GRACE", "0.8"))            # Coordinator pad (SpeakPlan kind=pad): posted this long after a worker starts, if the answer is not in yet
+PAD_FRONT_QUIET_S = float(os.environ.get("SOPHON_LIVE_PAD_FRONT_QUIET", "4.0"))  # ...and the voice front has not just spoken its own lead-in (it was heard within this window)
 RESULT_MIN_CHARS = int(os.environ.get("SOPHON_LIVE_RESULT_MIN_CHARS", "15"))    # shorter commentary = a progress line
 PROGRESS_AFTER_S = float(os.environ.get("SOPHON_LIVE_PROGRESS_AFTER", "5.0"))  # speak held progress once if no result by then
 RESULT_MERGE_S = float(os.environ.get("SOPHON_LIVE_RESULT_MERGE", "1.6"))     # multi-stage backends: merge result pieces arriving this close together
@@ -312,7 +314,7 @@ class LiveSession:
             return
         await self._post_update(did, chunks)
 
-    async def _post_update(self, did: str, chunks: list) -> None:
+    async def _post_update(self, did: str, chunks: list, *, pad: bool = False) -> None:
         d = self.deleg[did]
         if d.get("idle_timer") is not None:
             d["idle_timer"].cancel(); d["idle_timer"] = None
@@ -325,9 +327,9 @@ class LiveSession:
         out = UPDATE_FMT[self.lang].format(t=time.monotonic() - d["t0"], gap=gap_s, body=body, last=(self.last_said or "")[-80:])
         d["posted_any"] = True
         ok = await self.engine.tool_result(d["call_id"], out, speak=True)
-        if ok:
-            self._delivery_armed(did)
-        log.info("delegation %s -> update posted ok=%s (%d commentary chars, %d thinking chars)", did, ok, len(com), len(thk))
+        if ok and not pad:
+            self._delivery_armed(did)          # a pad is not the result: no receipt is armed and the trace's "posted" stays for the answer
+        log.info("delegation %s -> %s posted ok=%s (%d commentary chars, %d thinking chars)", did, "pad" if pad else "update", ok, len(com), len(thk))
 
     async def _idle_update(self, did: str) -> None:
         d = self.deleg.get(did)
@@ -615,6 +617,7 @@ class LiveSession:
         d = self.deleg.get(did)
         if d is None or getattr(self, "engine", None) is None:
             return
+        self._cancel_pad(d)
         try:
             await self.engine.tool_result(d["call_id"], note, speak=False)
         except Exception as e:  # noqa: BLE001
@@ -625,6 +628,8 @@ class LiveSession:
         d = self.deleg.get(did)
         if d is None:
             return
+        d["said_result"] = True
+        self._cancel_pad(d)                          # the real thing is here: a filler would only delay it
         if ask:                                      # a C-layer question: the front must voice the question itself, not paraphrase it away
             text = ASK_PREFIX[self.lang] + text
         tr = self._trace().get(did)
@@ -639,6 +644,42 @@ class LiveSession:
         if d.get("timer"):
             d["timer"].cancel()
         await self._flush_deleg(did)
+
+    @staticmethod
+    def _cancel_pad(d: dict) -> None:
+        t = d.pop("pad_task", None)
+        if t is not None and not t.done():
+            t.cancel()
+
+    async def _coord_pad(self, did: str, text: str) -> None:
+        """Deliver the Coordinator's SpeakPlan(kind="pad") while the Worker runs (Critic I-2).
+
+        The voice front usually says its own lead-in before it calls delegate (see DELEGATE); the pad is the Coordinator's
+        guarantee for when it did not. So: wait PAD_GRACE_S, and only if the answer is still not in and the front has not
+        just spoken, post the pad as a backend update (the model words it, or stays silent with <wait>). It is not the
+        result: no delivery receipt is armed, the trace's "posted" is left for the answer. A result arriving first cancels it."""
+        try:
+            await asyncio.sleep(PAD_GRACE_S)
+        except asyncio.CancelledError:
+            return
+        d = self.deleg.get(did)
+        if d is None or getattr(self, "engine", None) is None or d.get("said_result"):
+            return
+        if DELEG_MODE != "model":
+            self._trace_pad(did, text, "rules_mode")      # rules mode words its own progress lines (PROGRESS_AFTER_S)
+            return
+        heard = getattr(self, "last_voice_t", None)
+        if heard and time.monotonic() - heard < PAD_FRONT_QUIET_S:
+            self._trace_pad(did, text, "front_spoke")
+            return
+        d.pop("pad_task", None)                        # past the point of cancellation: the post below is atomic enough
+        await self._post_update(did, [("commentary", text)], pad=True)
+        self._trace_pad(did, text, "posted")
+
+    def _trace_pad(self, did: str, text: str, outcome: str) -> None:
+        tr = self._trace().get(did)
+        if tr is not None:
+            tr.set(pad=outcome, pad_text=text)
 
     def _recent_user_text(self, max_age_s: float = 20.0) -> str:
         last = getattr(self, "last_user", None)
@@ -716,6 +757,9 @@ class LiveSession:
                 run_worker_job(job, instructions=self.instructions or "", history=getattr(self, "orch_history", None) or [])
             )
         self.coord_workers[job.task_id] = worker
+        pad = result.speak.text if result.speak.kind == "pad" else ""
+        if pad and d is not None:
+            d["pad_task"] = asyncio.ensure_future(self._coord_pad(did, pad))
         if tr is not None:
             tr.mark("worker_start")
             tr.set(task_id=job.task_id, version=job.version)
@@ -733,6 +777,7 @@ class LiveSession:
             from .coordinator import WorkerResult
             result = WorkerResult(task_id=job.task_id, version=job.version, status="failed", spoken_answer="后台编排出错了，请稍后再试。")
         finally:
+            self._cancel_pad(d) if d is not None else None   # the Worker is done: a filler now would only get in the answer's way
             if self.coord_workers.get(job.task_id) is worker:
                 self.coord_workers.pop(job.task_id, None)
         if tr is not None:

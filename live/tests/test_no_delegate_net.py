@@ -104,8 +104,9 @@ class FrontWordedTaskTests(unittest.IsolatedAsyncioTestCase):
 
         from sophon_live.coordinator import AdmitRequest, Ledger, admit
         from sophon_live.coordinator import api
+        from tests.test_refine_guard import _jev
 
-        with mock.patch.object(api, "USE_JEV", False):
+        with mock.patch.object(api, "USE_JEV", True), mock.patch.object(api.jev_client, "system_one", new=_jev("WORKER", None)):
             joke = await admit(AdmitRequest(session_id="s", utterance_id="u", text="讲个笑话", delegate_task="讲个笑话", raw_text="来个笑话吧"), Ledger())
             no_raw = await admit(AdmitRequest(session_id="s", utterance_id="u", text="明天上海会下雨吗", delegate_task="明天上海会下雨吗"), Ledger())
         self.assertEqual(joke.job.require_tools if joke.job else [], [])

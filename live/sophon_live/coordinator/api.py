@@ -1,6 +1,7 @@
 """Coordinator admit(): Frontend → route/ledger → SpeakPlan and/or WorkerJob."""
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
@@ -135,12 +136,28 @@ async def _admit(req: AdmitRequest, ledger: Ledger, meta: dict) -> AdmitResult:
             # v0.1.0-rc2: the model, not a word list, says which tool the request needs and whether the front's task wording is faithful.
             if raw:
                 state["user_said"] = raw
-            questions[intent.TOOL_KEY] = intent.build_tool_question()
             if raw and raw != text:
                 questions[FAITHFUL_KEY] = build_faithful_question()
+            # v0.1.1 latency: the ~600-token tool question was what made one combined call 3x slower than rc1's route-only call
+            # (TRACE: jev 156 ms -> 483 ms). Two independent calls in parallel cost max(), not the sum: the small route/control/faithful
+            # call, and the tool call with only the words it needs (no task list). Same questions, same options, same judgments.
+            tool_state = {"utterance": text, "language": state.get("language", "zh")}
+            if raw:
+                tool_state["user_said"] = raw
             t_jev = time.monotonic()
-            resp = await jev_client.system_one(state, questions)
+            r_route, r_tool = await asyncio.gather(
+                jev_client.system_one(state, questions),
+                jev_client.system_one(tool_state, {intent.TOOL_KEY: intent.build_tool_question()}),
+                return_exceptions=True,
+            )
             meta["jev_ms"] = (time.monotonic() - t_jev) * 1000
+            if isinstance(r_route, BaseException):
+                raise r_route                      # no route -> degrade (model-free), whatever the tool call did
+            resp = r_route
+            if not isinstance(r_tool, BaseException):
+                resp = {**r_route, "answers": {**(r_route.get("answers") or {}), **(r_tool.get("answers") or {})}}
+            else:
+                log.warning("jev tool question failed (%r): the tool judgment is unknown, never guessed", r_tool)
             route = jev_client.choice_answer(resp, "route")
             if route in _ROUTES:
                 control_key = jev_client.choice_answer(resp, "control")

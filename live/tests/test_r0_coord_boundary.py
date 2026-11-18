@@ -81,7 +81,7 @@ class InvariantTests(unittest.IsolatedAsyncioTestCase):
             led = Ledger()
             result = await admit(_req("现在几点了", uid="jev"), led)
         after = Path(log_path).read_text(encoding="utf-8") if log_path and Path(log_path).exists() else ""
-        self.assertEqual(calls["n"], 1)
+        self.assertEqual(calls["n"], 2)       # two parallel JEV calls (route/control; tool), each tried once and each blocked
         self.assertEqual(after, before)
         self.assertEqual(result.route, "WORKER")
         self.assertIsNotNone(result.job)

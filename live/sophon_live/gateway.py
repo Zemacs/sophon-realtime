@@ -39,6 +39,25 @@ CJK = re.compile(r"[㐀-鿿]")
 EMOJI = re.compile("[\U0001F000-\U0001FAFF☀-➿️‍～~*#`_>]+")
 
 
+_SENT_END = "。！？.!?，,～…；;：:"
+_CLOSERS = "\"'“”‘’」』）)】》〉]}› \t"
+
+
+def lead_for(prev: str, lang: str) -> str:
+    """Separator put in front of a response when the previous one did not end a sentence (keeps the transcript readable).
+
+    A reply that ends with a closing quote / bracket after its sentence mark (``…腰带啊！”``, ``…消失。"``) HAS ended its
+    sentence: looking at the raw last character made every such reply leak a stray ``。`` into the next reply's text
+    (体验版 v1 / 3: 5 of 9 multi-turn runs). Look through the closers to the real last character."""
+    p = (prev or "").rstrip()
+    core = p.rstrip(_CLOSERS)
+    if not core:
+        return ""                                # nothing but quotes / brackets: not a dangling sentence either
+    if core[-1] in _SENT_END:
+        return ""
+    return "。" if lang == "zh" else ". "
+
+
 def clean_text(t: str, lang: str) -> str:
     """Transcript as spoken: no emoji / markdown symbols, no line breaks."""
     t = EMOJI.sub("", t).replace("\r", "")
@@ -520,8 +539,7 @@ class LiveSession:
                 if rid != self.cur_rid or rid not in self.resp:
                     self.cur_rid = rid
                     task = self._cut_user()
-                    prev = self.last_text.rstrip()
-                    lead = ("。" if self.lang == "zh" else ". ") if prev and prev[-1] not in "。！？.!?，,～…" else ""
+                    lead = lead_for(self.last_text, self.lang)
                     self.resp[rid] = {"text": lead, "released": 0, "audio_s": 0.0, "played_s": 0.0, "start_ms": None, "done": False, "asr": task}
                     self._delivery().attach(rid)
                     self._trace().response_started(rid)

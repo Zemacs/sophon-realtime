@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import time
 import re
 import urllib.error
 import urllib.parse
@@ -85,9 +87,20 @@ def _titles_from_rss(xml_bytes: bytes) -> list[str]:
     return titles
 
 
+def _budget_s() -> float:
+    """Whole-tool time budget. 2026-11-18 on the GPU box one get_news took 77.8 s (feeds tried one after the other, each up to 12 s + stalls)."""
+    try:
+        return max(2.0, float(os.environ.get("SOPHON_NEWS_BUDGET", "9")))
+    except ValueError:
+        return 9.0
+
+
+_PER_FEED_S = 5.0
+
+
 def _urlopen(url: str) -> bytes:
     req = urllib.request.Request(url, headers={"User-Agent": _UA})
-    with urllib.request.urlopen(req, timeout=12) as resp:
+    with urllib.request.urlopen(req, timeout=_PER_FEED_S) as resp:
         return resp.read()
 
 
@@ -127,11 +140,19 @@ async def run(args: dict[str, Any] | None = None) -> str:
 
     titles: list[str] = []
     bucket = _bucket(topic)
+    deadline = time.monotonic() + _budget_s()
+
+    async def fetch(url: str) -> bytes:
+        left = deadline - time.monotonic()
+        if left <= 0.3:
+            raise asyncio.TimeoutError("news budget spent")
+        return await asyncio.wait_for(_fetch_rss(url), min(_PER_FEED_S + 0.5, left))
+
     if lang == "zh":
         # Topic-matched CN feeds first (Google News usually times out on PAI-DSW).
         for fb in _ZH_FEEDS.get(bucket, _ZH_FEEDS["general"]):
             try:
-                raw = await _fetch_rss(fb)
+                raw = await fetch(fb)
                 # Dedicated topic feeds (it/finance) are already on-domain — take titles.
                 # Cross feeds: require keyword hit so politics never masquerades as 科技.
                 require = bucket == "general" or "it.xml" not in fb and bucket == "tech"
@@ -147,13 +168,13 @@ async def run(args: dict[str, Any] | None = None) -> str:
                     titles = _titles_from_rss(raw)
                 if titles:
                     break
-            except (OSError, urllib.error.URLError, ET.ParseError, UnicodeDecodeError):
+            except (OSError, urllib.error.URLError, ET.ParseError, UnicodeDecodeError, asyncio.TimeoutError):
                 continue
     if not titles:
         try:
-            raw = await _fetch_rss(_rss_url(topic, lang))
+            raw = await fetch(_rss_url(topic, lang))
             titles = _titles_from_rss(raw)
-        except (OSError, urllib.error.URLError, ET.ParseError, UnicodeDecodeError):
+        except (OSError, urllib.error.URLError, ET.ParseError, UnicodeDecodeError, asyncio.TimeoutError):
             titles = []
 
     if not titles:

@@ -314,6 +314,7 @@ async def run_job(
                     # "searched, found nothing" is not usable evidence for a factual answer (Critic S-11): the user hears the
                     # tool's own 没搜到 sentence, the model does not get to improvise one from its head
                     or (name == "web_search" and ("没有搜到" in out or "couldn't find useful snippets" in out))
+                    or (name == "get_news" and ("没有找到相关头条" in out or "couldn't find matching headlines" in out))
                 )
                 evidence.append({"tool": name, "args": args, "ok": not failed, "ms": tool_ms, **tool_meta})
                 if failed and name in required:

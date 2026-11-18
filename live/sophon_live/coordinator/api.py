@@ -291,7 +291,7 @@ _TOOL_FAILURE_SHAPES = tuple(re.compile(p) for p in (
     r"Web search is unavailable right now due to a network problem\. Please try again later\.",
     r"没有搜到关于「[^」]{1,80}」的可靠摘要。",
     r"I couldn't find useful snippets for '[^']{1,80}'\.",
-    r"新闻源暂时连不上，稍后再帮你看看头条吧。",
+    r"新闻源暂时连不上，稍后再帮你看看头条吧。", r"没有找到相关头条。", r"I couldn't find matching headlines\.",
     r"News feeds are unreachable right now\. Try again in a moment\.",
 ))
 

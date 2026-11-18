@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import os
 import time
 import re
@@ -93,6 +94,9 @@ def _budget_s() -> float:
 
 
 _PER_FEED_S = 5.0
+# the remaining tool budget, visible to the worker thread (asyncio.to_thread copies the context): the socket timeout is
+# min(5 s, what is left), so a straggler thread never outlives the budget by much (Critic S-14)
+_DEADLINE: contextvars.ContextVar[float | None] = contextvars.ContextVar("news_deadline", default=None)
 
 
 def _strip_publisher(item: ET.Element, title: str) -> str:
@@ -147,9 +151,18 @@ def _strip_publisher_guess(title: str) -> str:
 
 
 def _urlopen(url: str) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": _UA})
-    with urllib.request.urlopen(req, timeout=_PER_FEED_S) as resp:
-        return resp.read()
+    from . import web_search            # search and news share one cap on blocking HTTP threads (Critic S-14)
+
+    if not web_search._inflight.acquire(blocking=False):
+        raise OSError("too many outbound requests in flight")
+    try:
+        dl = _DEADLINE.get()
+        timeout = _PER_FEED_S if dl is None else max(0.5, min(_PER_FEED_S, dl - time.monotonic()))
+        req = urllib.request.Request(url, headers={"User-Agent": _UA})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read()
+    finally:
+        web_search._inflight.release()
 
 
 async def _fetch_rss(url: str) -> bytes:
@@ -189,6 +202,8 @@ async def run(args: dict[str, Any] | None = None) -> str:
     titles: list[str] = []
     bucket = _bucket(topic)
     deadline = time.monotonic() + _budget_s()
+    _DEADLINE.set(deadline)
+    reached = False                       # at least one feed answered with a parseable page (so an empty result is "nothing found", not an outage)
 
     async def fetch(url: str) -> bytes:
         left = deadline - time.monotonic()
@@ -201,6 +216,8 @@ async def run(args: dict[str, Any] | None = None) -> str:
         for fb in _ZH_FEEDS.get(bucket, _ZH_FEEDS["general"]):
             try:
                 raw = await fetch(fb)
+                parsed = _titles_from_rss(raw)
+                reached = True            # a page that parses as RSS: an empty result below is "nothing found"
                 # Dedicated topic feeds (it/finance) are already on-domain — take titles.
                 # Cross feeds: require keyword hit so politics never masquerades as 科技.
                 require = bucket == "general" or "it.xml" not in fb and bucket == "tech"
@@ -211,9 +228,9 @@ async def run(args: dict[str, Any] | None = None) -> str:
                     require = False
                 if bucket == "world" and "world.xml" in fb:
                     require = False
-                titles = _filter_topic(_titles_from_rss(raw), topic, require_hit=require)
+                titles = _filter_topic(parsed, topic, require_hit=require)
                 if not require and not titles:
-                    titles = _titles_from_rss(raw)
+                    titles = parsed
                 if titles:
                     break
             except (OSError, urllib.error.URLError, ET.ParseError, UnicodeDecodeError, asyncio.TimeoutError):
@@ -222,9 +239,12 @@ async def run(args: dict[str, Any] | None = None) -> str:
         try:
             raw = await fetch(_rss_url(topic, lang))
             titles = _titles_from_rss(raw)
+            reached = True
         except (OSError, urllib.error.URLError, ET.ParseError, UnicodeDecodeError, asyncio.TimeoutError):
             titles = []
 
+    if not titles and reached:
+        return "没有找到相关头条。" if lang == "zh" else "I couldn't find matching headlines."
     if not titles:
         if lang == "zh":
             return "新闻源暂时连不上，稍后再帮你看看头条吧。"

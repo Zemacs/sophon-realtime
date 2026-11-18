@@ -44,6 +44,7 @@ class WhitelistTests(unittest.TestCase):
             ("web_search", "没有搜到关于「今天美元兑人民币汇率」的可靠摘要。"),
             ("web_search", "Web search is unavailable right now due to a network problem. Please try again later."),
             ("get_news", "新闻源暂时连不上，稍后再帮你看看头条吧。"),
+            ("get_news", "没有找到相关头条。"),
         ):
             _, _, out = _finish(tool, s, s)
             self.assertEqual((out.text, out.rejected), (s, ""), s)

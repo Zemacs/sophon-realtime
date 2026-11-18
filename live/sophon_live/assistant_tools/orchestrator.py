@@ -16,9 +16,9 @@ from typing import Any
 
 import aiohttp
 
-from ..coordinator import slots
 from ..coordinator.clarify import clarify_for_slots
-from ..coordinator.schemas import NO_TOOL_ANSWER, WorkerJob, WorkerResult, tool_succeeded
+from .. import failcodes
+from ..coordinator.schemas import NO_TOOL_ANSWER, WorkerJob, WorkerResult, appears_in_words, tool_succeeded
 from . import toolmeta
 from .registry import TOOL_SCHEMAS
 from .runner import run_tool
@@ -126,10 +126,11 @@ def _missing_required(name: str, args: dict) -> list[str]:
 
 
 def _ungrounded_city(name: str, args: dict, msgs: list[dict[str, Any]]) -> bool:
-    """True when the model made up a weather city: not in what the user said, the recent turns, or a tool result.
+    """True when the weather city the model passed is not in what the user said, the recent turns, or a tool result.
 
-    "明天天气怎么样" must not become 上海 because the model likes Shanghai. Lenient on purpose: if any known city is
-    mentioned anywhere (the model may translate 北京 to Beijing), the argument is treated as grounded."""
+    "明天天气怎么样" must not become 上海 because the model likes Shanghai. Provenance only (B-4): the value must occur, as a whole word, in
+    those messages (or be the same known place spelled the other way, 北京 <-> Beijing). Whether the words name a city at all is the model's
+    call, not a list's: a value that is nowhere in the words is asked about (needs_input) instead of looked up."""
     if name != "get_weather":
         return False
     city = str(args.get("city") or "").strip()
@@ -137,9 +138,7 @@ def _ungrounded_city(name: str, args: dict, msgs: list[dict[str, Any]]) -> bool:
         return False
     seen = "\n".join(str(m.get("content") or "") for m in msgs if m.get("role") in ("user", "tool"))
     bare = city.rstrip("市")
-    if city in seen or (bare and bare in seen):
-        return False
-    return not any(c in seen for c in slots.CITY_NAMES)
+    return not any(appears_in_words(v, seen, translate=True) for v in (city, bare) if v)
 
 
 def _evidence_has_required(job: WorkerJob, evidence: list[dict]) -> bool:
@@ -334,9 +333,9 @@ async def run_job(
                     text = _tool_failure_text(out)
                     evidence[-1]["failure_text"] = text      # the Coordinator may speak exactly this sentence for the failed job
                     return _result(job, "failed", text, evidence)
-                news_ok = name == "get_news" and ("第1条" in out or "Headlines on" in out) and not failed
-                weather_ok = name == "get_weather" and ("度" in out or "°" in out or "°C" in out) and not failed
-                if news_ok or weather_ok:
+                # I-18: the "speak now" nudge reads the tool's structured success report (toolmeta ``success`` + its fields), not its text
+                succeeded = not failed and tool_meta.get(failcodes.SUCCESS_KEY) is True
+                if succeeded and name in ("get_news", "get_weather"):
                     msgs.append({
                         "role": "user",
                         "content": "Tool succeeded. Speak one or two short oral sentences from this result now. Do NOT call the same tool again.",

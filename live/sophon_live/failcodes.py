@@ -14,5 +14,9 @@ NO_DATA = "no_data"          # sources answered, none knows the thing asked abou
 NO_RESULTS = "no_results"    # searched, found nothing usable
 FAILURE_CODES = frozenset({BUSY, NETWORK, NO_DATA, NO_RESULTS})
 
+# ``toolmeta`` key ``success``: the tool produced usable evidence, in structure (True) plus the fields behind it (``count`` for headlines,
+# ``tmin`` / ``tmax`` for weather). The Worker's "Tool succeeded, speak now" nudge reads only this; it never looks at the spoken text (I-18).
+SUCCESS_KEY = "success"
+
 # What weather._first_ok writes after "<source>:" in its error notes. Closed: a Worker cannot put free text in this slot (I-17).
 SOURCE_ERROR_CODES = ("no_data", "timeout", "network", "http", "bad_data", "error")

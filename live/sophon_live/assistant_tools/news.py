@@ -218,6 +218,7 @@ async def run(args: dict[str, Any] | None = None) -> str:
         return "News feeds are unreachable right now. Try again in a moment."
 
     picked = titles[:speak_n]
+    toolmeta.note(**{failcodes.SUCCESS_KEY: True}, count=len(picked))          # I-18: success is reported in structure, not read from the text
     if lang == "zh":
         parts = "；".join(f"第{i + 1}条，{t}" for i, t in enumerate(picked))
         return f"关于{topic}，{parts}。"

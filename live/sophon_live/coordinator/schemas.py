@@ -107,13 +107,20 @@ def _said_in(echoed: str, request: str) -> bool:
     return re.search(pat, r) is not None
 
 
+def appears_in_words(value: str, words: str, *, translate: bool = False) -> bool:
+    """Provenance, the one check the code may make about a model-produced value: ``value`` literally occurs, as a whole word, in ``words``
+    (the user's own words or a tool's output). ``translate`` also accepts the same known place spelled the other way (北京 <-> Beijing).
+    Whether ``value`` is a city, a whole name or the right place is NOT decided here: that is the model's call (B-3, B-4)."""
+    names = {value} | (_city_aliases(value) if translate else set())
+    return any(_said_in(n, words or "") for n in names)
+
+
 def _echo_ok(echoed: str, objective: str, *, city: bool) -> bool:
     """Provenance only: what the failed tool echoes back must literally occur, as a whole word, in the user's own words (``job.objective``,
     which also holds an earlier ask and a later 改口 / 补充 of the same task). The code does NOT judge what the user meant: whether the echo
     is the whole place name, or which of several places in the words the user finally wants, was decided by the Worker model when it chose
     the tool's arguments (it reads the same objective); this check only proves the sentence is built from the user's words (B-3)."""
-    names = {echoed} | (_city_aliases(echoed) if city else set())
-    return any(_said_in(n, objective or "") for n in names)
+    return appears_in_words(echoed, objective, translate=city)
 
 
 def is_tool_failure_sentence(text: str, ev: dict, objective: str = "") -> bool:

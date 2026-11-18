@@ -412,5 +412,6 @@ async def run(args: dict[str, Any] | None = None) -> str:
     toolmeta.note(source=meta.get("source"), fallbacks=len(meta.get("notes") or []) or None,
                   orig_source=meta.get("orig_source"), age_s=meta.get("age_s"),
                   failure=meta.get("failure"),
+                  **{failcodes.SUCCESS_KEY: True if (not meta.get("failure") and meta.get("tmin") is not None and meta.get("tmax") is not None) else None},
                   city=meta.get("city"), tmin=meta.get("tmin"), tmax=meta.get("tmax"), now=meta.get("now"))
     return text

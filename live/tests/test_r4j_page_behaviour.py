@@ -18,13 +18,11 @@ from pathlib import Path
 LIVE = Path(__file__).resolve().parents[1]
 PAGE = LIVE / "sophon_live" / "static" / "index.html"
 HARNESS = LIVE / "tests" / "page_harness.js"
-CASES = [
-    {"name": "coord", "delegation": {"backend": "coord"}},
-    {"name": "orch", "delegation": {"backend": "orch"}},
-    {"name": "none", "delegation": {}, "type_manual": True},
-    {"name": "builtin", "delegation": {"backend": "builtin"}},
-    {"name": "other", "delegation": {"backend": "something-else", "task": "what's the weather in Beijing tomorrow?"}},
-]
+TASKS = {"weather": "北京今天天气怎么样", "stock": "帮我看一下今天的股票行情", "news": "最近有什么科技新闻", "english": "what's the weather in Beijing tomorrow?",
+         "device": "把客厅的灯关掉", "time": "现在几点了", "empty": "", "long": "请帮我查一下这个订单的物流并且告诉我大概什么时候能到，谢谢" * 3}
+CASES = ([{"name": f"{b}:{k}", "delegation": {"backend": b, "task": v}} for b in ("coord", "orch") for k, v in TASKS.items()]
+         + [{"name": f"{b}:{k}", "delegation": ({"backend": b} if b else {}) | {"task": v}, "type_manual": k == "weather"}
+            for b in (None, "builtin", "something-else") for k, v in TASKS.items()])
 
 
 def run_page(page: Path = PAGE) -> dict:
@@ -40,22 +38,26 @@ class PageDoesNothingOnItsOwn(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.rep = run_page()
 
-    def test_the_harness_ran_the_page(self) -> None:
+    def test_the_harness_ran_the_page_for_every_kind_of_task(self) -> None:
         self.assertNotIn("error", self.rep)
         self.assertEqual(set(self.rep), {c["name"] for c in CASES})
+        self.assertGreaterEqual(len(TASKS), 8)
 
-    def test_coord_and_orch_send_nothing_call_nothing_and_show_no_box(self) -> None:
+    def test_coord_and_orch_send_nothing_call_nothing_and_show_no_box_whatever_the_task(self) -> None:
         for b in ("coord", "orch"):
-            self.assertEqual(self.rep[b], {"sent": [], "network": [], "manual_box_shown": False, "pending": False}, b)
+            for k in TASKS:
+                self.assertEqual(self.rep[f"{b}:{k}"], {"sent": [], "network": [], "manual_box_shown": False, "pending": False}, (b, k))
 
-    def test_any_other_backend_only_shows_the_manual_box(self) -> None:
-        for b in ("none", "builtin", "other"):
-            r = self.rep[b]
-            self.assertEqual((r["sent"], r["network"], r["manual_box_shown"], r["pending"]), ([], [], True, True), b)
+    def test_any_other_backend_only_shows_the_manual_box_whatever_the_task(self) -> None:
+        for b in ("None", "builtin", "something-else"):
+            for k in TASKS:
+                r = self.rep[f"{b}:{k}"]
+                self.assertEqual((r["sent"], r["network"], r["manual_box_shown"], r["pending"]), ([], [], True, True), (b, k))
 
     def test_the_users_own_manual_answer_is_the_only_thing_the_page_sends(self) -> None:
-        sent = self.rep["none"]["after_manual_click"]
-        self.assertEqual([(m["type"], m["content"], m["delegation_id"]) for m in sent], [("session.commentary.append", "手动回答", "item_x")])
+        for b in ("None", "builtin", "something-else"):
+            sent = self.rep[f"{b}:weather"]["after_manual_click"]
+            self.assertEqual([(m["type"], m["content"], m["delegation_id"]) for m in sent], [("session.commentary.append", "手动回答", "item_x")], b)
 
 
 @unittest.skipUnless(shutil.which("node"), "node is not installed")
@@ -84,9 +86,10 @@ class HarnessSeesRewrittenRegressions(unittest.TestCase):
         for name, (old, new) in variants.items():
             self.assertIn(old, self.BASE, name)
             rep = self._run(self.BASE.replace(old, new, 1))
+            self.assertEqual(set(rep), {c["name"] for c in CASES}, name)
             clean = {"sent": [], "network": [], "manual_box_shown": False, "pending": False}
-            acted = any(r["sent"] or r["network"] for r in rep.values())          # the page did something on its own, for some backend
-            self.assertTrue(acted or rep["coord"] != clean or rep["orch"] != clean, name)
+            acted = any(r["sent"] or r["network"] for r in rep.values())          # the page did something on its own, for some backend / task
+            self.assertTrue(acted or any(rep[f"{b}:{k}"] != clean for b in ("coord", "orch") for k in TASKS), name)
 
 
 if __name__ == "__main__":

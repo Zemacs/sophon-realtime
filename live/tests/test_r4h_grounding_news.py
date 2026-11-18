@@ -67,8 +67,10 @@ class GroundingIsProvenanceOnly(unittest.TestCase):
         """Round 4j / I-23 reverses the 4h rule "more than 3 words is out of scope": the old expectation (an invented long summary passes
         when the caller only said "hello") is replaced on purpose. Long text now needs token provenance; see test_r4j_grounding_i23.py."""
         self.assertTrue(_bad({"summary": "the caller wants a refund for the broken blender they bought last week"}, ["hello"]))
-        self.assertEqual(_bad({"summary": "the caller wants a refund for the broken blender they bought last week"},
-                              ["I want a refund for the blender I bought last week it is broken"]), [])
+        # Round 4k: the token-overlap ratio is gone; a composed value needs the model's evidence span (see test_r4k_evidence.py)
+        said = ["I want a refund for the blender I bought last week it is broken"]
+        ev = [{"argument": "summary", "span": "I want a refund for the blender", "value_comes_from_span": True}]
+        self.assertEqual(grounding.check("t", {"summary": "the caller wants a refund for the broken blender they bought last week"}, said, [], evidence=ev), [])
 
     def test_the_old_mode_switch_has_no_effect(self) -> None:
         """SOPHON_LIVE_GROUND_MODE=placeholder used to skip every check except the placeholder lists. The lists are gone and so is the mode."""

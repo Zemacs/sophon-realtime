@@ -8,9 +8,11 @@ whatever it looks like. So 12345 / John Doe / example.com are allowed when the c
 them up, exactly like any other invented value."""
 from __future__ import annotations
 
+import copy
 import difflib
 import json
 import re
+import unicodedata
 
 from .coordinator.schemas import appears_in_words
 
@@ -141,83 +143,207 @@ def _values(args, key=""):
 
 
 _CJK = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+")
-CJK_MIN_COVERAGE = 0.75        # share of the value's character pairs that must occur in what was heard / seen (tolerates a misheard character)
-LONG_MIN_COVERAGE = 0.5        # share of a long Latin value's tokens that must occur in what was heard / seen (the model composes long text)
+EVIDENCE_KEY = "grounding_evidence"      # reserved argument the gateway adds to every tool schema it shows the engine, and strips before the client sees the call
+
+# ---------------------------------------------------------------- format normaliser (Round 4k / R-1): FORMAT conversion only
+# Chinese numerals -> Arabic digits (八十八 -> 88, 一号 -> 1号, 三零二 -> 302, 二零二六 -> 2026), full-width -> half-width and case folding (NFKC), then
+# everything that is not a word character, @ . _ is dropped. Applied identically to a value, to the caller's words and to a span, so equality is
+# decided on one format. It never decides what a number MEANS (十二点 stays 12点, not 12:00) and it knows no names, places or words.
+_CN_DIGIT = {"零": 0, "〇": 0, "○": 0, "一": 1, "壹": 1, "二": 2, "贰": 2, "两": 2, "三": 3, "叁": 3, "四": 4, "肆": 4, "五": 5, "伍": 5,
+             "六": 6, "陆": 6, "七": 7, "柒": 7, "八": 8, "捌": 8, "九": 9, "玖": 9}
+_CN_UNIT = {"十": 10, "拾": 10, "百": 100, "佰": 100, "千": 1000, "仟": 1000}
+_CN_RUN = re.compile("[" + "".join(list(_CN_DIGIT) + list(_CN_UNIT) + ["万"]) + "]+")
 
 
-def _cjk_grounded(v: str, said: str) -> bool:
-    """Provenance for the CJK part of a value: its characters (whitespace / punctuation / Latin removed on both sides) occur as one run in
-    what was heard / seen, or at least ``CJK_MIN_COVERAGE`` of its character pairs do. No dictionary, no names list."""
-    c = "".join(_CJK.findall(v))
-    if len(c) < 2:                                           # one character carries no provenance signal (the Latin side skips < 3 too)
-        return True
-    s = "".join(_CJK.findall(said))
-    if c in s:
-        return True
-    pairs = [c[i:i + 2] for i in range(len(c) - 1)]
-    return sum(p in s for p in pairs) / len(pairs) >= CJK_MIN_COVERAGE
+def _cn_to_int(run: str) -> str:
+    if not any(c in _CN_DIGIT for c in run):                 # a bare unit (百, 万) is a word, not a number
+        return "10" if run in ("十", "拾") else run
+    if not any(c in _CN_UNIT or c == "万" for c in run):     # positional digits: 二零二六 -> 2026
+        return "".join(str(_CN_DIGIT[c]) for c in run)
+    total = section = num = 0
+    for c in run:
+        if c in _CN_DIGIT:
+            num = _CN_DIGIT[c]
+        elif c == "万":
+            if section + num == 0:                           # a 万 with no number before it ("万一") is a word, not a number
+                return run
+            total += (section + num) * 10000
+            section = num = 0
+        else:
+            section += (num if num else 1) * _CN_UNIT[c]
+            num = 0
+    return str(total + section + num)
 
 
-def check(name: str, args: dict, heard: list[str], seen: list[str]) -> list[tuple[str, str, str]]:
-    """Returns [(key, value, why)] for ungrounded values; [] = OK.  Every value is checked for provenance, whatever its length or script
-    (Round 4j / I-23): short Latin values by the whole-word / spoken-form / fuzzy rules below, CJK text by character provenance, long Latin
-    text by token coverage. The only values never checked are those with nothing to look up: under 3 Latin characters, a single CJK character."""
-    heard_n = [_norm(h) for h in heard]
-    corpus = " ".join(heard_n + [_norm(s) for s in seen])
+def norm_text(s: str) -> str:
+    s = unicodedata.normalize("NFKC", str(s)).lower()
+    s = _CN_RUN.sub(lambda m: _cn_to_int(m.group(0)), s)
+    return re.sub(r"[^\w@.]", "", s)
+
+
+def occurs(value_n: str, corpus_n: str) -> bool:
+    """``value_n`` occurs in ``corpus_n`` (both normalised). A number must not be a piece of a longer number: 88 is not in 1988 or 8800."""
+    if not value_n:
+        return False
+    i = corpus_n.find(value_n)
+    while i >= 0:
+        j = i + len(value_n)
+        if not ((value_n[0].isdigit() and i > 0 and corpus_n[i - 1].isdigit()) or (value_n[-1].isdigit() and j < len(corpus_n) and corpus_n[j].isdigit())):
+            return True
+        i = corpus_n.find(value_n, i + 1)
+    return False
+
+
+def _turns_n(turns) -> str:
+    return "|".join(norm_text(x) for x in turns)            # "|" keeps a match from straddling two turns
+
+
+# ---------------------------------------------------------------- evidence: the MODEL says where a value comes from, code checks the span exists
+def _evidence_items() -> dict:
+    return {"type": "object", "properties": {
+        "argument": {"type": "string", "description": "Name of the argument this entry is about."},
+        "span": {"type": "string", "description": "The caller's words (or a tool result), copied EXACTLY as transcribed, that the value comes from."},
+        "value_comes_from_span": {"type": "boolean", "description": "true only if YOU judge the value to be what that span says: the same number, the same name, a "
+                                  "homophone or traditional / simplified spelling of it, or a short paraphrase. Never true for something the caller did not say."},
+        "read_back_to_caller": {"type": "boolean", "description": "true only if the span is the caller's own confirmation (their next words) after you read this value back to them."},
+    }, "required": ["argument", "span", "value_comes_from_span"]}
+
+
+def with_evidence_field(tools: list) -> list:
+    """Copy of ``tools`` where every function (except ``delegate``) accepts the optional ``grounding_evidence`` argument."""
+    out = []
+    for t in tools or []:
+        if not isinstance(t, dict):
+            out.append(t); continue
+        t = copy.deepcopy(t)
+        f = t.get("function") if isinstance(t.get("function"), dict) else t
+        if f.get("name") != "delegate":
+            params = f.setdefault("parameters", {"type": "object", "properties": {}})
+            if isinstance(params, dict) and isinstance(params.setdefault("properties", {}), dict):
+                params["properties"].setdefault(EVIDENCE_KEY, {"type": "array", "description": "For every argument whose value comes from what the caller said (or a "
+                                                               "tool returned), where it comes from. The system only checks that the span really was said.",
+                                                               "items": _evidence_items()})
+        out.append(t)
+    return out
+
+
+EVIDENCE_RULES_EN = ("\n\nTool arguments: never invent a value. When an argument comes from what the caller said, list it in `grounding_evidence` with the exact words "
+                     "you took it from (the system only checks that those words were really said; you judge that they mean the value). If the caller has not said it, ask. "
+                     "If a call is refused, read the value back to the caller, and when they confirm, call again with their confirming words as the span and read_back_to_caller=true.")
+EVIDENCE_RULES_ZH = ("\n\n工具参数：不要编造任何值。参数来自来电者说的话时，在 `grounding_evidence` 里写明你依据的原话（逐字照抄转写；系统只检查这段话确实说过，"
+                     "说的是不是这个值由你判断）。来电者没说过就先问。如果调用被拒绝，把这个值向来电者复述一遍；对方确认后再调用一次，把对方确认的原话作为 span，并设 read_back_to_caller=true。")
+
+
+def parse_evidence(raw) -> dict[str, list[dict]]:
+    """``grounding_evidence`` as the model wrote it -> {argument name: [entries]}; anything malformed is simply not evidence."""
+    if isinstance(raw, dict):
+        flat = []
+        for k, v in raw.items():
+            flat += [dict(x, argument=k) for x in (v if isinstance(v, list) else [v]) if isinstance(x, dict)]
+        raw = flat
+    out: dict[str, list[dict]] = {}
+    for it in raw if isinstance(raw, list) else []:
+        if isinstance(it, dict) and isinstance(it.get("argument"), str) and isinstance(it.get("span"), str):
+            out.setdefault(it["argument"], []).append(it)
+    return out
+
+
+def check(name: str, args: dict, heard: list[str], seen: list[str], evidence=None, spoken=None, audit=None) -> list[tuple[str, str, str]]:
+    """Returns [(key, value, why)] for ungrounded values; [] = OK.
+
+    EVERY value is checked, whatever its length or script (a number is never exempt), against ONLY what the caller said (``heard``, ASR turns) and what
+    tools returned (``seen``): never the instructions or tool schema (R-7). A value is grounded when
+      1. it occurs, after format normalisation, in the caller's words or a tool result (or is a spoken form of them: digits / dates / emails / spellings), or
+      2. the MODEL attached ``grounding_evidence`` for it: a ``span`` that occurs verbatim (after the same normalisation) in the caller's words or a tool result,
+         and the model's own statement ``value_comes_from_span: true``. Whether span and value are equivalent (八十八 / 88, homophones, 繁体, a short
+         paraphrase) is the model's judgment; the code only proves the span exists. Every such acceptance is appended to ``audit``.
+      3. (``read_back_to_caller``) the span is the caller's words from a turn AFTER the assistant last said the value aloud (``spoken`` = [(text, len(heard) then)]).
+    The only values not checked: nothing to look up (no digit and under 3 characters: 'TX', one CJK character)."""
+    evidence = parse_evidence(evidence)
+    spoken = spoken or []
+    heard_c, seen_c = _turns_n(heard), _turns_n(seen)
+    corpus = heard_c + "|" + seen_c
     joins = ([j for h in heard for j in spelled_joins(h)] + [n for h in heard for n in word_numbers(h)]
-             + [_norm(x) for h in heard for x in spoken_forms(h)])
-    words = set(re.findall(r"[a-z0-9@._]+", " ".join(heard + seen).lower())) | set(joins)
-    bad = []
+             + [x for h in heard for x in spoken_forms(h)])
+    joins_n = {norm_text(j) for j in joins}
+    words = set(re.findall(r"[a-z0-9@._]+", " ".join(list(heard) + list(seen)).lower())) | {j.lower() for j in joins}
     said = "\n".join(list(heard) + list(seen))
+    bad = []
 
     def near(w: str) -> float:
         return max((difflib.SequenceMatcher(None, w, x).ratio() for x in words), default=0.0)
 
-    def latin_grounded(v: str, nv: str) -> tuple[bool, float]:
-        if appears_in_words(v, said):                            # literal provenance: the value is, as a whole word, in what was heard / seen
+    def literal(v: str, vn: str) -> tuple[bool, float]:
+        if occurs(vn, corpus) or vn in joins_n:
             return True, 1.0
-        if nv in corpus or nv.lstrip("#") in corpus or nv in joins:
+        if appears_in_words(v, said):
             return True, 1.0
         dm = re.fullmatch(r"\d{4}-(\d{2})-(\d{2})", v.strip())
-        if dm and (dm.group(1) + dm.group(2)) in joins:                  # year usually not said
+        if dm and (dm.group(1) + dm.group(2)) in joins_n:                  # year usually not said
             return True, 1.0
-        if "@" in nv:                                            # emails are often said as "name at domain dot com"
-            loc, _, dom = nv.partition("@")
-            if loc and loc in corpus and dom.split(".")[0] in corpus:
+        if "@" in vn:                                            # emails are often said as "name at domain dot com"
+            loc, _, dom = vn.partition("@")
+            if loc and occurs(loc, corpus) and occurs(dom.split(".")[0], corpus):
                 return True, 1.0
-        best = near(nv)
-        if best >= 0.85:
-            return True, best
-        parts = [_norm(p) for p in re.split(r"[\s,]+", v) if _norm(p)]
-        if len(parts) > 1 and all(p in corpus or p in joins or near(p) >= 0.85 for p in parts):
+        has_digit = any(c.isdigit() for c in vn)
+        ascii_ = vn.isascii()
+        best = 0.0
+        if ascii_ and not has_digit:                             # misheard LETTERS only; a digit string is never fuzzy-matched (4829137 is not 4829130)
+            best = near(vn)
+            if best >= 0.85:
+                return True, best
+        parts = [norm_text(p) for p in re.split(r"[\s,]+", v) if norm_text(p)]
+        if len(parts) > 1 and all(p in words or p in joins_n or occurs(p, corpus) and (any(c.isdigit() for c in p) or not p.isascii())
+                                  or (p.isascii() and not any(c.isdigit() for c in p) and near(p) >= 0.85) for p in parts):
             return True, best
         return False, best
 
+    def by_evidence(k: str, v: str, vn: str) -> tuple[bool, str]:
+        entries = evidence.get(k) or []
+        if not entries:
+            return False, "no evidence span was given"
+        why = "its evidence span does not occur in what the caller said"
+        for en in entries:
+            span_n = norm_text(en.get("span", ""))
+            if en.get("value_comes_from_span") is not True:
+                why = "the model did not state that the value comes from its span"
+                continue
+            if not span_n:
+                continue
+            if en.get("read_back_to_caller") is True:
+                j = max((i for i, (tx, _) in enumerate(spoken) if occurs(vn, norm_text(tx))), default=-1)
+                if j < 0:
+                    why = "the value was never read back to the caller"
+                    continue
+                if not occurs(span_n, _turns_n(heard[spoken[j][1]:])):
+                    why = "the caller said nothing like that after the read-back"
+                    continue
+                if audit is not None:
+                    audit.append({"argument": k, "value": v, "how": "read_back_confirmed", "span": en.get("span"), "value_comes_from_span": True})
+                return True, ""
+            if occurs(span_n, corpus):
+                if audit is not None:
+                    audit.append({"argument": k, "value": v, "how": "model_span", "span": en.get("span"), "value_comes_from_span": True})
+                return True, ""
+        return False, why
+
     for k, v in _values(args):
-        if _CJK.search(v):
-            if not _cjk_grounded(v, said):
-                bad.append((k, v, "not said by the caller (the characters do not occur in what was heard)"))
-                continue
-            v = _CJK.sub(" ", v).strip()                         # the Latin / digit rest of a mixed value is checked below
-            if not v:
-                continue
-        nv = _norm(v)
-        if len(v.split()) > 3:                                   # long text: checked for provenance too, by token coverage
-            toks = [x.strip(".") for x in re.findall(r"[a-z0-9@._]+", v.lower()) if x.strip(".")]
-            if toks and all(x.isdigit() for x in toks):          # "4 8 2 9 1 3 7": an id read out digit by digit is one value
-                ok, best = latin_grounded(v, nv)
-            else:
-                grounded = [x for x in toks if x in words or near(x) >= 0.85]
-                ok = bool(toks) and len(grounded) / len(toks) > LONG_MIN_COVERAGE and all(x in grounded for x in toks if any(c.isdigit() for c in x))
-                best = len(grounded) / len(toks) if toks else 0.0
-            if not ok:
-                bad.append((k, v, f"not said by the caller (only {best:.0%} of its words occur in what was heard)"))
+        if k == EVIDENCE_KEY:
             continue
-        if len(nv) < 3:
+        vn = norm_text(v)
+        if not vn or (len(vn) < 3 and not any(c.isdigit() for c in vn) and not (len(vn) >= 2 and _CJK.search(vn))):
+            continue                                             # nothing to look up
+        if len(vn) < 2 and _CJK.search(vn):
             continue
-        ok, best = latin_grounded(v, nv)
-        if not ok:
-            bad.append((k, v, f"not said by the caller (closest match {best:.2f})"))
+        ok, best = literal(v, vn)
+        if ok:
+            if audit is not None:
+                audit.append({"argument": k, "value": v, "how": "literal"})
+            continue
+        ok, why = by_evidence(k, v, vn)
+        if ok:
+            continue
+        bad.append((k, v, f"not said by the caller ({why}" + (f"; closest match {best:.2f}" if best else "") + ")"))
     return bad
 
 
@@ -227,7 +353,8 @@ def guard_message(bad, heard: list[str]) -> str:
     joins = [j for h in heard[-3:] for j in spelled_joins(h)]
     s = (f"NOT EXECUTED. These argument values were not provided by the caller: {vals}. Do not guess or invent values. "
          f"Ask the caller for the missing information (for names and emails, ask them to spell it letter by letter), "
-         f"read it back, then call the tool again with exactly what they said.")
+         f"read it back, then call the tool again with exactly what they said. If the caller DID say it in other words (a spoken number, a homophone, a "
+         f"short paraphrase), call again and list it in {EVIDENCE_KEY} with their exact words as the span.")
     if recent:
         s += f" Caller's recent words (speech transcript): \"{recent}\"."
     if joins:
@@ -235,13 +362,16 @@ def guard_message(bad, heard: list[str]) -> str:
     return s
 
 
-def needs_input_message(bad) -> str:
-    """The answer to a call the model repeated unchanged after being told its values were not provided: the tool is NOT run and never will be
-    for these values; the only way forward is to ask the caller (Round 4j / I-24)."""
+def needs_input_message(bad, give_up: bool = False) -> str:
+    """The answer to a call the model repeated unchanged after being told its values were not provided: the tool is NOT run for these values. The way
+    forward is the caller: read the value back, and the caller's confirming words (their next turn) become the provenance (``read_back_to_caller``)."""
     vals = ", ".join(f"{k}={v!r}" for k, v, _ in bad)
-    return (f"NOT EXECUTED and will not be. You repeated a call whose values were never provided by the caller ({vals}). Stop calling the tool "
-            "with them. Tell the caller what you need, ask them to say it (spell names, emails and ids letter by letter), and call the tool "
-            "again only with what they actually said.")
+    if give_up:
+        return (f"NOT EXECUTED. Too many of your calls were refused in this conversation ({vals}). Stop calling tools with values the caller has not given. "
+                "Tell the caller plainly that you cannot complete this on your own and ask what they would like to do (they may prefer to end the call).")
+    return (f"NOT EXECUTED and will not be. You repeated a call whose values were never provided by the caller ({vals}). Read each value back to the caller "
+            "(\"I have <value>, is that right?\", or ask them to spell it), wait for their answer, and only then call the tool again: put the caller's confirming "
+            f"words, copied exactly, as the span in {EVIDENCE_KEY} with value_comes_from_span=true and read_back_to_caller=true. Do not call it again before they answer.")
 
 
 def output_failed(item: dict) -> bool:
@@ -276,3 +406,15 @@ def failure_hint(failed: bool, heard: list[str]) -> str:
     s = f"\n[Caller's recent words (speech transcript): \"{recent}\"."
     if joins: s += f" Spelled-out sequences heard: {', '.join(joins)}."
     return s + " If a name or id may have been misheard, ask the caller to spell it letter by letter and retry with the spelled version.]"
+
+
+class ToolText(str):
+    """A client's ``function_call_output`` text that remembers whether the item reported failure by structure (``output_failed(item)``): the back
+    office reads ``.failed`` so ``item.error`` / ``item.status`` count toward MAX_FAILS, not only a JSON ``ok:false`` inside the text (R-4)."""
+    failed: bool = False
+
+
+def tool_text(item: dict) -> ToolText:
+    s = ToolText(str((item or {}).get("output", "")))
+    s.failed = output_failed(item)
+    return s

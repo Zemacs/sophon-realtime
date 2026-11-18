@@ -60,7 +60,10 @@ class LongValuesAreChecked(unittest.TestCase):
 
     def test_a_long_value_made_of_what_the_caller_said_passes(self) -> None:
         self.assertEqual(bad({"address": "742 Evergreen Terrace Springfield"}, self.HEARD), [])
-        self.assertEqual(bad({"note": "bob lives at Evergreen Terrace in Springfield"}, self.HEARD), [])
+        # Round 4k: the 50% token-overlap rule is gone. A composed value (words the caller never said) needs the model's evidence span instead.
+        self.assertTrue(bad({"note": "bob lives at Evergreen Terrace in Springfield"}, self.HEARD))
+        ev = [{"argument": "note", "span": "I live at 742 Evergreen Terrace Springfield", "value_comes_from_span": True}]
+        self.assertEqual(grounding.check("t", {"note": "bob lives at Evergreen Terrace in Springfield"}, self.HEARD, [], evidence=ev), [])
 
     def test_an_invented_long_value_is_blocked(self) -> None:
         for args in ({"address": "55 Maple Avenue Shelbyville Ohio"}, {"name": "Dr Alice Marie Carter Jones"}, {"address": "9 Quiet Lane Portland Oregon"}):
@@ -88,6 +91,7 @@ class LongValuesAreChecked(unittest.TestCase):
 def _session(heard: list[str]) -> realtime.RealtimeSession:
     s = realtime.RealtimeSession.__new__(realtime.RealtimeSession)
     s.id = "t"; s.heard = list(heard); s.seen = []; s.asr = object(); s.asr_tasks = []; s.guard_counts = {}
+    s.guard_total = 0; s.audit = []; s.spoken = []; s.degraded_warned = False
     s.cfg = {"instructions": "", "tools": [{"name": "lookup_account"}]}
     s.engine = mock.MagicMock(); s.engine.tool_result = mock.AsyncMock()
     return s

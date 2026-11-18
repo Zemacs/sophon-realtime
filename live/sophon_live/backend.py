@@ -190,7 +190,7 @@ class BackOffice:
                                "to spell the value letter by letter (or read the digits one by one) and wait for it." % self.fails[name])
                     else:
                         out = await call_tool(name, args)
-                        if grounding.output_failed({"output": out}):      # structure only (Round 4j / B-5): never the words of the output
+                        if getattr(out, "failed", False) or grounding.output_failed({"output": out}):      # structure only (Round 4j / B-5): never the words of the output
                             self.fails[name] = self.fails.get(name, 0) + 1
                     self.actions.append(f"{name}({json.dumps(args, ensure_ascii=False)}) -> {out[:600]}")
                     msgs.append({"role": "tool", "tool_call_id": tc["id"], "content": out})

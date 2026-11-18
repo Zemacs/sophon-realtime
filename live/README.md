@@ -66,3 +66,7 @@ Measured on one H100 (mock backend, 14 recorded questions):
 - Sometimes delegates a question it could answer itself, or says a filler line without delegating.
 - The first session right after the engine starts may not respond; run one warm-up session (`client_example.py` does this).
 - Sound tags appear in the output transcript (for example `[laughter]`), the way GPT-Live shows acoustic events.
+
+### Release gate
+
+`python tests/release_gate.py` (from `live/`, with pytest, httpx, websockets, fastapi, uvicorn, numpy, aiohttp installed) fails unless **node** is installed (the page behaviour tests need it), no page test is skipped, the full suite passes with `SOPHON_LIVE_*` cleared, and `tests/mutation_check_r4c.py` kills every mutant. There is no CI in this repository; run the gate before releasing.

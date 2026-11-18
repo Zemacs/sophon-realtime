@@ -44,7 +44,7 @@ _PAD_BY_TOOL = {
     "get_weather": "我帮你查一下。",
     "get_news": "我帮你查一下。",
     "web_search": "我帮你查一下。",
-    "memory_note": "我想一下。",
+    "memory_note": "我帮你查一下。",
     "device_control": "好的，马上。",
     "get_datetime": "",
 }

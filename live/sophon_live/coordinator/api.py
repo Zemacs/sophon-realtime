@@ -141,7 +141,7 @@ async def _admit(req: AdmitRequest, ledger: Ledger, meta: dict) -> AdmitResult:
     return AdmitResult(
         speak=SpeakPlan(
             kind="pad",
-            text="我帮你查一下。",
+            text=intent.pad_for(text),
             task_id=job.task_id,
             version=job.version,
         ),
@@ -166,7 +166,7 @@ def _apply_control(decision: ControlDecision, text: str, req: AdmitRequest, ledg
         # unknown id (e.g. a hallucinated option): nothing to control, treat as a new request
         job = _new_job(ledger, text, language=req.language)
         return AdmitResult(
-            speak=SpeakPlan(kind="pad", text="我帮你查一下。", task_id=job.task_id, version=job.version),
+            speak=SpeakPlan(kind="pad", text=intent.pad_for(text), task_id=job.task_id, version=job.version),
             job=job,
             route="WORKER",
             ledger=ledger,

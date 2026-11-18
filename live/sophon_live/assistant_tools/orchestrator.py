@@ -37,7 +37,9 @@ SYS = (
     "- Device: call device_control.\n"
     "- Chat / jokes / chit-chat with no tool need: answer directly. If history shows a previous "
     "joke the caller disliked, tell a different one.\n"
-    "- If a tool returns an error JSON or '暂时/不可用', apologize briefly and stop retrying the same tool.\n"
+    "- If a tool returns headlines or weather facts, speak them immediately; never call the same tool again in that turn.\n"
+    "- If a tool returns an error JSON or '暂时/不可用/unreachable', apologize briefly and stop retrying the same tool.\n"
+    "- Match the caller's language; for Chinese tasks keep get_news lang=zh.\n"
     "When done, reply with ONLY the short spoken answer for the caller (one or two natural sentences). "
     "No markdown, no tool names, no 'SAY:' prefix."
 )
@@ -187,10 +189,23 @@ async def resolve_task(
                     out[:160],
                 )
                 msgs.append({"role": "tool", "tool_call_id": tc.get("id") or name, "content": out})
-                # stop hammering a failing network tool in the same turn
-                if name in ("get_weather", "web_search", "get_news") and (
-                    '"ok": false' in out or "暂时" in out or "unavailable" in out.lower() or "不可用" in out
-                ):
+                failed = (
+                    '"ok": false' in out
+                    or "暂时连不上" in out
+                    or "暂时查不到" in out
+                    or "暂时没有" in out
+                    or "unreachable" in out.lower()
+                    or "unavailable" in out.lower()
+                    or "不可用" in out
+                )
+                news_ok = name == "get_news" and ("第1条" in out or "Headlines on" in out) and not failed
+                weather_ok = name == "get_weather" and ("度" in out or "°" in out or "°C" in out) and not failed
+                if news_ok or weather_ok:
+                    msgs.append({
+                        "role": "user",
+                        "content": "Tool succeeded. Speak one or two short oral sentences from this result now. Do NOT call the same tool again.",
+                    })
+                elif name in ("get_weather", "web_search", "get_news") and failed:
                     msgs.append({
                         "role": "user",
                         "content": "The tool failed. Tell the caller briefly without calling the same tool again.",

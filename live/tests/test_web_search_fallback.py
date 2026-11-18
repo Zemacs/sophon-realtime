@@ -120,3 +120,58 @@ class FallbackTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BingHedgeTests(unittest.IsolatedAsyncioTestCase):
+    def _flaky(self, plan: list):
+        """Attempts at the Bing URL behave as ``plan`` says in order: 'ok' / 'fail' / 'hang'."""
+        calls: list[float] = []
+
+        async def fetch(url: str, timeout: float = 5.5) -> bytes:
+            if "cn.bing.com" not in url:
+                raise OSError("down")
+            n = len(calls); calls.append(time.monotonic())
+            what = plan[n] if n < len(plan) else "hang"
+            if what == "fail":
+                raise OSError("reset")
+            if what == "hang":
+                await asyncio.sleep(30)
+            return BING_HTML
+        fetch.calls = calls
+        return fetch
+
+    async def test_a_failed_attempt_is_retried_at_once(self) -> None:
+        fetch = self._flaky(["fail", "ok"])
+        with mock.patch.object(web_search, "_fetch_bytes", fetch):
+            t0 = time.monotonic()
+            out = await web_search.run({"query": "汇率"})
+        self.assertIn("外汇牌价", out)
+        self.assertLess(time.monotonic() - t0, 1.0)
+        self.assertEqual(len(fetch.calls), 2)
+
+    async def test_a_stalled_attempt_is_hedged_after_the_hedge_delay(self) -> None:
+        fetch = self._flaky(["hang", "ok"])
+        with mock.patch.object(web_search, "_BING_HEDGE_S", 0.3), mock.patch.object(web_search, "_fetch_bytes", fetch):
+            t0 = time.monotonic()
+            out = await web_search.run({"query": "汇率"})
+        self.assertIn("外汇牌价", out)
+        self.assertLess(time.monotonic() - t0, 1.5)
+
+    async def test_three_failures_are_an_honest_outage(self) -> None:
+        fetch = self._flaky(["fail", "fail", "fail"])
+        with mock.patch.object(web_search, "_fetch_bytes", fetch):
+            out = await web_search.run({"query": "汇率"})
+        self.assertIn("网络暂时不可用", out)
+        self.assertEqual(len(fetch.calls), 3)
+
+    def test_gzip_pages_are_decoded(self) -> None:
+        import gzip as _gz
+        import io
+
+        class Resp(io.BytesIO):
+            headers = {"Content-Encoding": "gzip"}
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        with mock.patch.object(web_search.urllib.request, "urlopen", lambda req, timeout=0: Resp(_gz.compress(BING_HTML))):
+            self.assertEqual(web_search._urlopen("https://cn.bing.com/search?q=x", 1.0), BING_HTML)

@@ -8,6 +8,7 @@ started at once and the answer is taken by priority; the whole search has a hard
 from __future__ import annotations
 
 import asyncio
+import gzip
 import json
 import os
 import re
@@ -58,10 +59,13 @@ def _no_results(query: str, *, zh: bool) -> str:
 
 def _urlopen(url: str, timeout: float = 20.0) -> bytes:
     bing = "bing.com" in url
-    headers = {"User-Agent": _BROWSER_UA, "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.5"} if bing else {"User-Agent": _UA}
+    headers = {"User-Agent": _BROWSER_UA, "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.5", "Accept-Encoding": "gzip"} if bing else {"User-Agent": _UA}
     req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read()
+        raw = resp.read()
+        if (getattr(resp, "headers", None) or {}).get("Content-Encoding", "") == "gzip":
+            raw = gzip.decompress(raw)             # 106 KB -> 37 KB: matters on this link
+        return raw
 
 
 async def _fetch_bytes(url: str, timeout: float = 5.5) -> bytes:
@@ -137,10 +141,40 @@ def _snippets_from_bing(html: str, limit: int) -> list[str]:
     return out
 
 
+_BING_HEDGE_S = 1.5      # a Bing attempt that has not answered by then gets a second, independent connection (max 3)
+
+
 async def _bing(query: str, max_results: int, zh: bool, timeout: float) -> list[str]:
-    q = urllib.parse.quote_plus(query)
-    html = (await _fetch_bytes(_BING_URL.format(q=q, en=0 if zh else 1), timeout)).decode("utf-8", errors="replace")
-    return _snippets_from_bing(html, max_results)
+    """The GPU box's route to Bing drops or stalls roughly every other new connection (measured 2026-11-18: of 10 fetches
+    ~4 failed outright, ok ones took 0.3-5 s), so attempts are hedged: first success wins, a failure starts the next at once."""
+    url = _BING_URL.format(q=urllib.parse.quote_plus(query), en=0 if zh else 1)
+    deadline = time.monotonic() + timeout
+    pending: set[asyncio.Future] = set()
+    last: BaseException = asyncio.TimeoutError()
+    try:
+        for attempt in range(3):
+            left = deadline - time.monotonic()
+            if left <= 0.3:
+                break
+            pending.add(asyncio.ensure_future(_fetch_bytes(url, left)))
+            wait_s = _BING_HEDGE_S if attempt < 2 else max(0.0, deadline - time.monotonic())
+            done, pending = await asyncio.wait(pending, timeout=wait_s, return_when=asyncio.FIRST_COMPLETED)
+            for d in done:
+                if d.exception() is None:
+                    return _snippets_from_bing(d.result().decode("utf-8", errors="replace"), max_results)
+                last = d.exception()  # type: ignore[assignment]
+        while pending and deadline - time.monotonic() > 0:
+            done, pending = await asyncio.wait(pending, timeout=deadline - time.monotonic(), return_when=asyncio.FIRST_COMPLETED)
+            for d in done:
+                if d.exception() is None:
+                    return _snippets_from_bing(d.result().decode("utf-8", errors="replace"), max_results)
+                last = d.exception()  # type: ignore[assignment]
+    finally:
+        for f in pending:
+            f.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+    raise last
 
 
 async def _ddg(query: str, max_results: int, zh: bool, timeout: float) -> list[str]:

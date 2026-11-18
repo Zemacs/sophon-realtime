@@ -277,7 +277,7 @@ class PriorityTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.dict(os.environ, ENV), mock.patch.object(weather, "_fetch_json", fetch):
             _, meta = await weather.run_detailed({"city": "北京", "when": "tomorrow"})
         self.assertEqual(meta["source"], "open-meteo")     # not wttr: open-meteo ranks above it
-        self.assertEqual(meta["notes"], ["sojson:OSError"])
+        self.assertEqual(meta["notes"], ["sojson:network"])
 
     async def test_top_source_that_hangs_is_cut_by_its_timeout_then_the_next_one_answers(self) -> None:
         fetch = _router(om=OM, wttr=WTTR, sojson=SOJSON, sj_delay=9.0)

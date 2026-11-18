@@ -66,7 +66,7 @@ class WordBoundaries(unittest.TestCase):
 
     def test_known_city_in_either_language(self) -> None:
         ev = {"tool": "get_weather"}
-        self.assertTrue(ok("Weather for 北京 is unavailable right now (sojson:OSError).", ev, "weather in Beijing"))
+        self.assertTrue(ok("Weather for 北京 is unavailable right now (sojson:network).", ev, "weather in Beijing"))
         self.assertTrue(ok("暂时查不到北京的天气，请稍后再试。", ev, "what's the weather in beijing"))
         self.assertFalse(ok("暂时查不到上海的天气，请稍后再试。", ev, "what's the weather in beijing"))
 
@@ -75,19 +75,21 @@ class EnglishWeatherSlotIsNarrow(unittest.TestCase):
     EV = {"tool": "get_weather"}
 
     def test_real_note_shapes_pass(self) -> None:
-        for reason in ("no source", "sojson:OSError", "sojson:OSError, open-meteo:TimeoutError, wttr:no_data",
-                       ", ".join(["wttr:TimeoutError"] * 8)):
+        for reason in ("no source", "sojson:network", "sojson:network, open-meteo:timeout, wttr:no_data",
+                       ", ".join(["wttr:timeout"] * 8)):
             self.assertTrue(ok(f"Weather for Paris is unavailable right now ({reason}).", self.EV, "weather in Paris"), reason)
 
     def test_free_text_in_the_slot_is_rejected(self) -> None:
-        for reason in ("it is sunny, 25 degrees, trust me", "sojson:OSError, " + "9" * 100, "sojson:HTTP 500", "x" * 60,
-                       "sojson:OSError, open-meteo:TimeoutError, wttr:no_data, " + ", ".join(["wttr:TimeoutError"] * 8),
-                       "evil:OSError", "sojson:" + "A" * 80, "sojson:OSError 25C sunny"):
+        for reason in ("it is sunny, 25 degrees, trust me", "sojson:network, " + "9" * 100, "sojson:HTTP 500", "x" * 60,
+                       "sojson:network, open-meteo:timeout, wttr:no_data, " + ", ".join(["wttr:timeout"] * 8),
+                       "evil:network", "sojson:" + "A" * 80, "sojson:network 25C sunny",
+                       # I-17: a well-formed <source>:<token> whose token is not in the closed enum (free ASCII, or a bare class name)
+                       "sojson:sunny_minus3_to_11", "sojson:OSError", "open-meteo:TimeoutError", "sojson:gaierror"):
             self.assertFalse(ok(f"Weather for Paris is unavailable right now ({reason}).", self.EV, "weather in Paris"), reason)
 
     def test_slot_cannot_be_widened_back_to_200_chars(self) -> None:
         # S-21 mutant "slot widened": a 150-char free-text / digit slot must still be rejected
-        long_digits = "sojson:OSError, " + "1" * 150
+        long_digits = "sojson:network, " + "1" * 150
         self.assertFalse(ok(f"Weather for Paris is unavailable right now ({long_digits}).", self.EV, "weather in Paris"))
         long_text = "北京晴零下三度" * 20
         self.assertFalse(ok(f"Weather for Paris is unavailable right now ({long_text}).", self.EV, "weather in Paris"))
@@ -127,7 +129,7 @@ class RealToolSentencesStayWhitelisted(unittest.TestCase):
         from sophon_live.assistant_tools import weather
 
         async def down(*a, **k):
-            return None, "", ["sojson:OSError", "open-meteo:TimeoutError", "wttr:no_data"]
+            return None, "", ["sojson:network", "open-meteo:timeout", "wttr:no_data"]
 
         async def nodata(*a, **k):
             return None, "", ["open-meteo:no_data", "wttr:no_data"]

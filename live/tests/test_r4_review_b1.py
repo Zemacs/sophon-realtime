@@ -18,6 +18,7 @@ from sophon_live.assistant_tools import orchestrator as orch
 from sophon_live.coordinator import Ledger, WorkerJob, WorkerResult, api, finish_job
 from sophon_live.coordinator.schemas import NO_TOOL_ANSWER
 from sophon_live.coordinator.schemas import TaskStatus, freshness_token_for
+from tests._tool_fakes import failing_tool
 from tests.test_gateway_coord_control import _commentary, _session
 from tests.test_orch_worker import _say, _tool_call
 from tests.test_orchestrator import _FakeResp, _FakeSession
@@ -127,7 +128,7 @@ class ToolFailureTests(unittest.IsolatedAsyncioTestCase):
         sess = _FakeSession([_FakeResp(200, _tool_call("get_weather", '{"city":"北京","when":"tomorrow"}'))])   # ONE LLM call only
         tool_says = "暂时查不到北京的天气，请稍后再试。"
         job = WorkerJob(task_id="t1", version=2, objective="明天北京会下雨吗", require_tools=["get_weather"])
-        with mock.patch.object(orch.aiohttp, "ClientSession", return_value=sess), mock.patch.object(orch, "run_tool", new=mock.AsyncMock(return_value=tool_says)):
+        with mock.patch.object(orch.aiohttp, "ClientSession", return_value=sess), mock.patch.object(orch, "run_tool", new=failing_tool(tool_says)):
             res = await orch.run_job(job)
         self.assertEqual(len(sess.posts), 1)                      # the model never got to paraphrase / invent
         self.assertEqual((res.status, res.spoken_answer), ("failed", tool_says))
@@ -143,7 +144,7 @@ class ToolFailureTests(unittest.IsolatedAsyncioTestCase):
         sess = _FakeSession([_FakeResp(200, _tool_call("get_weather", '{"city":"北京"}'))])
         job = WorkerJob(task_id="t1", version=1, objective="北京天气", require_tools=["get_weather"])
         said = "暂时查不到北京的天气，请稍后再试。"
-        with mock.patch.object(orch.aiohttp, "ClientSession", return_value=sess), mock.patch.object(orch, "run_tool", new=mock.AsyncMock(return_value=said)):
+        with mock.patch.object(orch.aiohttp, "ClientSession", return_value=sess), mock.patch.object(orch, "run_tool", new=failing_tool(said)):
             res = await orch.run_job(job)
         self.assertEqual(res.evidence[0]["failure_text"], said)
         led = Ledger(); rec = led.create("北京天气"); led.mark_running(rec.task_id)
@@ -167,7 +168,7 @@ class ToolFailureTests(unittest.IsolatedAsyncioTestCase):
         ])
         job = WorkerJob(task_id="t1", version=1, objective="随便聊聊，说说北京的天气", require_tools=[])
         with mock.patch.object(orch.aiohttp, "ClientSession", return_value=sess), \
-                mock.patch.object(orch, "run_tool", new=mock.AsyncMock(return_value="暂时查不到北京的天气，请稍后再试。")):
+                mock.patch.object(orch, "run_tool", new=failing_tool("暂时查不到北京的天气，请稍后再试。")):
             res = await orch.run_job(job)
         self.assertEqual((res.status, res.spoken_answer), ("completed", "现在查不到天气，稍后再试。"))
 

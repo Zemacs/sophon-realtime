@@ -20,6 +20,8 @@ import urllib.request
 from html import unescape
 from typing import Any
 
+from .. import failcodes
+from . import toolmeta
 from . import inflight as _inflight_mod
 
 _INSTANT_URL = "https://api.duckduckgo.com/"
@@ -266,9 +268,12 @@ async def run(args: dict[str, Any] | None = None) -> str:
 
     if not snippets:
         if empty:
+            toolmeta.note(failure=failcodes.NO_RESULTS)
             return _no_results(query, zh=zh)
         if busy:
+            toolmeta.note(failure=failcodes.BUSY)
             return _inflight_mod.BUSY_ZH if zh else _inflight_mod.BUSY_EN       # S-24: our own cap refused, not a network fault
+        toolmeta.note(failure=failcodes.NETWORK)
         return _network_error(zh)
 
     snippets = snippets[:max_results]

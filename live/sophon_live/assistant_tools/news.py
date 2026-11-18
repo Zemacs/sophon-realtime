@@ -9,7 +9,8 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from typing import Any
 
-from . import inflight
+from .. import failcodes
+from . import inflight, toolmeta
 
 _RSS_BASE = "https://news.google.com/rss/search"
 _UA = "sophon-live-assistant/1.0"
@@ -209,7 +210,9 @@ async def run(args: dict[str, Any] | None = None) -> str:
 
     if not titles:
         if busy:
+            toolmeta.note(failure=failcodes.BUSY)
             return inflight.BUSY_ZH if lang == "zh" else inflight.BUSY_EN         # S-24: our own cap refused, not a feed outage
+        toolmeta.note(failure=failcodes.NETWORK)
         if lang == "zh":
             return "新闻源暂时连不上，稍后再帮你看看头条吧。"
         return "News feeds are unreachable right now. Try again in a moment."

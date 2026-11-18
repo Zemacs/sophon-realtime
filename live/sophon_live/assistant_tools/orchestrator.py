@@ -148,6 +148,25 @@ def _evidence_has_required(job: WorkerJob, evidence: list[dict]) -> bool:
     return not req or any(ev.get("tool") in req and tool_succeeded(ev) for ev in evidence)
 
 
+def _tool_failure_code(out: str, tool_meta: dict[str, Any]) -> str | None:
+    """Structured failure signal of one tool call, or None when the tool reported none.
+
+    Two structured channels, nothing else: the tool's own failure code (``toolmeta`` key ``failure``, see ``failcodes``), and a JSON result
+    with ``"ok": false`` (the runner's error envelope: unknown tool, handler exception, scope refusal). The spoken text is not read."""
+    code = (tool_meta or {}).get("failure")
+    if code:
+        return str(code)
+    t = (out or "").strip()
+    if t.startswith("{"):
+        try:
+            obj = json.loads(t)
+        except ValueError:
+            return None
+        if isinstance(obj, dict) and obj.get("ok") is False:
+            return "error"
+    return None
+
+
 def _tool_failure_text(out: str) -> str:
     """What to say when a required tool ran and failed: the tool's own plain sentence (it is honest by construction),
     never model text. Machine-looking output (JSON) falls back to the generic sentence."""
@@ -303,21 +322,11 @@ async def run_job(
                     out[:160],
                 )
                 msgs.append({"role": "tool", "tool_call_id": tc.get("id") or name, "content": out})
-                failed = (
-                    '"ok": false' in out
-                    or "暂时连不上" in out
-                    or "同时在查的太多" in out
-                    or "too many lookups" in out
-                    or "暂时查不到" in out
-                    or "暂时没有" in out
-                    or "unreachable" in out.lower()
-                    or "unavailable" in out.lower()
-                    or "不可用" in out
-                    # "searched, found nothing" is not usable evidence for a factual answer (Critic S-11): the user hears the
-                    # tool's own 没搜到 sentence, the model does not get to improvise one from its head
-                    or (name == "web_search" and ("没有搜到" in out or "couldn't find useful snippets" in out))
-                )
-                evidence.append({"tool": name, "args": args, "ok": not failed, "ms": tool_ms, **tool_meta})
+                # B-3: failure is what the TOOL reported in structure (a failure code in toolmeta, or an {"ok": false} JSON result), never a
+                # reading of its spoken text for words
+                fail_code = _tool_failure_code(out, tool_meta)
+                failed = fail_code is not None
+                evidence.append({"tool": name, "args": args, "ok": not failed, "ms": tool_ms, **tool_meta, **({"failure": fail_code} if failed else {})})
                 if failed and name in required:
                     # A tool-backed job whose tool failed: say so plainly. The model never gets to word it, it could
                     # "recover" with numbers of its own (Critic B-1).

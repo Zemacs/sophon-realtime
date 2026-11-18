@@ -260,7 +260,7 @@ class FailureTextWhitelistTests(unittest.TestCase):
         cases = [
             ("get_weather", "暂时查不到北京的天气，请稍后再试。", {"city": "北京"}, "明天北京会下雨吗"),
             ("get_weather", "找不到火星的天气信息。", {"city": "火星"}, "火星的天气"),
-            ("get_weather", "Weather for Paris is unavailable right now (sojson:OSError, open-meteo:TimeoutError).", {"city": "Paris"}, "weather in Paris"),
+            ("get_weather", "Weather for Paris is unavailable right now (sojson:network, open-meteo:timeout).", {"city": "Paris"}, "weather in Paris"),
             ("web_search", "没有搜到关于「美元兑人民币」的可靠摘要。", {"query": "美元兑人民币"}, "今天美元兑人民币是多少"),
             ("web_search", "网络暂时不可用，没法完成网页搜索，请稍后再试。", {"query": "x"}, "今天美元兑人民币是多少"),
             ("get_news", "新闻源暂时连不上，稍后再帮你看看头条吧。", {"topic": "科技"}, "今天有什么科技新闻"),

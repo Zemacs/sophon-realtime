@@ -513,6 +513,7 @@ class LiveSession:
             return None
         a = a[max(0, voiced[0] * 320 - 3200): min(a.size, (voiced[-1] + 1) * 320 + 3200)]
         start = t0 + int(voiced[0] * 20); end = t0 + int((voiced[-1] + 1) * 20)
+        self._trace().note_vad_end(time.monotonic() - max(0, self.timeline_ms - end) / 1000)   # TRACE vad_end (体验版 v1 / 6)
         self.asr_task = asyncio.create_task(self._asr(a, start, end))
         return self.asr_task
 
@@ -818,6 +819,7 @@ class LiveSession:
                 r = self.resp.get(rid)
                 if r is not None and r["start_ms"] is None:
                     r["start_ms"] = self.timeline_ms
+                    self._trace().note_voice_start(time.monotonic())   # TRACE pad_start (体验版 v1 / 6)
                 self.play_buf = np.concatenate([self.play_buf, x]) if self.play_buf.size else x
                 self._play_rid = rid
             frame = self.play_buf[:n]; self.play_buf = self.play_buf[n:]

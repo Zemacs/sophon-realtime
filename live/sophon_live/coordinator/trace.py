@@ -4,6 +4,10 @@ Pure bookkeeping (no I/O, no audio). The gateway marks stages; ``TraceBook`` tur
 delegation into a single machine-readable log line ``TRACE {json}``; ``scripts/trace_summary.py`` aggregates them.
 
 Stages (ms since the delegation reached the gateway, first mark wins):
+  vad_end      NEGATIVE: the user's last voiced frame (energy VAD, 20 ms frames) -> delegation; how long the user waited
+               in silence before the system even had the task. Absent when the gateway did not cut a user segment.
+  pad_start    NEGATIVE (usually): the first sound the user heard after that, i.e. the front's lead-in / filler
+               (「我帮你查一下」). ``pad_start - vad_end`` is the real "time to first sound". Absent when there was no lead-in.
   deleg        0, the front called delegate()
   route        admit() returned (includes the JEV round trip, reported separately as ``jev_ms``)
   worker_start the Worker job began
@@ -23,7 +27,7 @@ from typing import Any
 
 log = logging.getLogger("sophon_live.trace")
 
-STAGES = ("deleg", "route", "worker_start", "worker_done", "say", "posted", "speech_start", "speech_end", "speech_cut", "silent")
+STAGES = ("vad_end", "pad_start", "deleg", "route", "worker_start", "worker_done", "say", "posted", "speech_start", "speech_end", "speech_cut", "silent")
 
 
 class TurnTrace:
@@ -38,6 +42,10 @@ class TurnTrace:
 
     def mark(self, stage: str) -> None:
         self.stages.setdefault(stage, round((self._clock() - self.t0) * 1000))
+
+    def mark_at(self, stage: str, t: float) -> None:
+        """Mark a stage that happened at monotonic time ``t`` (may be before the trace started: negative ms)."""
+        self.stages.setdefault(stage, round((t - self.t0) * 1000))
 
     def set(self, **kv: Any) -> None:
         self.meta.update({k: v for k, v in kv.items() if v is not None})
@@ -69,10 +77,25 @@ class TraceBook:
         self.by_did: dict[str, TurnTrace] = {}
         self._said: deque[TurnTrace] = deque()          # posted to the front, response not started yet
         self._speaking: dict[str, TurnTrace] = {}       # response id -> trace
+        self._vad_end: float | None = None              # monotonic time of the user's last voiced frame, not yet claimed
+        self._voice_start: float | None = None          # monotonic time the latest response became audible, not yet claimed
+
+    def note_vad_end(self, t: float) -> None:
+        self._vad_end = t
+
+    def note_voice_start(self, t: float) -> None:
+        self._voice_start = t
 
     def start(self, did: str) -> TurnTrace:
         self._turn += 1
         tr = TurnTrace(self.session, self._turn, did, clock=self._clock)
+        ve, vs = self._vad_end, self._voice_start
+        if ve is not None and 0 <= tr.t0 - ve <= 60:
+            tr.mark_at("vad_end", ve)
+            # the lead-in belongs to this turn only if it started after the user stopped (a previous turn's tail does not count)
+            if vs is not None and ve - 0.3 <= vs <= tr.t0 + 0.05:
+                tr.mark_at("pad_start", vs)
+        self._vad_end = self._voice_start = None        # each marker is claimed by one turn at most
         self.by_did[did] = tr
         return tr
 

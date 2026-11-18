@@ -248,5 +248,88 @@ class WeatherSourceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(fetch.calls), {"wttr"})
 
 
+class PriorityTests(unittest.IsolatedAsyncioTestCase):
+    """体验版 v1 / 2: the answer is chosen by source priority, not by who arrives first."""
+
+    def setUp(self) -> None:
+        weather.STATS.clear()
+        weather.CACHE.clear()
+
+    async def test_slower_top_priority_source_still_wins_over_a_faster_lower_one(self) -> None:
+        # sojson (priority 1) needs 0.3 s, open-meteo and wttr answer at once: sojson's numbers are the answer
+        fetch = _router(om=OM, wttr=WTTR, sojson=SOJSON, sj_delay=0.3)
+        with mock.patch.dict(os.environ, {**ENV, "SOPHON_WEATHER_TIMEOUT": "2"}), mock.patch.object(weather, "_fetch_json", fetch):
+            text, meta = await weather.run_detailed({"city": "北京", "when": "tomorrow"})
+        self.assertEqual(meta["source"], "sojson")
+        self.assertEqual(text, "北京明天小雨，气温2到12度。")
+
+    async def test_same_question_gets_the_same_answer_every_time(self) -> None:
+        answers = set()
+        for delays in ((0.0, 0.2, 0.0), (0.2, 0.0, 0.0), (0.0, 0.0, 0.2), (0.1, 0.0, 0.1)):
+            weather.CACHE.clear()
+            fetch = _router(om=OM, wttr=WTTR, sojson=SOJSON, om_delay=delays[0], wttr_delay=delays[1], sj_delay=delays[2])
+            with mock.patch.dict(os.environ, {**ENV, "SOPHON_WEATHER_TIMEOUT": "2"}), mock.patch.object(weather, "_fetch_json", fetch):
+                answers.add(await weather.run({"city": "北京", "when": "tomorrow"}))
+        self.assertEqual(len(answers), 1, answers)
+
+    async def test_fails_over_in_priority_order_when_the_top_source_is_down(self) -> None:
+        fetch = _router(om=OM, wttr=WTTR, sojson=OSError("down"))
+        with mock.patch.dict(os.environ, ENV), mock.patch.object(weather, "_fetch_json", fetch):
+            _, meta = await weather.run_detailed({"city": "北京", "when": "tomorrow"})
+        self.assertEqual(meta["source"], "open-meteo")     # not wttr: open-meteo ranks above it
+        self.assertEqual(meta["notes"], ["sojson:OSError"])
+
+    async def test_top_source_that_hangs_is_cut_by_its_timeout_then_the_next_one_answers(self) -> None:
+        fetch = _router(om=OM, wttr=WTTR, sojson=SOJSON, sj_delay=9.0)
+        with mock.patch.dict(os.environ, ENV), mock.patch.object(weather, "_fetch_json", fetch):
+            t0 = time.monotonic()
+            _, meta = await weather.run_detailed({"city": "北京", "when": "tomorrow"})
+        self.assertLess(time.monotonic() - t0, 1.5)
+        self.assertEqual(meta["source"], "open-meteo")
+
+    async def test_non_mainland_city_prefers_open_meteo_over_wttr(self) -> None:
+        fetch = _router(om=OM, wttr=WTTR, sojson=SOJSON, om_delay=0.2)
+        with mock.patch.dict(os.environ, {**ENV, "SOPHON_WEATHER_TIMEOUT": "2"}), mock.patch.object(weather, "_fetch_json", fetch):
+            _, meta = await weather.run_detailed({"city": "东京", "when": "tomorrow"})
+        self.assertEqual(meta["source"], "open-meteo")
+        self.assertNotIn("sojson", fetch.calls)
+
+    async def test_source_order_is_configurable(self) -> None:
+        fetch = _router(om=OM, wttr=WTTR, sojson=SOJSON)
+        with mock.patch.dict(os.environ, {**ENV, "SOPHON_WEATHER_SOURCES": "wttr,sojson"}), mock.patch.object(weather, "_fetch_json", fetch):
+            _, meta = await weather.run_detailed({"city": "北京", "when": "tomorrow"})
+        self.assertEqual(meta["source"], "wttr")
+
+    async def test_cache_is_keyed_by_city_and_target_date(self) -> None:
+        env = {**ENV, "SOPHON_WEATHER_CACHE_TTL": "600"}
+        with mock.patch.dict(os.environ, env), mock.patch.object(weather, "_fetch_json", _router(om=OM, wttr=WTTR, sojson=SOJSON)):
+            await weather.run({"city": "北京", "when": "tomorrow"})
+            await weather.run({"city": "北京", "when": "today"})
+        import datetime as dt
+        today = dt.date.today()
+        self.assertEqual(
+            sorted(k[:2] for k in weather.CACHE),
+            sorted([("北京", today.isoformat()), ("北京", (today + dt.timedelta(days=1)).isoformat())]),
+        )
+
+    async def test_cache_default_ttl_is_long_enough_for_a_conversation(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SOPHON_WEATHER_CACHE_TTL", None)
+            self.assertGreaterEqual(weather._cache_ttl(), 1800.0)
+
+    async def test_source_and_cache_origin_reach_the_trace_side_channel(self) -> None:
+        from sophon_live.assistant_tools import toolmeta
+        env = {**ENV, "SOPHON_WEATHER_CACHE_TTL": "600"}
+        with mock.patch.dict(os.environ, env), mock.patch.object(weather, "_fetch_json", _router(om=OM, wttr=WTTR, sojson=SOJSON)):
+            toolmeta.take()
+            await weather.run({"city": "北京", "when": "tomorrow"})
+            m1 = toolmeta.take()
+            await weather.run({"city": "北京", "when": "tomorrow"})
+            m2 = toolmeta.take()
+        self.assertEqual(m1["source"], "sojson")
+        self.assertEqual((m2["source"], m2["orig_source"]), ("cache", "sojson"))
+        self.assertIn("age_s", m2)
+
+
 if __name__ == "__main__":
     unittest.main()

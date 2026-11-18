@@ -1,9 +1,12 @@
-"""City weather from independent sources, raced: Open-Meteo, sojson (CN-hosted, mainland cities) and wttr.in, with a short-lived cache.
+"""City weather from independent sources in a fixed priority order, with a per-(city, date) cache.
 
-All of them are flaky from the GPU box (measured: each answers only some of the time, 1-40 s), so they run
-concurrently with a short per-source timeout; the first source that returns real data wins and the rest
-are cancelled. If every source fails or times out the caller gets an honest failure sentence, never
-invented numbers. ``SOPHON_WEATHER_SOURCES`` (default ``open-meteo,sojson,wttr``) selects sources for A/B runs.
+All sources are flaky from the GPU box (measured: each answers only some of the time, 0.2-40 s), so they are
+all started at once with a short per-source timeout (latency hedge), but the ANSWER is chosen by priority, not by
+who arrives first: the highest-priority source that returns real data wins, a lower one is used only after every
+higher one has failed or timed out. Same question, same source, same numbers (they used to differ from run to run
+because whoever answered first won). Default priority ``sojson,open-meteo,wttr`` (sojson is CN-hosted and covers
+mainland cities only; it is skipped for other cities). If every source fails the caller gets an honest failure
+sentence, never invented numbers. ``SOPHON_WEATHER_SOURCES`` sets sources and their order (also for A/B runs).
 """
 from __future__ import annotations
 
@@ -97,9 +100,9 @@ _STALE_MAX_S = 2 * 3600.0
 
 def _cache_ttl() -> float:
     try:
-        return max(0.0, float(os.environ.get("SOPHON_WEATHER_CACHE_TTL", "600")))
+        return max(0.0, float(os.environ.get("SOPHON_WEATHER_CACHE_TTL", "1800")))
     except ValueError:
-        return 600.0
+        return 1800.0
 
 
 def _note(source: str, ok: bool, ms: float, err: str = "") -> None:
@@ -114,22 +117,26 @@ def _note(source: str, ok: bool, ms: float, err: str = "") -> None:
 
 def _timeout_s() -> float:
     try:
-        return max(0.5, float(os.environ.get("SOPHON_WEATHER_TIMEOUT", "5")))
+        return max(0.5, float(os.environ.get("SOPHON_WEATHER_TIMEOUT", "4")))
     except ValueError:
-        return 5.0
+        return 4.0
 
 
 def _rounds() -> int:
     try:
-        return max(1, int(os.environ.get("SOPHON_WEATHER_ROUNDS", "3")))
+        return max(1, int(os.environ.get("SOPHON_WEATHER_ROUNDS", "2")))
     except ValueError:
-        return 3
+        return 2
 
 
 def _source_names() -> list[str]:
-    raw = os.environ.get("SOPHON_WEATHER_SOURCES", "open-meteo,sojson,wttr")
-    names = [x.strip() for x in raw.split(",") if x.strip() in ("open-meteo", "sojson", "wttr")]
-    return names or ["open-meteo", "sojson", "wttr"]
+    """Source names in priority order (highest first)."""
+    raw = os.environ.get("SOPHON_WEATHER_SOURCES", "sojson,open-meteo,wttr")
+    names: list[str] = []
+    for x in (p.strip() for p in raw.split(",")):
+        if x in ("open-meteo", "sojson", "wttr") and x not in names:
+            names.append(x)
+    return names or ["sojson", "open-meteo", "wttr"]
 
 
 def _resolve_city(city: str) -> tuple[str, str, bool]:
@@ -256,11 +263,15 @@ async def _from_open_meteo(display_name: str, idx: int, zh: bool, timeout: float
 
 
 async def _first_ok(query_name: str, display_name: str, idx: int, zh: bool) -> tuple[dict[str, Any] | None, str, list[str]]:
-    """Race the sources; per-source timeout; a couple of rounds. Returns (data, source, error notes)."""
+    """Start every source at once (hedge), pick the answer by PRIORITY; per-source timeout; a couple of rounds.
+
+    Returns (data, source, error notes). A lower-priority source that is already done is used only after every
+    higher-priority one has failed / timed out, so the same question gets the same source whenever it is up."""
     timeout = _timeout_s()
     notes: list[str] = []
     for rnd in range(_rounds()):
         tasks: dict[asyncio.Task, tuple[str, float]] = {}
+        order: list[asyncio.Task] = []
         for name in _source_names():
             if name == "sojson" and display_name not in SOJSON_CODES:
                 continue  # mainland cities only
@@ -270,36 +281,32 @@ async def _first_ok(query_name: str, display_name: str, idx: int, zh: bool) -> t
                 coro = _from_sojson(display_name, idx, zh, timeout)
             else:
                 coro = _from_wttr(query_name, idx, zh, timeout)
-            tasks[asyncio.ensure_future(asyncio.wait_for(coro, timeout + 0.5))] = (name, time.monotonic())
-        pending = set(tasks)
+            task = asyncio.ensure_future(asyncio.wait_for(coro, timeout + 0.5))
+            tasks[task] = (name, time.monotonic())
+            order.append(task)
         try:
-            while pending:
-                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-                for t in done:
-                    name, t0 = tasks[t]
-                    ms = (time.monotonic() - t0) * 1000
-                    try:
-                        res = t.result()
-                    except Exception as e:  # noqa: BLE001
-                        err = type(e).__name__
-                        _note(name, False, ms, err)
-                        notes.append(f"{name}:{err}")
-                        continue
-                    if res is None:
-                        _note(name, False, ms, "no_data")
-                        notes.append(f"{name}:no_data")
-                        continue
-                    _note(name, True, ms)
-                    log.info("weather source=%s ms=%d round=%d", name, ms, rnd + 1)
-                    return res, name, notes
+            for t in order:                        # priority order: wait for the best source before looking at a worse one
+                name, t0 = tasks[t]
+                try:
+                    res = await asyncio.shield(t)
+                except Exception as e:  # noqa: BLE001
+                    err = type(e).__name__
+                    _note(name, False, (time.monotonic() - t0) * 1000, err)
+                    notes.append(f"{name}:{err}")
+                    continue
+                ms = (time.monotonic() - t0) * 1000
+                if res is None:
+                    _note(name, False, ms, "no_data")
+                    notes.append(f"{name}:no_data")
+                    continue
+                _note(name, True, ms)
+                log.info("weather source=%s ms=%d round=%d priority=%d", name, ms, rnd + 1, order.index(t) + 1)
+                return res, name, notes
         finally:
-            for t in pending:
-                t.cancel()
-            if pending:
-                await asyncio.gather(*pending, return_exceptions=True)  # reap: no "exception was never retrieved"
-            for t in tasks:
-                if t.done() and not t.cancelled():
-                    t.exception()  # mark retrieved (a source that failed in the same tick as the winner)
+            for t in order:
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(*order, return_exceptions=True)  # reap: no "exception was never retrieved"
     return None, "", notes
 
 
@@ -325,7 +332,7 @@ async def run_detailed(args: dict[str, Any] | None = None) -> tuple[str, dict[st
             break
     import datetime as _dt
 
-    ckey = (name, idx, zh, _dt.date.today().isoformat())
+    ckey = (name, (_dt.date.today() + _dt.timedelta(days=idx)).isoformat(), zh)   # per (city, target date)
     hit = CACHE.get(ckey)
     age_s = (time.time() - hit[0]) if hit else None
     if hit and age_s is not None and age_s <= _cache_ttl():
@@ -374,5 +381,6 @@ async def run(args: dict[str, Any] | None = None) -> str:
     text, meta = await run_detailed(args)
     from . import toolmeta
 
-    toolmeta.note(source=meta.get("source"), fallbacks=len(meta.get("notes") or []) or None)
+    toolmeta.note(source=meta.get("source"), fallbacks=len(meta.get("notes") or []) or None,
+                  orig_source=meta.get("orig_source"), age_s=meta.get("age_s"))
     return text

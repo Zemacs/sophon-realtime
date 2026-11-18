@@ -90,16 +90,25 @@ class NewsTests(unittest.TestCase):
     def test_rss_headlines_zh(self) -> None:
         rss = """<?xml version="1.0" encoding="UTF-8"?>
         <rss version="2.0"><channel>
-        <item><title>Source A - 芯片出口新规</title></item>
-        <item><title>Source B - AI 监管框架公布</title></item>
-        <item><title>Source C - 电动车销量创新高</title></item>
+        <item><title>芯片出口新规 - Source A</title></item>
+        <item><title>AI 监管框架公布 - Source B</title></item>
+        <item><title>电动车销量创新高 - Source C</title></item>
         </channel></rss>""".encode("utf-8")
 
         with mock.patch("urllib.request.urlopen", return_value=_FakeResp(rss, "application/rss+xml")):
             out = _run(news.run({"topic": "科技", "lang": "zh", "max_items": 3}))
         self.assertIn("芯片出口新规", out)
+        self.assertNotIn("Source A", out)  # the trailing 「 - 来源」 is dropped, not the headline
         self.assertIn("第1条", out)
         self.assertIn("第2条", out)
+
+    def test_title_keeps_inner_dashes_and_untagged_titles(self) -> None:
+        rss = """<?xml version="1.0" encoding="UTF-8"?>
+        <rss version="2.0"><channel>
+        <item><title>特斯拉 - 马斯克新计划 - 路透社</title></item>
+        <item><title>没有来源后缀的标题</title></item>
+        </channel></rss>""".encode("utf-8")
+        self.assertEqual(news._titles_from_rss(rss), ["特斯拉 - 马斯克新计划", "没有来源后缀的标题"])
 
     def test_network_error_en(self) -> None:
         with mock.patch("urllib.request.urlopen", side_effect=OSError("down")):

@@ -97,15 +97,37 @@ class DeviceToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("模拟设备", out)
         self.assertIn("客厅灯", out)
 
-    async def test_hook_script(self) -> None:
-        with tempfile.NamedTemporaryFile("w", suffix=".cmd", delete=False, encoding="utf-8") as f:
-            f.write("@echo hook ok\n")
+    @staticmethod
+    def _hook_file(*, executable: bool = True) -> str:
+        """A hook script the platform can actually run: .cmd on Windows, a shebang script with the exec bit elsewhere."""
+        if os.name == "nt":
+            suffix, body = ".cmd", "@echo hook ok\n"
+        else:
+            suffix, body = ".sh", "#!/bin/sh\necho hook ok\n"
+        with tempfile.NamedTemporaryFile("w", suffix=suffix, delete=False, encoding="utf-8") as f:
+            f.write(body)
             path = f.name
+        if os.name != "nt":
+            os.chmod(path, 0o755 if executable else 0o644)
+        return path
 
+    async def test_hook_script(self) -> None:
+        path = self._hook_file()
         try:
             with mock.patch.dict(os.environ, {"SOPHON_LIVE_DEVICE_HOOK": path}, clear=False):
                 out = await device.run({"device": "light", "action": "on", "lang": "en"})
             self.assertIn("hook ok", out)
+        finally:
+            os.unlink(path)
+
+    @unittest.skipIf(os.name == "nt", "exec bit is a POSIX notion")
+    async def test_non_executable_hook_fails_honestly(self) -> None:
+        path = self._hook_file(executable=False)
+        try:
+            with mock.patch.dict(os.environ, {"SOPHON_LIVE_DEVICE_HOOK": path}, clear=False):
+                out = await device.run({"device": "light", "action": "on", "lang": "en"})
+            self.assertNotIn("hook ok", out)
+            self.assertIn("failed", out.lower())  # never reported as a success
         finally:
             os.unlink(path)
 

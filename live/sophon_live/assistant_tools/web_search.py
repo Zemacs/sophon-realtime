@@ -62,21 +62,12 @@ def _no_results(query: str, *, zh: bool) -> str:
 
 # urllib cannot be interrupted: a cancelled hedge leaves its thread running until its own socket timeout (<= the attempt's remaining
 # budget, <= 5.5 s). The number of such threads in flight is capped (Critic S-9), and the cap is shared with the news tool
-# (assistant_tools/inflight.py, S-14): beyond it an attempt fails at once instead of piling up sockets.
+# (assistant_tools/inflight.py, S-14): beyond it an attempt fails at once instead of piling up sockets or queueing (S-19).
 _INFLIGHT_MAX = _inflight_mod.MAX_INFLIGHT
 _inflight = _inflight_mod.SHARED
 
 
-def _urlopen(url: str, timeout: float = 20.0) -> bytes:
-    if not _inflight.acquire(blocking=False):
-        raise OSError("too many web-search requests in flight")
-    try:
-        return _urlopen_unbounded(url, timeout)
-    finally:
-        _inflight.release()
-
-
-def _urlopen_unbounded(url: str, timeout: float) -> bytes:
+def _urlopen_unbounded(url: str, timeout: float = 20.0) -> bytes:
     bing = "bing.com" in url
     headers = {"User-Agent": _BROWSER_UA, "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.5", "Accept-Encoding": "gzip"} if bing else {"User-Agent": _UA}
     req = urllib.request.Request(url, headers=headers)
@@ -89,7 +80,7 @@ def _urlopen_unbounded(url: str, timeout: float) -> bytes:
 
 async def _fetch_bytes(url: str, timeout: float = 5.5) -> bytes:
     """One attempt bounded by ``timeout`` (the socket timeout in the thread and the awaiting side)."""
-    return await asyncio.wait_for(asyncio.to_thread(_urlopen, url, timeout), timeout + 0.5)
+    return await asyncio.wait_for(_inflight_mod.run(_urlopen_unbounded, url, timeout, sem=_inflight), timeout + 0.5)
 
 
 def _snippets_from_instant(data: dict[str, Any]) -> list[str]:

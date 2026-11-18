@@ -142,7 +142,7 @@ def _urlopen(url: str) -> bytes:
 
 
 async def _fetch_rss(url: str) -> bytes:
-    return await asyncio.to_thread(inflight.guarded, _urlopen, url)      # S-14: same in-flight cap as web_search
+    return await inflight.run(_urlopen, url)      # S-14 / S-19: same in-flight cap and dedicated pool as web_search
 
 
 def _filter_topic(titles: list[str], topic: str, *, require_hit: bool) -> list[str]:

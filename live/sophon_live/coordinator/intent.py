@@ -18,16 +18,26 @@ import re
 # sent to the tool costs a lookup; a fact answered without it is a fabrication.
 _MONEY = r"美元|美金|欧元|日元|英镑|港币|港元|澳元|加元|韩元|卢布|比特币|以太坊|狗狗币|BTC|ETH|USDT|黄金|白银|金价|银价|油价|原油|汽油|柴油|铜价|白糖|猪肉价"
 _MARKET = r"A股|a股|港股|美股|沪指|深指|上证|深证|创业板|科创板|恒生|纳斯达克|纳指|道指|道琼斯|标普|大盘|指数|基金|净值|涨停|跌停|开盘|收盘|开市|休市|交易所|市值|股价|股票|股市|行情|涨了|跌了|涨幅|跌幅"
-_SPORT_ETC = r"比分|比赛结果|谁赢了|赢了没|赛程|战绩|积分榜|世界杯|欧冠|英超|西甲|NBA|CBA|奥运|票房|热搜|榜单|航班|晚点|延误|路况|堵车|限行|地震|台风|疫情"
-_PRICE = r"多少钱|什么价|价格|报价|价位|售价|汇率|兑换|换算|兑人民币|兑美元|兑[^，。！？]{1,3}(多少|汇率|换)"
-_FRESH_Q = r"(今天|今日|现在|目前|当前|最新|实时|刚刚|此刻|这会儿)[^，。！？]{0,10}(多少|几点开|几多|多高|多低|涨|跌|开盘|收盘|开了吗|开门|营业|比分|排名|第几|结果|怎么样了|什么情况|发生了什么|是谁|谁)"
-_CURRENT_OFFICE = r"现任|在任的|最新一[任届期]|当前的?(总统|首相|总理|主席|冠军|纪录)"
+_SPORT_ETC = r"比分|比赛结果|谁赢了|赢了没|赛程|战绩|积分榜|票房|热搜|榜单|航班|晚点|延误|路况|堵车|限行|空气质量|pm2\.?5|aqi"
+# v0.1.0 / I-9: event or sport TOPICS are only live when the sentence says "now" (「刚才地震了吗」「这周末英超有什么比赛」);
+# on their own they are knowledge (「地震是怎么形成的」「NBA是什么意思」「世界杯的历史」).
+_NOW = r"今天|今日|现在|目前|当前|最新|实时|刚刚|刚才|此刻|这会儿|最近|昨晚|昨天|今晚|今早|本周|这周|周末|明天"
+_EVENT_TOPIC = r"地震|台风|疫情|世界杯|欧冠|英超|西甲|NBA|CBA|奥运|基金|指数"
+_TOPIC_NOW = rf"(?:{_NOW})[^，。！？]{{0,12}}(?:{_EVENT_TOPIC})|(?:{_EVENT_TOPIC})[^，。！？]{{0,12}}(?:{_NOW}|了吗|了没|怎么样了|结果)"
+# a definitional / how-to question about a market or money word is knowledge unless it also says "now"
+_KNOWLEDGE_Q = re.compile(r"什么意思|是什么|有什么区别|区别|怎么形成|怎样形成|是怎么|是怎样|为什么|历史|原理|定义|什么叫|怎么读|怎么买|怎么开户|怎么开通|开通|账户|怎么炒|怎么玩|入门|推荐|什么是|笑话|故事|写一首|写首诗|怎么换算|如何换算|换算成(?!人民币)|名字由来|来历|起源|规则")
+_NOW_RE = re.compile(_NOW)
+_PRICE = r"多少钱|什么价|价格|报价|价位|售价|汇率|兑换|兑人民币|兑美元|兑[^，。！？]{1,3}(多少|汇率|换)"
+_FRESH_Q = r"(今天|今日|现在|目前|当前|最新|实时|刚刚|此刻|这会儿)[^，。！？]{0,10}(几点开|几多|涨|跌|开盘|收盘|开了吗|开门|营业|比分|排名|第几|结果|发生了什么|什么情况)"
+_CURRENT_OFFICE = r"现任|在任的|最新一[任届期]|当前的?(总统|首相|总理|主席|冠军|纪录)|(现在|目前|当前|最新)的?[^，。！？]{0,6}(总统|首相|总理|主席|冠军|首富|市长)"
 _REALTIME_FACTS = "|".join((
     rf"(?:{_MONEY})[^，。！？]{{0,8}}(?:多少|几|价|汇|涨|跌|行情|报价|兑)",    # 「比特币现在多少钱」「美元兑人民币是多少」「金价」
     rf"(?:兑|换)[^，。！？]{{0,4}}(?:{_MONEY}|人民币)", r"人民币[^，。！？]{0,6}(?:汇|兑|多少|换)",
-    _MARKET, _SPORT_ETC, _PRICE, _FRESH_Q, _CURRENT_OFFICE,
+    _MARKET, _SPORT_ETC, _TOPIC_NOW, _PRICE, _FRESH_Q, _CURRENT_OFFICE,
     r"exchange rate|stock price|share price|bitcoin|\bbtc\b|\bnasdaq\b|dow jones|s&p 500|\bscore\b|box office|\bprice of\b|how much is|live score|market open",
 ))
+
+_REALTIME_RE = re.compile(_REALTIME_FACTS, re.I)
 
 # (tool name, pattern) in priority order; the first matching pattern wins for the *primary* tool.
 _PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -35,7 +45,7 @@ _PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("get_news", re.compile(r"新闻|头条|快讯|headline|\bnews\b", re.I)),
     ("get_datetime", re.compile(r"几点|现在时间|当前时间|什么时间|几号|星期几|周几|礼拜几|今天日期|今天的日期|what time|the time|what day|today'?s date|\bdate\b", re.I)),
     ("device_control", re.compile(r"(打开|关掉|关闭|关上|调高|调低|调亮|调暗|开|关)[^，。！？]{0,6}(灯|空调|窗帘|电视|风扇|插座)|(灯|空调|窗帘|电视|风扇|插座)[^，。！？]{0,3}(打开|关掉|关闭|关上|开|关)|音量|闹钟|设个提醒|设置提醒|turn (on|off)|\blights?\b|volume|alarm|curtain|\btv\b", re.I)),
-    ("web_search", re.compile(r"搜索|搜一下|搜一搜|百度一下|google|\bsearch\b|" + _REALTIME_FACTS, re.I)),
+    ("web_search", re.compile(r"搜索|搜一下|搜一搜|百度一下|google|\bsearch\b", re.I)),
     ("memory_note", re.compile(r"记住|记下|别忘了|你还?记得|上次说|之前说|我的偏好|喜欢吃什么|喜欢喝什么|remember|recall", re.I)),
 )
 
@@ -46,8 +56,10 @@ def required_tools(text: str) -> list[str]:
     if not t:
         return []
     out: list[str] = []
+    # realtime facts are web_search too, except knowledge questions that do not ask about "now" (v0.1.0 / I-9)
+    realtime = bool(_REALTIME_RE.search(t)) and not (_KNOWLEDGE_Q.search(t) and not _NOW_RE.search(t))
     for name, pat in _PATTERNS:
-        if pat.search(t) and name not in out:
+        if (pat.search(t) or (name == "web_search" and realtime)) and name not in out:
             out.append(name)
     return out
 

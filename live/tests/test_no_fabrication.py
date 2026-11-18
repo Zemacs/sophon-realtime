@@ -299,3 +299,40 @@ class MutationFakeNeverSpokenTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class IntentOverTriggerTests(unittest.TestCase):
+    """v0.1.0 / Critic I-9: the realtime-fact vocabulary must not send knowledge or chit-chat to web_search (latency + outbound cost)."""
+
+    # the 15 the review found wrongly sent to web_search, plus more of the same shapes (topic word / 现在 / 今天 without being a live question)
+    KNOWLEDGE_AND_CHITCHAT = (
+        "今天是谁的生日", "今天谁来吃饭", "现在心情怎么样了", "地震是怎么形成的", "世界杯的历史是什么", "台风是怎样形成的",
+        "厘米怎么换算成英寸", "疫情是什么时候开始的", "幸福指数是什么意思", "光速现在是多少", "今天过得怎么样了", "NBA是什么意思",
+        "基金和股票有什么区别", "今天谁最帅", "谁是今天的主角", "现在是不是该睡觉了", "奥运会是哪一年开始的", "欧冠一共有多少支球队参加",
+        "股票怎么买", "怎么开通基金账户", "推荐一本理财入门的书", "指数基金的原理是什么", "地震时应该怎么躲", "台风为什么有眼",
+        "疫情期间怎么在家锻炼", "世界杯的规则是什么", "英超是哪个国家的联赛", "NBA的全称怎么读", "公里怎么换算成英里", "米换算成英尺是多少",
+        "现在的孩子为什么爱玩手机", "目前你能做什么", "最新的想法是什么", "今天你叫什么名字", "我现在有点难过", "今天好开心",
+        "航班是什么意思", "榜单是什么", "什么是汇率", "比特币是什么", "黄金为什么贵", "美元为什么叫美元", "道琼斯是怎么命名的",
+        "讲个关于股票的笑话", "给我讲讲世界杯的故事", "帮我写一首关于台风的诗", "解释一下什么是通货膨胀", "地球上为什么有地震",
+    )
+
+    def test_knowledge_and_chitchat_stay_tool_free(self) -> None:
+        for text in self.KNOWLEDGE_AND_CHITCHAT:
+            self.assertEqual(intent.required_tools(text), [], text)
+
+    def test_false_positive_rate_threshold(self) -> None:
+        """Guard against drifting back: <= 2% of the negative corpus (this one plus the I-8 negatives) may be tool-scoped."""
+        corpus = list(self.KNOWLEDGE_AND_CHITCHAT) + list(IntentTests.NOT_REALTIME_FACTS)
+        fp = [t for t in corpus if intent.required_tools(t)]
+        self.assertLessEqual(len(fp) / len(corpus), 0.02, fp)
+        self.assertGreaterEqual(len(corpus), 60)
+
+    def test_every_realtime_question_is_still_tool_backed(self) -> None:
+        """Recall stays 100%: FX / crypto / A-share open / scores / prices must call the tool (the other half of the I-9 trade-off)."""
+        extra = ("刚才地震了吗", "现在台风到哪了，最新结果", "这周末英超有什么比赛", "今天世界杯有哪些比赛", "现在A股开盘了吗", "美元兑人民币汇率",
+                 "今天比特币多少钱", "以太坊现在什么价", "现在的美国总统是谁", "今天的空气质量怎么样", "上海pm2.5多少", "最新的疫情情况", "昨天欧冠结果")
+        for text in tuple(IntentTests.REALTIME_FACT_QUESTIONS) + extra:
+            self.assertEqual(intent.required_tools(text)[:1], ["web_search"], text)
+
+    def test_an_explicit_search_request_always_searches(self) -> None:
+        self.assertEqual(intent.required_tools("搜一下地震是怎么形成的")[:1], ["web_search"])

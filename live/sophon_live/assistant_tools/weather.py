@@ -20,6 +20,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any
+from . import inflight
 
 log = logging.getLogger("sophon_live.weather")
 
@@ -174,7 +175,7 @@ def _http_get_json(url: str, *, timeout: float = 20.0) -> dict[str, Any]:
 
 async def _fetch_json(url: str, timeout: float = 5.0) -> dict[str, Any]:
     """One attempt, bounded by ``timeout`` (the thread's socket timeout and the awaiting side)."""
-    return await asyncio.wait_for(asyncio.to_thread(_http_get_json, url, timeout=timeout), timeout + 0.5)
+    return await asyncio.wait_for(inflight.run(_http_get_json, url, timeout=timeout), timeout + 0.5)      # S-19: under the shared cap, off the default pool
 
 
 def _normalize_wttr(data: dict[str, Any], idx: int, *, zh: bool) -> dict[str, Any] | None:

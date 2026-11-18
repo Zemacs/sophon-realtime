@@ -93,11 +93,9 @@ class SlotEditTests(unittest.TestCase):
         self.assertEqual(slot_edit("明天广州会下雨吗", "", led).version, 2)
 
     def test_city_list_matches_the_weather_tool(self) -> None:
-        import importlib.util
+        import importlib
 
-        spec = importlib.util.spec_from_file_location("w", _LIVE_ROOT / "sophon_live" / "assistant_tools" / "weather.py")
-        w = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(w)  # type: ignore[union-attr]
+        w = importlib.import_module("sophon_live.assistant_tools.weather")      # (weather.py now imports its sibling inflight.py: a package import)
         self.assertEqual(set(slots.CITY_NAMES), set(w.CITIES))
 
 

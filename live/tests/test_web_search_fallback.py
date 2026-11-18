@@ -174,4 +174,4 @@ class BingHedgeTests(unittest.IsolatedAsyncioTestCase):
             def __exit__(self, *a): return False
 
         with mock.patch.object(web_search.urllib.request, "urlopen", lambda req, timeout=0: Resp(_gz.compress(BING_HTML))):
-            self.assertEqual(web_search._urlopen("https://cn.bing.com/search?q=x", 1.0), BING_HTML)
+            self.assertEqual(web_search._urlopen_unbounded("https://cn.bing.com/search?q=x", 1.0), BING_HTML)

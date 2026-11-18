@@ -97,8 +97,8 @@ class NoResultsIsNotEvidence(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(res.evidence[0]["ok"])
 
 
-class InflightCap(unittest.TestCase):
-    def test_requests_beyond_the_cap_fail_at_once_and_release_on_finish(self) -> None:
+class InflightCap(unittest.IsolatedAsyncioTestCase):
+    async def test_requests_beyond_the_cap_fail_at_once_and_release_on_finish(self) -> None:
         gate = threading.Event()
         started = threading.Semaphore(0)
 
@@ -108,17 +108,15 @@ class InflightCap(unittest.TestCase):
             return b"ok"
 
         with mock.patch.object(web_search, "_inflight", threading.BoundedSemaphore(2)), mock.patch.object(web_search, "_urlopen_unbounded", slow):
-            ts = [threading.Thread(target=web_search._urlopen, args=("https://x", 1.0)) for _ in range(2)]
-            for t in ts:
-                t.start()
+            ts = [asyncio.ensure_future(web_search._fetch_bytes("https://x", 3.0)) for _ in range(2)]
             for _ in range(2):
-                self.assertTrue(started.acquire(timeout=2))
+                self.assertTrue(await asyncio.to_thread(started.acquire, True, 2))
             with self.assertRaises(OSError):
-                web_search._urlopen("https://x", 1.0)           # the third does not even start a socket
+                await web_search._fetch_bytes("https://x", 1.0)           # the third does not even start a socket
             gate.set()
-            for t in ts:
-                t.join(2)
-            self.assertEqual(web_search._urlopen("https://x", 1.0), b"ok")      # slots were released
+            self.assertEqual(await asyncio.gather(*ts), [b"ok", b"ok"])
+            await asyncio.sleep(0.05)
+            self.assertEqual(await web_search._fetch_bytes("https://x", 1.0), b"ok")      # slots were released
 
 
 if __name__ == "__main__":

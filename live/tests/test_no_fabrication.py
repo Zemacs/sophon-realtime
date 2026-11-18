@@ -20,7 +20,8 @@ if str(_LIVE_ROOT) not in sys.path:
 from sophon_live.assistant_tools import orchestrator as orch
 from sophon_live.assistant_tools.registry import list_tool_names
 from sophon_live.coordinator import AdmitRequest, Ledger, WorkerJob, WorkerResult, admit, api, finish_job, intent
-from sophon_live.coordinator.schemas import FAILED_GENERIC, NO_TOOL_ANSWER, TaskStatus
+from sophon_live.coordinator.schemas import FAILED_GENERIC, NO_TOOL_ANSWER, TaskStatus, is_tool_failure_sentence
+from tests.intent_cases import CRITIC_FREE, CRITIC_REALTIME, OFFICIAL_FREE, OFFICIAL_REALTIME
 from tests.test_orch_worker import _job, _say, _tool_call
 from tests.test_orchestrator import _FakeResp, _FakeSession
 from tests.test_refine_guard import _jev, _ledger
@@ -43,19 +44,8 @@ class IntentTests(unittest.TestCase):
 
     # Critic I-8: realtime facts without the words 搜索 / 汇率 / 股价. Each one must be tool-backed (web_search), so the guard in
     # finish_job applies: no successful tool evidence -> honest failure, never an answer from the model's head.
-    REALTIME_FACT_QUESTIONS = (
-        "今天美元兑人民币是多少", "比特币现在多少钱", "A股开盘了吗",                       # the three the review found classified as []
-        "现在金价多少", "今天油价多少", "上证指数今天涨了吗", "昨晚湖人比分是多少", "这周末英超有什么比赛", "现在日元汇率",
-        "一百美元能换多少人民币", "特斯拉股价", "今天的票房冠军是谁", "北京到上海的航班晚点吗", "现在堵车吗", "现任美国总统是谁",
-        "纳斯达克收盘了没有", "iPhone 17 多少钱", "苹果最新市值多少", "今天有什么热搜", "港股今天开市吗", "明天限行吗",
-        "今天欧元兑人民币多少", "美元现在对人民币什么价", "黄金今天跌了没有", "茅台现在股价", "最新一任奥运冠军是谁",
-        "what's the bitcoin price", "dollar to yuan exchange rate today", "did the Lakers win, what's the score",
-    )
-    NOT_REALTIME_FACTS = (
-        "讲个笑话", "你好", "你叫什么名字", "给我唱首歌", "现在心情怎么样", "今天过得怎么样", "帮我翻译一下这句话", "一加一等于几",
-        "李白是哪个朝代的", "水的沸点是多少度", "光速是多少", "地球到月亮多远", "帮我写首诗", "你会做什么", "谢谢你", "再说一遍",
-        "谁发明了电灯", "北京是中国的首都吗", "灯为什么会亮",
-    )
+    REALTIME_FACT_QUESTIONS = OFFICIAL_REALTIME + CRITIC_REALTIME      # 29 + 12, all must be web_search (labeled sets: tests/intent_cases.py)
+    NOT_REALTIME_FACTS = OFFICIAL_FREE + CRITIC_FREE                   # 19 + 15 (the 15 are Critic's I-9 over-trigger probes)
 
     def test_realtime_fact_questions_are_tool_backed(self) -> None:
         for text in self.REALTIME_FACT_QUESTIONS:
@@ -240,6 +230,63 @@ class FinishJobGuardTests(unittest.TestCase):
         self.assertEqual((out.text, out.rejected), (sentence, ""))
         _, _, out = self._run([{"tool": "get_weather", "ok": False}], status="failed", say=sentence)          # same words, no evidence of them
         self.assertEqual((out.text, out.rejected), (NO_TOOL_ANSWER, "failed_text"))
+
+
+class FailureTextWhitelistTests(unittest.TestCase):
+    """Critic S-13: ``evidence.failure_text`` is the Worker's own claim. It is spoken only when it is one of OUR tools' failure
+    sentences (schemas.TOOL_FAILURE_TEMPLATES) and what it echoes (city / query) came from the request."""
+
+    FAKE = "北京晴，零下三到十一度。"
+
+    def _out(self, said: str, ev: dict, *, objective: str = "明天北京会下雨吗", require=("get_weather",), status: str = "failed"):
+        led = Ledger()
+        rec = led.create(objective)
+        led.mark_running(rec.task_id)
+        job = WorkerJob(task_id=rec.task_id, version=rec.version, objective=objective, require_tools=list(require))
+        res = WorkerResult(task_id=rec.task_id, version=rec.version, status=status, spoken_answer=said, evidence=[ev])
+        return finish_job(led, job, res)
+
+    def test_fabricated_sentence_written_into_failure_text_is_still_replaced(self) -> None:
+        out = self._out(self.FAKE, {"tool": "get_weather", "ok": False, "failure_text": self.FAKE})        # failure_text == spoken text
+        self.assertEqual((out.text, out.rejected), (NO_TOOL_ANSWER, "failed_text"))
+        self.assertNotIn("零下", out.text)
+
+    def test_a_template_shaped_sentence_with_smuggled_content_is_replaced(self) -> None:
+        for said in ("暂时查不到北京晴零下三度的天气，请稍后再试。", "没有搜到关于「北京晴，零下三到十一度」的可靠摘要。", "暂时查不到上海的天气，请稍后再试。"):
+            out = self._out(said, {"tool": "get_weather", "ok": False, "args": {"city": "北京"}, "failure_text": said})
+            self.assertEqual(out.text, NO_TOOL_ANSWER, said)          # (the last one: a real template, but for a city nobody asked about)
+
+    def test_the_tools_own_sentences_are_spoken(self) -> None:
+        cases = [
+            ("get_weather", "暂时查不到北京的天气，请稍后再试。", {"city": "北京"}, "明天北京会下雨吗"),
+            ("get_weather", "找不到火星的天气信息。", {"city": "火星"}, "火星的天气"),
+            ("get_weather", "Weather for Paris is unavailable right now (sojson:OSError, open-meteo:TimeoutError).", {"city": "Paris"}, "weather in Paris"),
+            ("web_search", "没有搜到关于「美元兑人民币」的可靠摘要。", {"query": "美元兑人民币"}, "今天美元兑人民币是多少"),
+            ("web_search", "网络暂时不可用，没法完成网页搜索，请稍后再试。", {"query": "x"}, "今天美元兑人民币是多少"),
+            ("get_news", "新闻源暂时连不上，稍后再帮你看看头条吧。", {"topic": "科技"}, "今天有什么科技新闻"),
+        ]
+        for tool, said, args, objective in cases:
+            out = self._out(said, {"tool": tool, "ok": False, "args": args, "failure_text": said}, objective=objective, require=(tool,))
+            self.assertEqual((out.text, out.rejected), (said, ""), said)
+
+    def test_the_sentence_must_match_the_evidence_exactly_and_the_failed_required_tool(self) -> None:
+        said = "暂时查不到北京的天气，请稍后再试。"
+        self.assertEqual(self._out(said, {"tool": "get_weather", "ok": False}).text, NO_TOOL_ANSWER)                                   # no failure_text recorded
+        self.assertEqual(self._out(said, {"tool": "get_weather", "ok": False, "failure_text": said + "。"}).text, NO_TOOL_ANSWER)      # not the same text
+        self.assertEqual(self._out(said, {"tool": "get_weather", "ok": True, "failure_text": said}).text, NO_TOOL_ANSWER)          # ok=True is not a failure
+        self.assertEqual(self._out(said, {"tool": "get_news", "ok": False, "failure_text": said}).text, NO_TOOL_ANSWER)            # not a required tool
+
+    def test_every_sentence_the_tools_can_produce_is_whitelisted(self) -> None:
+        """The templates must not drift away from the tools' real failure sentences."""
+        from sophon_live.assistant_tools import news, web_search
+
+        for text in (web_search._network_error(True), web_search._network_error(False), web_search._no_results("美元兑人民币", zh=True),
+                     web_search._no_results("usd cny", zh=False)):
+            self.assertTrue(is_tool_failure_sentence(text, {"tool": "web_search"}, "美元兑人民币 usd cny"), text)
+        src = Path(news.__file__).read_text(encoding="utf-8")
+        for text in ("新闻源暂时连不上，稍后再帮你看看头条吧。", "News feeds are unreachable right now. Try again in a moment."):
+            self.assertIn(text, src)
+            self.assertTrue(is_tool_failure_sentence(text, {"tool": "get_news"}), text)
 
 
 class MutationFakeNeverSpokenTests(unittest.TestCase):

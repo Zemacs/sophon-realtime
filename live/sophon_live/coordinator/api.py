@@ -11,7 +11,7 @@ from .clarify import clarify_for_slots, missing_slots_for_text
 from .ledger import Ledger
 from .route import build_route_questions, build_state, heuristic_control, heuristic_route, slot_edit
 from .schemas import AdmitRequest, ControlDecision, PlaybackReceipt, SpeakPlan, TaskStatus, WorkerJob, WorkerResult, freshness_token_for
-from .schemas import FAILED_GENERIC, FIXED_FAILURES, NO_TOOL_ANSWER, tool_succeeded
+from .schemas import FAILED_GENERIC, FIXED_FAILURES, NO_TOOL_ANSWER, is_tool_failure_sentence, tool_succeeded
 
 log = logging.getLogger("sophon_live.coordinator")
 
@@ -287,6 +287,7 @@ def _failure_text(job: WorkerJob, result: WorkerResult) -> str:
     if said in FIXED_FAILURES:
         return said
     if said and any(ev.get("tool") in (job.require_tools or []) and ev.get("ok") is False and ev.get("failure_text") == said
+                    and is_tool_failure_sentence(said, ev, job.objective)       # S-13: a Worker's say-so is not enough, it must be OUR tool's sentence
                     for ev in result.evidence):
         return said
     return NO_TOOL_ANSWER if job.require_tools else FAILED_GENERIC

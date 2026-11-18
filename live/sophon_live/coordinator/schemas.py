@@ -4,6 +4,7 @@ Keep this module free of gateway/audio/tool I/O so layers stay decoupled.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Literal
@@ -53,6 +54,77 @@ FIXED_FAILURES = frozenset({
     "我还在查，请稍等一下再问一次。",
     "后台编排出错了，请稍后再试。",
 })
+
+
+# The failure sentences OUR tools produce themselves (assistant_tools: weather / news / web_search). The Coordinator speaks a Worker-reported
+# ``failure_text`` only if it is exactly one of these AND belongs to the tool that failed (Critic S-13, S-18): a Worker cannot launder a
+# fabricated sentence by writing it into evidence as the "tool's own text", nor pass a web_search sentence off as the weather tool's.
+# Group 1, where present, is what the tool echoes back (city / query); it must appear, as a whole word, in the user's ORIGINAL request
+# (``job.objective``), never in the Worker's own ``args`` (the Worker is the party being checked).
+_CITY = r"[\u4e00-\u9fffA-Za-z·\- ]"
+_WEATHER_SRC = r"(?:sojson|open-meteo|wttr):(?:no_data|[A-Z][A-Za-z]{2,40})"          # exactly what weather._first_ok writes into ``notes``
+TOOL_FAILURE_TEMPLATES: dict[str, tuple[re.Pattern[str], ...]] = {
+    "get_weather": tuple(re.compile(p) for p in (
+        rf"暂时查不到({_CITY}{{1,24}})的天气，请稍后再试。",
+        rf"Weather for ({_CITY}{{1,40}}) is unavailable right now \((?:no source|{_WEATHER_SRC}(?:, {_WEATHER_SRC}){{0,7}})\)\.",
+        rf"找不到({_CITY}{{1,24}})的天气信息。",
+        rf"No weather data for ({_CITY}{{1,40}})\.",
+    )),
+    "get_news": tuple(re.compile(p) for p in (
+        r"新闻源暂时连不上，稍后再帮你看看头条吧。",
+        r"News feeds are unreachable right now\. Try again in a moment\.",
+    )),
+    "web_search": tuple(re.compile(p) for p in (
+        r"网络暂时不可用，没法完成网页搜索，请稍后再试。",
+        r"Web search is unavailable right now due to a network problem\. Please try again later\.",
+        r"没有搜到关于「([^」\n]{1,60})」的可靠摘要。",
+        r"I couldn't find useful snippets for '([^'\n]{1,60})'\.",
+    )),
+}
+
+
+def _said_in(echoed: str, request: str) -> bool:
+    """``echoed`` occurs in ``request`` as a whole word (an ASCII edge must not sit inside a longer ASCII word; CJK has no word boundary)."""
+    e = " ".join(echoed.split()).lower()
+    r = " ".join((request or "").split()).lower()
+    if not e:
+        return False
+    pat = re.escape(e)
+    if re.match(r"[a-z0-9]", e[0]):
+        pat = r"(?<![a-z0-9])" + pat
+    if re.match(r"[a-z0-9]", e[-1]):
+        pat += r"(?![a-z0-9])"
+    return re.search(pat, r) is not None
+
+
+def is_tool_failure_sentence(text: str, ev: dict, objective: str = "") -> bool:
+    """``text`` is one of the failed tool's own failure sentences, and what it echoes (city / query) is in the user's original request."""
+    for pat in TOOL_FAILURE_TEMPLATES.get(str((ev or {}).get("tool") or ""), ()):
+        m = pat.fullmatch(text or "")
+        if not m:
+            continue
+        if not m.groups():
+            return True
+        echoed = m.group(1)
+        if _said_in(echoed, objective):
+            return True
+        # the weather tool names a known city by its canonical name (北京) even when the user wrote it in English (Beijing) or the reverse
+        return str(ev.get("tool")) == "get_weather" and any(_said_in(a, objective) for a in _city_aliases(echoed))
+    return False
+
+
+def _city_aliases(name: str) -> set[str]:
+    try:
+        from ..assistant_tools.weather import CITIES
+    except Exception:  # noqa: BLE001
+        return set()
+    n = " ".join(name.split()).lower()
+    out: set[str] = set()
+    for zh, en in CITIES.items():
+        if n in (zh.lower(), en.lower()):
+            out.update((zh, en))
+    out.discard(name)
+    return out
 
 
 def tool_succeeded(ev: dict) -> bool:

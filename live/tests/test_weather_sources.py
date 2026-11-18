@@ -192,7 +192,8 @@ class WeatherSourceTests(unittest.IsolatedAsyncioTestCase):
             second, m2 = await weather.run_detailed({"city": "北京", "when": "tomorrow"})
         self.assertEqual(first, second)
         self.assertEqual(len(fetch.calls), calls)  # nothing fetched the second time
-        self.assertEqual((m1["source"], m2["source"]), ("open-meteo", "cache"))
+        self.assertIn(m1["source"], ("open-meteo", "wttr"))  # both answer at once: either may win the race
+        self.assertEqual((m2["source"], m2["orig_source"]), ("cache", m1["source"]))
 
     async def test_cache_is_per_city_and_day(self) -> None:
         env = {**ENV, "SOPHON_WEATHER_CACHE_TTL": "600"}

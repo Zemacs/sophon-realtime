@@ -263,7 +263,7 @@ class FailureTextWhitelistTests(unittest.TestCase):
             ("get_weather", "Weather for Paris is unavailable right now (sojson:network, open-meteo:timeout).", {"city": "Paris"}, "weather in Paris"),
             ("web_search", "没有搜到关于「美元兑人民币」的可靠摘要。", {"query": "美元兑人民币"}, "今天美元兑人民币是多少"),
             ("web_search", "网络暂时不可用，没法完成网页搜索，请稍后再试。", {"query": "x"}, "今天美元兑人民币是多少"),
-            ("get_news", "新闻源暂时连不上，稍后再帮你看看头条吧。", {"topic": "科技"}, "今天有什么科技新闻"),
+            ("get_news", "新闻源暂时连不上，稍后再帮你看看头条吧。", {"topic": "tech"}, "今天有什么科技新闻"),
         ]
         for tool, said, args, objective in cases:
             out = self._out(said, {"tool": tool, "ok": False, "args": args, "failure_text": said}, objective=objective, require=(tool,))

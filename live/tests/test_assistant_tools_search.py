@@ -96,7 +96,7 @@ class NewsTests(unittest.TestCase):
         </channel></rss>""".encode("utf-8")
 
         with mock.patch("urllib.request.urlopen", return_value=_FakeResp(rss, "application/rss+xml")):
-            out = _run(news.run({"topic": "科技", "lang": "zh", "max_items": 3}))
+            out = _run(news.run({"topic": "tech", "lang": "zh", "max_items": 3}))
         self.assertIn("芯片出口新规", out)
         self.assertNotIn("Source A", out)  # the trailing 「 - 来源」 is dropped, not the headline
         self.assertIn("第1条", out)
@@ -145,7 +145,7 @@ class NewsTests(unittest.TestCase):
 
     def test_network_error_en(self) -> None:
         with mock.patch("urllib.request.urlopen", side_effect=OSError("down")):
-            out = _run(news.run({"topic": "NVIDIA", "lang": "en"}))
+            out = _run(news.run({"topic": "tech", "lang": "en"}))
         self.assertIn("unreachable", out.lower())
 
 

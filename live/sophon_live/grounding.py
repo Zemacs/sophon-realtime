@@ -1,17 +1,19 @@
 """Argument grounding for tool calls (Realtime face): a short argument value (name, email, zip, id) must come from somewhere
 the agent actually saw -- the caller's words (ASR), an earlier tool result, or the instructions/tool schema. Values the model
-made up (placeholders like John Doe / example.com / 12345, or a name it misheard) are sent back to the model instead of executed."""
+made up (or a name it misheard) are sent back to the model instead of executed.
+
+PROVENANCE ONLY (Round 4h / I-20): there is no list of "placeholder" names, values, domains or "free-text" argument keys. A value is
+fine when it occurs in what the agent saw (literally, as a whole word, or in a spoken form of it); a value that occurs nowhere is not,
+whatever it looks like. So 12345 / John Doe / example.com are allowed when the caller actually said them and blocked when the model made
+them up, exactly like any other invented value."""
 from __future__ import annotations
-import os
 
 import difflib
 import json
 import re
 
-PLACEHOLDER_NAMES = {("john", "doe"), ("jane", "doe"), ("jane", "smith"), ("john", "smith")}
-PLACEHOLDER_VALUES = {"12345", "00000", "11111", "90210", "123456", "1234", "000000", "5551234567", "5555555555", "1234567890", "5550123"}
-PLACEHOLDER_DOMAINS = ("example.com", "example.org", "test.com", "email.com", "domain.com")
-FREE_TEXT_KEYS = {"summary", "reason", "query", "note", "notes", "message", "description", "comment", "content"}
+from .coordinator.schemas import appears_in_words
+
 NUM_WORDS = {"zero": "0", "oh": "0", "one": "1", "two": "2", "three": "3", "four": "4", "five": "5", "six": "6", "seven": "7",
              "eight": "8", "nine": "9"}
 
@@ -146,19 +148,14 @@ def check(name: str, args: dict, heard: list[str], seen: list[str]) -> list[tupl
              + [_norm(x) for h in heard for x in spoken_forms(h)])
     words = set(re.findall(r"[a-z0-9@._]+", " ".join(heard + seen).lower())) | set(joins)
     bad = []
-    a = args if isinstance(args, dict) else {}
-    fn, ln = str(a.get("first_name", "")).lower(), str(a.get("last_name", "")).lower()
-    if (fn, ln) in PLACEHOLDER_NAMES and not any(fn in h and ln in h for h in heard_n):
-        bad.append(("first_name/last_name", f"{fn} {ln}", "placeholder name"))
+    said = "\n".join(list(heard) + list(seen))
     for k, v in _values(args):
-        if k.lower() in FREE_TEXT_KEYS or len(v.split()) > 3:
+        if len(v.split()) > 3:                                   # long text is composed by the model, not looked up: out of scope
             continue
         nv = _norm(v)
         if len(nv) < 3:
             continue
-        if nv in PLACEHOLDER_VALUES or any(nv.endswith(d) for d in PLACEHOLDER_DOMAINS):
-            if nv not in corpus: bad.append((k, v, "placeholder value")); continue
-        if os.environ.get("SOPHON_LIVE_GROUND_MODE", "full") == "placeholder":   # only block obvious made-up values
+        if appears_in_words(v, said):                            # literal provenance: the value is, as a whole word, in what was heard / seen
             continue
         if nv in corpus or nv.lstrip("#") in corpus or nv in joins:
             continue

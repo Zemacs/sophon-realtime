@@ -36,8 +36,10 @@ SYS = (
     "You receive ONE job objective that the coordinator already routed and refined; "
     "you never decide whether to ask, cancel, refine or remember anything. "
     "Do exactly the objective with the tools you are given.\n"
-    "- Pick the tool that fits the objective (time/date: get_datetime; weather: get_weather; news: get_news; "
-    "search: web_search; device: device_control).\n"
+    "- Pick the tool that fits the objective (time/date: get_datetime; weather: get_weather; news headlines: get_news; "
+    "search or news about a specific person, company or event: web_search; device: device_control).\n"
+    "- get_news takes ``topic`` from its closed list (tech / finance / world / general): you choose the category from the objective; "
+    "set ``lang`` to the language the caller speaks.\n"
     "- If a required tool parameter is not in the objective, call the tool WITHOUT that parameter. "
     "Never guess it and never ask the caller; the coordinator asks.\n"
     "- If the objective says the caller changed their mind or added detail, the newest wording wins.\n"
@@ -117,11 +119,19 @@ def _history_block(history: list[dict[str, str]] | None) -> str:
 
 
 def _missing_required(name: str, args: dict) -> list[str]:
-    """Required tool parameters the model left out (schema-driven, no keywords)."""
+    """Required tool parameters the model left out, or filled with a value outside the schema's closed enum (schema-driven, no keywords)."""
     for t in TOOL_SCHEMAS:
         if t["name"] == name:
-            req = (t.get("parameters") or {}).get("required") or []
-            return [k for k in req if not str(args.get(k) or "").strip()]
+            params = t.get("parameters") or {}
+            req = params.get("required") or []
+            props = params.get("properties") or {}
+            out = []
+            for k in req:
+                v = str(args.get(k) or "").strip()
+                enum = (props.get(k) or {}).get("enum")
+                if not v or (enum and v not in enum):
+                    out.append(k)
+            return out
     return []
 
 
@@ -308,6 +318,8 @@ async def run_job(
                     log.info("orch step=%d tool=%s missing=%s -> needs_input", step, name, missing)
                     evidence.append({"tool": name, "args": args, "ok": False, "missing": missing})
                     return _result(job, "needs_input", "", evidence, missing)
+                if name == "get_news" and args.get("lang") not in ("zh", "en") and job.language in ("zh", "en"):
+                    args["lang"] = job.language          # structural default: the job's language (the model normally sets it)
                 t_tool = time.monotonic()
                 toolmeta.take()
                 out = await run_tool(name, args)

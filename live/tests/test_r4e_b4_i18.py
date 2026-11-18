@@ -119,12 +119,12 @@ class SpeakNowNudgeReadsStructure(unittest.IsolatedAsyncioTestCase):
         return any(m.get("role") == "user" and str(m.get("content", "")).startswith(NUDGE) for m in msgs)
 
     async def test_structured_success_gets_the_nudge_whatever_the_text(self) -> None:
-        self.assertTrue(await self._nudged("get_news", '{"topic":"科技"}', _structured_ok("some words with none of the old markers", count=2)))
+        self.assertTrue(await self._nudged("get_news", '{"topic":"tech"}', _structured_ok("some words with none of the old markers", count=2)))
         self.assertTrue(await self._nudged("get_weather", '{"city":"北京"}', _structured_ok("cloudy and mild", tmin=1, tmax=5)))
 
     async def test_success_looking_text_without_a_structured_report_gets_no_nudge(self) -> None:
-        self.assertFalse(await self._nudged("get_news", '{"topic":"科技"}', mock.AsyncMock(return_value="关于科技，第1条，某某；第2条，某某。")))
-        self.assertFalse(await self._nudged("get_news", '{"topic":"科技"}', mock.AsyncMock(return_value="Headlines on tech: a; b.")))
+        self.assertFalse(await self._nudged("get_news", '{"topic":"tech"}', mock.AsyncMock(return_value="关于科技，第1条，某某；第2条，某某。")))
+        self.assertFalse(await self._nudged("get_news", '{"topic":"tech"}', mock.AsyncMock(return_value="Headlines on tech: a; b.")))
         self.assertFalse(await self._nudged("get_weather", '{"city":"北京"}', mock.AsyncMock(return_value="北京今天多云，气温1到5度，现在3°C。")))
 
     async def test_a_failed_call_never_gets_the_success_nudge_even_with_a_success_flag(self) -> None:
@@ -146,9 +146,8 @@ class RealToolsReportSuccessInStructure(unittest.IsolatedAsyncioTestCase):
     async def test_news_reports_success_and_how_many_headlines(self) -> None:
         toolmeta.take()
         with mock.patch.object(news, "_fetch_rss", mock.AsyncMock(return_value="<rss/>")), \
-                mock.patch.object(news, "_titles_from_rss", return_value=["甲公司发布新品", "乙公司获融资", "丙大学成果", "丁市地铁开通"]), \
-                mock.patch.object(news, "_filter_topic", side_effect=lambda t, *a, **k: t):
-            out = await news.run({"topic": "科技", "lang": "zh", "max_items": 2})
+                mock.patch.object(news, "_titles_from_rss", return_value=["甲公司发布新品", "乙公司获融资", "丙大学成果", "丁市地铁开通"]):
+            out = await news.run({"topic": "tech", "lang": "zh", "max_items": 2})
         meta = toolmeta.take()
         self.assertIn("第1条", out)
         self.assertIs(meta.get(failcodes.SUCCESS_KEY), True)
@@ -157,7 +156,7 @@ class RealToolsReportSuccessInStructure(unittest.IsolatedAsyncioTestCase):
     async def test_news_failure_reports_no_success(self) -> None:
         toolmeta.take()
         with mock.patch.object(news, "_fetch_rss", mock.AsyncMock(side_effect=OSError("down"))):
-            await news.run({"topic": "科技", "lang": "zh"})
+            await news.run({"topic": "tech", "lang": "zh"})
         meta = toolmeta.take()
         self.assertFalse(meta.get(failcodes.SUCCESS_KEY))
         self.assertEqual(meta.get("failure"), failcodes.NETWORK)

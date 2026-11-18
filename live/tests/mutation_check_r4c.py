@@ -16,6 +16,7 @@ T_E = ["tests.test_r4d_s23_s24", "tests.test_r4_s18_s21", "tests.test_no_fabrica
 ORCH = "sophon_live/assistant_tools/orchestrator.py"
 GR = "sophon_live/grounding.py"; RT = "sophon_live/realtime.py"; GW = "sophon_live/gateway.py"
 T_G = ["tests.test_r4g_failure_hint", "tests.test_assistant_tools"]
+T_H = ["tests.test_r4h_grounding_news"]
 T_F = ["tests.test_r4e_b4_i18", "tests.test_orch_worker", "tests.test_orchestrator"]
 NEWS = "sophon_live/assistant_tools/news.py"; WS = "sophon_live/assistant_tools/web_search.py"; WX = "sophon_live/assistant_tools/weather.py"
 INF = "sophon_live/assistant_tools/inflight.py"; SCH = "sophon_live/coordinator/schemas.py"; INT = "sophon_live/coordinator/intent.py"
@@ -71,6 +72,21 @@ M = [
  ("S-24: search says 'network' when the cap refused", WS, "        if busy:\n            toolmeta.note(failure=failcodes.BUSY)", "        if False:\n            toolmeta.note(failure=failcodes.BUSY)", T_D),
  ("S-24: weather says 'cannot find' when the cap refused", WX, "        if busy:\n            meta[\"failure\"] = failcodes.BUSY", "        if False:\n            meta[\"failure\"] = failcodes.BUSY", T_D),
  ("S-24: busy sentence not whitelisted for web_search", SCH, '    "web_search": tuple(re.compile(p) for p in (\n        r"网络暂时不可用，没法完成网页搜索，请稍后再试。",\n        BUSY_ZH_RE, BUSY_EN_RE,', '    "web_search": tuple(re.compile(p) for p in (\n        r"网络暂时不可用，没法完成网页搜索，请稍后再试。",', T_D),
+ # Round 4h (I-20 grounding provenance only / news topic is a schema parameter)
+ ("I-20: a free-text key is exempt from grounding again", GR, "        if len(v.split()) > 3:", '        if len(v.split()) > 3 or k.lower() in {"summary", "reason", "query", "note", "notes", "message", "description", "comment", "content"}:', T_H),
+ ("I-20: placeholder-looking values are blocked even when the caller said them", GR, "        if appears_in_words(v, said):",
+  '        if nv in {"12345", "johndoe", "john", "doe", "example.com", "5551234567"}:\n            bad.append((k, v, "not said by the caller (placeholder)"))\n            continue\n        if appears_in_words(v, said):', T_H),
+ ("I-20: placeholder-looking values are allowed even when the caller never said them", GR, "        if appears_in_words(v, said):",
+  '        if nv in {"12345", "johndoe", "john", "doe", "example.com", "testerexample.com"}:\n            continue\n        if appears_in_words(v, said):', T_H),
+ ("I-20: grounding accepts everything (provenance not enforced)", GR, "        if appears_in_words(v, said):", "        if True:", T_H),
+ ("news: a keyword filter decides which headlines are kept again", NEWS, "                titles = _titles_from_rss(await _fetch_rss(fb))\n",
+  "                titles = [t for t in _titles_from_rss(await _fetch_rss(fb)) if topic in t or '科技' in t]\n", T_H),
+ ("news: a category falls back to another category's feed", NEWS, '    "tech": ("http://www.people.com.cn/rss/it.xml",),', '    "tech": ("http://www.people.com.cn/rss/it.xml", "http://www.people.com.cn/rss/finance.xml"),', T_H),
+ ("news: a value outside the enum is accepted as a topic", NEWS, "    if topic not in CATEGORIES:", "    if not topic:", T_H),
+ ("news: the search fallback uses the raw topic, not the category label", NEWS, "_rss_url(label, lang)", "_rss_url(topic, lang)", T_H),
+ ("orchestrator: a required enum value outside the enum is accepted", ORCH, "                if not v or (enum and v not in enum):", "                if not v:", T_H),
+ ("orchestrator: the job language no longer fills get_news lang", ORCH, 'args.get("lang") not in ("zh", "en") and job.language in ("zh", "en")', "False", T_H),
+ ("schema: get_news topic is a free string again", "sophon_live/assistant_tools/registry.py", '"topic": {"type": "string", "enum": ["tech", "finance", "world", "general"], ', '"topic": {"type": "string", ', T_H),
 ]
 def run_group(tests, env):
     """-> (returncode, passed, failed, errors, failed_names, output). Uses pytest; module names are mapped to files."""
@@ -89,7 +105,10 @@ def script_error(msg):
     sys.exit(2)
 
 
-env = dict(os.environ, PYTHONPATH=".", SOPHON_LIVE_JEV="0")
+env = dict(os.environ, PYTHONPATH=".", SOPHON_LIVE_JEV="0", PYTHONDONTWRITEBYTECODE="1")   # a stale .pyc (same size, same second) must never stand in for the mutated or the restored source
+for _d, _dn, _fn in os.walk("."):
+    if os.path.basename(_d) == "__pycache__":
+        shutil.rmtree(_d, ignore_errors=True)
 groups = {tuple(m[4]) for m in M}
 for g in sorted(groups):                                          # the unmutated source must pass every group, with tests actually collected
     rc, passed, failed, errors, _, out = run_group(list(g), env)

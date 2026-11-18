@@ -22,7 +22,7 @@
 | `get_datetime` | 本地/时区 时间日期 |
 | `get_weather` | Open-Meteo 天气 |
 | `web_search` | DuckDuckGo Instant Answer（无 key） |
-| `get_news` | Google News RSS 头条 |
+| `get_news` | Google News RSS / 人民网 RSS 头条；`topic` 是封闭枚举 `tech`/`finance`/`world`/`general`，由编排模型填写，代码只按参数取源（不读用户原话，不做关键词过滤）；具体人物/公司/事件走 `web_search` |
 | `device_control` | 模拟设备（可选 `SOPHON_LIVE_DEVICE_HOOK`） |
 | `memory_note` | 本地 JSON 记忆 |
 

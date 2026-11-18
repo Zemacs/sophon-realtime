@@ -45,14 +45,14 @@ class EmptyFeedsAreFailures(unittest.TestCase):
         for lang, want in (("zh", "连不上"), ("en", "unreachable")):
             for body in (EMPTY_RSS, b"", b"<html>blocked</html>"):
                 with mock.patch.object(news, "_fetch_rss", new=mock.AsyncMock(return_value=body)):
-                    out = _run(news.run({"topic": "科技" if lang == "zh" else "tech", "lang": lang}))
+                    out = _run(news.run({"topic": "tech", "lang": lang}))
                 self.assertIn(want, out, (lang, body))
                 self.assertNotIn("第1条", out)
                 self.assertNotIn("Headlines on", out)
 
     def test_headlines_still_come_through_when_the_feed_has_items(self) -> None:
         with mock.patch.object(news, "_fetch_rss", new=mock.AsyncMock(return_value=GOOD_RSS)):
-            out = _run(news.run({"topic": "科技", "lang": "zh"}))
+            out = _run(news.run({"topic": "tech", "lang": "zh"}))
         self.assertIn("第1条", out)
         self.assertIn("真实头条一", out)
 
@@ -66,7 +66,7 @@ class SharedInflightCap(unittest.TestCase):
         full.acquire()                                                 # every slot taken (by searches, say)
         with mock.patch.object(inflight, "SHARED", full), mock.patch.object(news, "_urlopen", side_effect=AssertionError("must not even start")):
             t0 = time.monotonic()
-            out = _run(news.run({"topic": "科技", "lang": "zh"}))
+            out = _run(news.run({"topic": "tech", "lang": "zh"}))
         self.assertEqual(out, inflight.BUSY_ZH)          # S-24: our own cap refused: say "too many at once", not "feeds unreachable"
         self.assertLess(time.monotonic() - t0, 1.0)
 
@@ -74,7 +74,7 @@ class SharedInflightCap(unittest.TestCase):
         sem = threading.BoundedSemaphore(2)
         with mock.patch.object(inflight, "SHARED", sem), mock.patch.object(news, "_urlopen", return_value=GOOD_RSS):
             for _ in range(5):
-                _run(news.run({"topic": "科技", "lang": "zh"}))
+                _run(news.run({"topic": "tech", "lang": "zh"}))
         self.assertTrue(sem.acquire(blocking=False) and sem.acquire(blocking=False))     # both slots free again
 
 
@@ -97,7 +97,7 @@ class LateFeedIsNeverWrittenIn(unittest.TestCase):
         with mock.patch.object(news, "_urlopen", urlopen), mock.patch.object(news, "_PER_FEED_S", 0.3):
             async def timed():                                           # (asyncio.run itself waits for the executor thread on exit; time the call, not the loop)
                 t0 = time.monotonic()
-                got = await news.run({"topic": "科技", "lang": "zh"})
+                got = await news.run({"topic": "tech", "lang": "zh"})
                 return got, time.monotonic() - t0
 
             out, took = _run(timed())
@@ -115,7 +115,7 @@ class LateFeedIsNeverWrittenIn(unittest.TestCase):
 
         with mock.patch.dict(os.environ, {"SOPHON_NEWS_BUDGET": "2"}), mock.patch.object(news, "_budget_s", return_value=0.5), \
                 mock.patch.object(news, "_PER_FEED_S", 0.2), mock.patch.object(news, "_urlopen", urlopen):
-            out = _run(news.run({"topic": "科技", "lang": "zh"}))
+            out = _run(news.run({"topic": "tech", "lang": "zh"}))
         self.assertIn("连不上", out)
         self.assertNotIn("迟到的头条", out)
         time.sleep(1.0)                                                 # let the stragglers finish (no thread error, nothing leaks into state)
@@ -124,7 +124,7 @@ class LateFeedIsNeverWrittenIn(unittest.TestCase):
 class NewsFailureCannotBecomeHeadlines(unittest.IsolatedAsyncioTestCase):
     async def _orch(self, tool_out: str, model_after: str = FAKE):
         job = WorkerJob(task_id="t1", version=1, objective="今天有什么科技新闻", require_tools=["get_news"])
-        sess = _FakeSession([_FakeResp(200, _tool_call("get_news", '{"topic":"科技"}')),
+        sess = _FakeSession([_FakeResp(200, _tool_call("get_news", '{"topic":"tech"}')),
                              _FakeResp(200, {"choices": [{"message": {"role": "assistant", "content": model_after}}]})])
         with mock.patch.object(orch.aiohttp, "ClientSession", return_value=sess), mock.patch.object(orch, "run_tool", new=failing_tool(tool_out)):          # B-3: the news tool reports failure in structure
             return await orch.run_job(job)
@@ -157,7 +157,7 @@ class NewsFailureCannotBecomeHeadlines(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("第1条", out.text, name)
 
     def test_finish_job_speaks_the_tools_own_unreachable_sentence(self) -> None:
-        out = self._finish("failed", DOWN_ZH, {"tool": "get_news", "ok": False, "args": {"topic": "科技"}, "failure_text": DOWN_ZH})
+        out = self._finish("failed", DOWN_ZH, {"tool": "get_news", "ok": False, "args": {"topic": "tech"}, "failure_text": DOWN_ZH})
         self.assertEqual((out.text, out.rejected), (DOWN_ZH, ""))
 
 

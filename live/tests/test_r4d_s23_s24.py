@@ -250,7 +250,7 @@ class RealToolsReportTheirFailureInStructure(unittest.IsolatedAsyncioTestCase):
         full.acquire()
         weather.CACHE.clear()
         with mock.patch.object(inflight, "SHARED", full), mock.patch.object(web_search, "_inflight", full):
-            for label, call in (("web_search", lambda: web_search.run({"query": "今天黄金价格"})), ("news", lambda: news.run({"topic": "科技", "lang": "zh"})),
+            for label, call in (("web_search", lambda: web_search.run({"query": "今天黄金价格"})), ("news", lambda: news.run({"topic": "tech", "lang": "zh"})),
                                 ("weather", lambda: weather.run({"city": "北京"}))):
                 toolmeta.take()
                 weather.CACHE.clear()
@@ -264,7 +264,7 @@ class RealToolsReportTheirFailureInStructure(unittest.IsolatedAsyncioTestCase):
             await web_search.run({"query": "今天黄金价格"})
         self.assertEqual(toolmeta.take().get("failure"), failcodes.NETWORK)
         with mock.patch.object(news, "_urlopen", side_effect=boom):
-            await news.run({"topic": "科技", "lang": "zh"})
+            await news.run({"topic": "tech", "lang": "zh"})
         self.assertEqual(toolmeta.take().get("failure"), failcodes.NETWORK)
         with mock.patch.object(web_search, "_bing", mock.AsyncMock(return_value=[])), mock.patch.object(web_search, "_ddg", mock.AsyncMock(return_value=[])):
             out = await web_search.run({"query": "今天黄金价格"})
@@ -304,8 +304,8 @@ class BusySentence(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(inflight, "SHARED", full), mock.patch.object(web_search, "_inflight", full):
             self.assertEqual(await web_search.run({"query": "今天黄金价格"}), inflight.BUSY_ZH)
             self.assertEqual(await web_search.run({"query": "latest gold price today"}), inflight.BUSY_EN)
-            self.assertEqual(await news.run({"topic": "科技", "lang": "zh"}), inflight.BUSY_ZH)
-            self.assertEqual(await news.run({"topic": "technology", "lang": "en"}), inflight.BUSY_EN)
+            self.assertEqual(await news.run({"topic": "tech", "lang": "zh"}), inflight.BUSY_ZH)
+            self.assertEqual(await news.run({"topic": "tech", "lang": "en"}), inflight.BUSY_EN)
             text, _ = await weather.run_detailed({"city": "北京"})
             self.assertEqual(text, inflight.BUSY_ZH)
             weather.CACHE.clear()
@@ -318,7 +318,7 @@ class BusySentence(unittest.IsolatedAsyncioTestCase):
             out = await web_search.run({"query": "今天黄金价格"})
         self.assertIn("网络暂时不可用", out)
         with mock.patch.object(news, "_urlopen", side_effect=boom):
-            self.assertIn("连不上", await news.run({"topic": "科技", "lang": "zh"}))
+            self.assertIn("连不上", await news.run({"topic": "tech", "lang": "zh"}))
 
     async def test_busy_spoken_by_finish_job(self) -> None:
         for tool in ("get_weather", "get_news", "web_search"):

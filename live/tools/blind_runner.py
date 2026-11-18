@@ -75,18 +75,26 @@ Modes
 
 Exit codes: 0 done; 2 bad arguments, an unreadable or invalid input file (bad JSON / empty text / duplicate id / bad history line / not valid UTF-8,
 in the sentences, --instructions-file or --history-jsonl: one line on stderr naming the line NUMBER (and, for UTF-8, the byte offset), never its
-content and never an id's value), or an output that cannot be created (e.g. no such directory); 3 gateway mode;
+content and never an id's value; line breaks (CRLF, a lone CR, LF) are counted the way the readers' text mode counts them), or an output that cannot be created (e.g. no such directory); 3 gateway mode;
 4 real mode refused; 5 output refused (exists / is the input); 6 the run finished but OUT.jsonl.done could not be created (it appeared during the run).
 A run that finished also writes ``OUT.jsonl.done`` (counts only); a run that was interrupted has none.
 
-What the runner can and cannot do with a sentence (Opaque)
-  Every sentence (and ``task``) is wrapped by ``read_sentences`` in ``Opaque``: not iterable, not comparable, not hashable, no ``len``/truth value/
-  string methods, not formattable/copyable/picklable, and not a ``str``. ``re.search(p, s)``, ``json.dumps(s)``, ``bytes(s)``, ``str.find(s, x)`` (unbound),
-  ``x in s``, ``s == x``, ``f"{s}"`` ... all raise ``TypeError``, C-level paths included, so a runner that tries them CRASHES instead of forking. The
-  only way out is ``reveal()``, called from ``_admit_request`` (the one place that builds the production ``AdmitRequest``); a test asserts that, and that
-  nothing touches the wrapper's slot.  Still relying on REVIEW: whatever happens to the revealed ``str`` inside ``_admit_request`` (3 lines), code that
-  gets the text some other way (re-reading the input file, a global), and code that calls ``reveal`` from the allowlisted function. Production code
-  receives a real ``str`` by design: what it does with it is exactly what is being tested.
+What the runner can and cannot do with a sentence (Opaque = an accident guard, NOT "unreadable")
+  Every sentence and ``task`` is wrapped by ``read_sentences`` in ``Opaque``; so is every text production hands back that may quote a sentence
+  (``job.objective``, the clarify/fast reply ``res.speak.text``, the Worker's ``out.text``), at the very line it is read, and so are the history
+  entries (``task``/``answer``). An Opaque is not iterable, not comparable, not hashable, has no ``len``/truth value/string methods, is not
+  formattable/copyable/picklable and is not a ``str``: ``re.search(p, s)``, ``json.dumps(s)``, ``bytes(s)``, ``str.find(s, x)`` (unbound), ``x in s``,
+  ``s == x``, ``f"{s}"`` ... all raise ``TypeError``, C-level paths included, so a runner that tries them CRASHES instead of forking.
+  The ONLY way out is ``reveal()``, and it checks its caller at run time: only the code objects of four fixed exit functions may call it
+  (``_admit_request`` and ``_task_context`` and ``_worker_history`` hand text to production; ``_dump_row`` writes the JSONL line). Their bodies are
+  pinned by an AST whitelist (``reveal`` plus building the one object, nothing else), as are the bodies of the reading functions (on the raw line only
+  ``strip()``, ``startswith("{")`` and ``json.loads``; no ``in``/comparison/indexing on content; no module-level mutable containers) and of the spy
+  and recorder that watch production. The file may not import ``gc``/``inspect``/``ctypes``/``re``..., nor name ``object``, ``globals``, ``sys.modules``,
+  ``__getattribute__`` ... (Python cannot hide the wrapper's slot; these spellings are how it would be taken out).
+  Still relying on REVIEW (and a human reads this file before the blind run): the production objects the runner is handed (it is the system under
+  test, and it holds them as ``res``/``job``/``wr``), the structure tests' own blind spots, and whatever a test-suite change might weaken.
+  ``--instructions-file`` is PLAINTEXT and not protected: it is the test author's front prompt, not a blind input. The history file's texts are
+  wrapped, but they are the test author's too.
 
 Privacy (what the runner guarantees, and the tests that pin it: ``tests/test_blind_runner.py::Privacy``)
   * sentence text is written to no place except the reply field of OUT.jsonl (the sentence itself is not even echoed there);
@@ -116,14 +124,16 @@ EXIT_BAD_ARGS, EXIT_GATEWAY, EXIT_REAL_REFUSED, EXIT_OUT_REFUSED, EXIT_DONE_FAIL
 
 
 class Opaque:
-    """A sentence the runner can carry but not read. It is not iterable, not comparable, not hashable, has no ``len``/truth value/string methods,
-    cannot be formatted, copied or pickled, and is no ``str``: ``re.search``, ``json.dumps``, ``bytes()``, an unbound ``str.find(x, ...)``, ``in``,
-    ``==`` and every other way of looking inside raise ``TypeError`` (C-level paths included). The ONE way out is ``reveal``, which only
-    ``_admit_request`` may call (a test asserts it); production code then receives a real ``str``, as it must."""
+    """A guard against ACCIDENTS (an accident guard, not a secret): a blind-test sentence, or any text production derived from one, that the runner carries but
+    must not read by mistake. It is not iterable, not comparable, not hashable, has no ``len``/truth value/string methods, cannot be formatted,
+    copied or pickled, and is no ``str``: ``re.search``, ``json.dumps``, ``bytes()``, an unbound ``str.find(x, ...)``, ``in``, ``==`` and every
+    other way of looking inside raise ``TypeError`` (C-level paths included). Python cannot hide the slot (``object.__getattribute__``, ``gc``,
+    ``ctypes`` ... get it out); tests/test_blind_runner.py forbids those spellings in this file and a person reads the file before the blind run.
+    The ONE way out is ``reveal``, which only the fixed exit functions may call (checked at run time and by an AST test)."""
     __slots__ = ("_v",)
 
-    def __init__(self, v: str) -> None:
-        self._v = v
+    def __init__(self, v: str | None) -> None:
+        self._v = "" if v is None else v
 
     def _no(self, *a: Any, **k: Any):   # noqa: ANN002, ANN003
         raise TypeError("a blind-test sentence is opaque to the runner")
@@ -136,10 +146,16 @@ class Opaque:
 
 
 def reveal(o: Opaque) -> str:
-    """The only unwrap. Called from ``_admit_request`` and nowhere else (tests/test_blind_runner.py::RunnerHoldsNoJudgment pins that)."""
+    """The only unwrap. It checks its CALLER at run time: only the code objects of the fixed exit functions (``_EXIT_FUNCTIONS``: the AdmitRequest, the
+    TaskContext, the Worker's history and the JSONL row) may call it, however the call is spelled (an alias, ``globals()[...]``, a module attribute).
+    Anyone else gets a TypeError. The check is by code object, not by name."""
     if type(o) is not Opaque:
-        raise TypeError("reveal() takes an Opaque sentence")
-    return o._v
+        raise TypeError("reveal() takes an Opaque value")
+    caller = sys._getframe(1).f_code
+    for fn in _EXIT_FUNCTIONS:
+        if fn.__code__ is caller:
+            return o._v
+    raise TypeError("reveal() may only be called from a fixed exit function")
 
 
 class Sentence(NamedTuple):
@@ -149,13 +165,14 @@ class Sentence(NamedTuple):
 
 
 def _utf8_or_exit(path: str, what: str) -> None:
-    """Refuse a file that is not valid UTF-8 with ONE line naming the position, never the content (the line number counts newline bytes)."""
+    """Refuse a file that is not valid UTF-8 with ONE line naming the position, never the content. The line number counts line breaks the way the
+    readers' text mode does (``\\r\\n``, a lone ``\\r`` and ``\\n`` are one break each), so it agrees with the numbers they report."""
     with open(path, "rb") as fb:
         data = fb.read()
     try:
         data.decode("utf-8-sig")
     except UnicodeDecodeError as e:
-        line_no = data[:e.start].count(b"\n") + 1
+        line_no = data[:e.start].replace(b"\r\n", b"\n").replace(b"\r", b"\n").count(b"\n") + 1
         raise SystemExit(f"{what} is not valid UTF-8 (line {line_no}, byte offset {e.start})")
 
 
@@ -190,10 +207,10 @@ def read_sentences(path: str) -> list[Sentence]:
     return out
 
 
-def read_history(path: str) -> list[dict[str, str]]:
-    """``{"task": "...", "answer": "..."}`` per line, the shape the gateway keeps in ``orch_history``. Never echoed."""
+def read_history(path: str) -> list[dict[str, Opaque]]:
+    """``{"task": "...", "answer": "..."}`` per line, the shape the gateway keeps in ``orch_history``, each text wrapped in ``Opaque``. Never echoed."""
     _utf8_or_exit(path, "history file")
-    out: list[dict[str, str]] = []
+    out: list[dict[str, Opaque]] = []
     with open(path, encoding="utf-8-sig") as f:
         for n, line in enumerate(f, 1):
             if not line.strip():
@@ -202,7 +219,7 @@ def read_history(path: str) -> list[dict[str, str]]:
                 o = json.loads(line)
                 if not isinstance(o, dict) or not isinstance(o.get("task", ""), str) or not isinstance(o.get("answer", ""), str):
                     raise TypeError
-                out.append({"task": o.get("task", ""), "answer": o.get("answer", "")})
+                out.append({"task": Opaque(o.get("task", "")), "answer": Opaque(o.get("answer", ""))})
             except (ValueError, TypeError):
                 raise SystemExit(f"history line {n}: expected JSON {{\"task\": str, \"answer\": str}}")
     return out
@@ -291,7 +308,7 @@ def fidelity_codes(*, mode: str, has_task: bool, instructions: str, history_mode
 def _blank_row(sid: str, mode: str, fidelity: list[str]) -> dict[str, Any]:
     return {"id": sid, "mode": mode, "fidelity": fidelity, "route": None, "route_via": None, "decision": None, "jev_route": None,
             "jev_control": None, "via": None, "control_via": None, "degraded": None, "degraded_reason": None, "degraded_exc": None, "handled_by": None,
-            "required_tools": None, "clarify_slots": None, "memory_gate_explicit": None, "tools": None, "tool_ok": None, "worker_status": None, "outcome_kind": None, "outcome_rejected": None, "reply": "", "error": None, "error_stage": None}
+            "required_tools": None, "clarify_slots": None, "memory_gate_explicit": None, "tools": None, "tool_ok": None, "worker_status": None, "outcome_kind": None, "outcome_rejected": None, "reply": Opaque(""), "error": None, "error_stage": None}
 
 
 def _route_via(res, jev_route: str | None, use_jev: bool, enums: set[str]) -> str:   # noqa: ANN001
@@ -316,8 +333,8 @@ def _control_via(res, jev_route: str | None, jev_control: str | None) -> str | N
 
 
 def _admit_request(sid: str, text: Opaque, task: Opaque | None, language: str, playback_active: bool):
-    """THE unwrap site: builds the production AdmitRequest from the opaque sentence (``task`` = the front's rewrite when the input gives one;
-    ``raw_text`` stays the original sentence). Nothing else in this file may call ``reveal``."""
+    """EXIT 1 (to production): builds the production AdmitRequest from the opaque sentence (``task`` = the front's rewrite when the input gives one;
+    ``raw_text`` stays the original sentence). The body is pinned by an AST whitelist: ``reveal`` and ``C.AdmitRequest`` only."""
     from sophon_live import coordinator as C
     raw = reveal(text)
     delegate = raw if task is None else reveal(task)
@@ -325,9 +342,32 @@ def _admit_request(sid: str, text: Opaque, task: Opaque | None, language: str, p
                           playback_active=playback_active, raw_text=raw)
 
 
+def _task_context(job, objective: Opaque, ledger):   # noqa: ANN001
+    """EXIT 2 (to production): the TaskContext the Worker runs under. AST whitelist: ``reveal`` and ``C.TaskContext`` only."""
+    from sophon_live import coordinator as C
+    return C.TaskContext(task_id=job.task_id, version=job.version, utterance=reveal(objective), ledger=ledger)
+
+
+def _worker_history(history: list[dict[str, Opaque]]) -> list[dict[str, str]]:
+    """EXIT 3 (to production): the last HISTORY_TURNS turns as the plain ``{"task","answer"}`` dicts the Worker prompt takes.
+    AST whitelist: ``reveal`` and ``list.append`` only."""
+    out: list[dict[str, str]] = []
+    for h in history[-HISTORY_TURNS:]:
+        out.append({"task": reveal(h["task"]), "answer": reveal(h["answer"])})
+    return out
+
+
+def _dump_row(row: dict[str, Any]) -> str:
+    """EXIT 4 (to the output file): the one JSONL line of a row; the reply is the only Opaque field. AST whitelist: ``reveal`` and ``json.dumps`` only."""
+    return json.dumps({**row, "reply": reveal(row["reply"])}, ensure_ascii=False)
+
+
+_EXIT_FUNCTIONS = (_admit_request, _task_context, _worker_history, _dump_row)      # a tuple of the only functions reveal() serves
+
+
 async def run_one(sid: str, text: Opaque, *, ledger, jev, worker, language: str = "zh", mode: str = "fake", task: Opaque | None = None,
-                  instructions: str = "", history: list[dict[str, str]] | None = None, playback_active: bool = False,
-                  fidelity: list[str] | None = None, history_sink: list[dict[str, str]] | None = None) -> dict[str, Any]:
+                  instructions: str = "", history: list[dict[str, Opaque]] | None = None, playback_active: bool = False,
+                  fidelity: list[str] | None = None, history_sink: list[dict[str, Opaque]] | None = None) -> dict[str, Any]:
     """Run one sentence; ALWAYS returns a row (on an error the fields obtained so far are kept, plus ``error``/``error_stage``)."""
     from sophon_live import coordinator as C
     from sophon_live.coordinator import api, jev_client, memory_gate
@@ -383,14 +423,15 @@ async def run_one(sid: str, text: Opaque, *, ledger, jev, worker, language: str 
         row["clarify_slots"] = rec.slots
         if res.job is None:
             row["handled_by"] = {"STOP_SPEAKING": "stop", "FAST": "fast", "CLARIFY": "clarify"}.get(res.route, "control" if res.control else res.route.lower())
-            row["reply"] = res.speak.text or ""
+            row["reply"] = Opaque(res.speak.text)        # read here, wrapped at once: production's text may quote the sentence
             return row
         job = res.job
+        objective = Opaque(job.objective)                # read here, wrapped at once
         row["handled_by"] = "worker"
         row["required_tools"] = list(job.require_tools or [])
         stage = "worker"
-        with C.bind_task(C.TaskContext(task_id=job.task_id, version=job.version, utterance=job.objective, ledger=ledger)):
-            wr = await worker(job, instructions=instructions, history=list((history or [])[-HISTORY_TURNS:]))
+        with C.bind_task(_task_context(job, objective, ledger)):
+            wr = await worker(job, instructions=instructions, history=_worker_history(history or []))
         row["worker_status"] = wr.status
         if mode != "fake":                       # a fake Worker calls nothing: its "evidence" is just the required tools echoed back
             row["tools"] = [str(e.get("tool")) for e in wr.evidence]
@@ -399,10 +440,11 @@ async def run_one(sid: str, text: Opaque, *, ledger, jev, worker, language: str 
         stage = "finish"
         out = C.finish_job(ledger, job, wr)
         row["outcome_kind"], row["outcome_rejected"] = out.kind, out.rejected or None
-        row["reply"] = out.text
+        reply = Opaque(out.text)                         # read here, wrapped at once
+        row["reply"] = reply
         row["clarify_slots"] = rec.slots
         if history_sink is not None and out.kind == "answer":      # like gateway.py: a clarify question or a stale result never enters the history
-            history_sink.append({"task": job.objective, "answer": out.text})
+            history_sink.append({"task": objective, "answer": reply})
             del history_sink[:-HISTORY_KEEP]
     except Exception as e:   # noqa: BLE001   class name only: a message may quote the sentence
         row["error"], row["error_stage"] = type(e).__name__, stage
@@ -428,7 +470,7 @@ def open_output(out_path: str) -> int:
 
 async def run(sentences: Iterable[Sentence], out_path: str, *, mode: str = "fake", fake_route: str = "WORKER",
               jev_url: str | None = None, shared_ledger: bool = False, instructions: str = "",
-              history: list[dict[str, str]] | None = None, language: str = "zh", playback_active: bool = False) -> int:
+              history: list[dict[str, Opaque]] | None = None, language: str = "zh", playback_active: bool = False) -> int:
     from sophon_live import coordinator as C
     from sophon_live.coordinator import api, jev_client
     if mode == "fake":
@@ -460,7 +502,7 @@ async def run(sentences: Iterable[Sentence], out_path: str, *, mode: str = "fake
                 row = await run_one(s.id, s.text, ledger=ledger, jev=jev, worker=worker, language=language, mode=mode, task=s.task,
                                     instructions=instructions, history=run_history, playback_active=playback_active, fidelity=fid,
                                     history_sink=run_history if shared_ledger else None)
-                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                f.write(_dump_row(row) + "\n")
                 f.flush()
                 n += 1
                 n_err += 1 if row["error"] else 0

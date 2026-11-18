@@ -24,7 +24,7 @@ PY = sys.executable
 SRC = os.path.join(LIVE, "tools", "blind_runner.py")
 TESTS = [os.path.join(LIVE, "tests", "test_blind_runner.py")]
 EXC = 'row["error"], row["error_stage"] = type(e).__name__, stage'
-WRITE = "                f.write(json.dumps(row, ensure_ascii=False) + \"\\n\")"
+WRITE = "                f.write(_dump_row(row) + \"\\n\")"
 RUNCALL = "                                    history_sink=run_history if shared_ledger else None)\n"
 
 M = [
@@ -67,8 +67,8 @@ M = [
  ("R7e an error wipes the row", EXC, "row = _blank_row(sid, mode, []); " + EXC),
  ("R7f error_stage always admit", EXC, 'row["error"], row["error_stage"] = type(e).__name__, "admit"'),
  # --- B-R2 fidelity ---------------------------------------------------------------------------------------------------------------
- ("R2a history not passed to the worker", "history=list((history or [])[-HISTORY_TURNS:])", "history=[]"),
- ("R2b instructions not passed to the worker", "instructions=instructions, history=list(", 'instructions="", history=list('),
+ ("R2a history not passed to the worker", "history=_worker_history(history or [])", "history=[]"),
+ ("R2b instructions not passed to the worker", "instructions=instructions, history=_worker_history(", 'instructions="", history=_worker_history('),
  ("R2c more than the last 6 turns", "HISTORY_TURNS = 6", "HISTORY_TURNS = 12"),
  ("R2d the rewritten task ignored", "delegate = raw if task is None else reveal(task)", "delegate = raw"),
  ("R2e raw_text is the rewrite", "playback_active=playback_active, raw_text=raw)", "playback_active=playback_active, raw_text=delegate)"),
@@ -149,7 +149,7 @@ M = [
  ("K4 the wrapper can be compared again", "__getitem__ = __eq__ = __ne__", "__getitem__ = __ne__"),
  ("K5 str(wrapper) works again", "    __hash__ = __str__ = __format__", "    __hash__ = __format__"),
  ("K6 the wrapper's repr leaks the content", 'return "<Opaque sentence>"', 'return f"<Opaque {self._v}>"'),
- ("K7 reveal accepts anything", "    if type(o) is not Opaque:\n        raise TypeError(\"reveal() takes an Opaque sentence\")\n", ""),
+ ("K7 reveal accepts anything", "    if type(o) is not Opaque:\n        raise TypeError(\"reveal() takes an Opaque value\")\n", ""),
  ("K8 the reader does not wrap a plain line", "item = Sentence(sid, Opaque(line), None)", "item = Sentence(sid, line, None)"),
  ("K9 the reader does not wrap a JSON text", "item = Sentence(sid, Opaque(text),", "item = Sentence(sid, text,"),
  ("U1 an invalid UTF-8 input file is not checked", '    _utf8_or_exit(path, "input file")\n', "    pass\n"),
@@ -160,6 +160,42 @@ M = [
  ("D1 duplicate ids are not detected", "            if sid in seen:\n", "            if False:\n"),
  ("D2 the duplicate-id message has no line number", 'raise SystemExit(f"input line {n}: id is not unique")', 'raise SystemExit("input ids are not unique")'),
  ("D3 the duplicate-id message echoes the id", 'raise SystemExit(f"input line {n}: id is not unique")', 'raise SystemExit(f"input line {n}: id {sid} is not unique")'),
+ # --- I-1 (triple prime): production texts are Opaque at the line they are read (Critic's N1-N4 and the unwrapped variants) -----------------------
+ ("N1 fork on job.objective", "        objective = Opaque(job.objective)", "        objective = Opaque(job.objective)\n        if 'qzxw' in job.objective:\n            row['handled_by'] = 'fast'"),
+ ("N2 fork on job.objective at the history sink", 'history_sink.append({"task": objective, "answer": reply})', 'history_sink.append({"task": objective, "answer": reply})\n            if \'qzxw\' in job.objective:\n                row["via"] = "guard"'),
+ ("N3 fork on out.text", "        reply = Opaque(out.text)", "        reply = Opaque(out.text)\n        if 'qzxw' in out.text:\n            row['handled_by'] = 'fast'"),
+ ("N4 fork on res.speak.text", 'row["reply"] = Opaque(res.speak.text)', 'row["reply"] = Opaque(res.speak.text)\n            if \'qzxw\' in res.speak.text:\n                row["handled_by"] = "fast"'),
+ ("N5 fork on the Opaque reply", "        reply = Opaque(out.text)", "        reply = Opaque(out.text)\n        if 'qzxw' in reply:\n            row['handled_by'] = 'fast'"),
+ ("N6 job.objective is not wrapped", "        objective = Opaque(job.objective)", "        objective = job.objective"),
+ ("N7 the clarify/fast reply is not wrapped", 'row["reply"] = Opaque(res.speak.text)', 'row["reply"] = res.speak.text'),
+ ("N8 out.text is not wrapped", "        reply = Opaque(out.text)", "        reply = out.text"),
+ ("N9 the history sink gets plain text", 'history_sink.append({"task": objective, "answer": reply})', 'history_sink.append({"task": job.objective, "answer": out.text})'),
+ ("N10 the TaskContext reads job.objective itself", "utterance=reveal(objective)", "utterance=job.objective"),
+ ("N11 the JSON row is dumped without the reply being revealed", 'return json.dumps({**row, "reply": reveal(row["reply"])}, ensure_ascii=False)', "return json.dumps(row, ensure_ascii=False)"),
+ ("N12 the Worker's history is plain again (a stored sentence is read raw)", '        out.append({"task": reveal(h["task"]), "answer": reveal(h["answer"])})', '        out.append({"task": h["task"], "answer": h["answer"]})'),
+ ("N14 fork on str(res.speak) (a production field that is not audited)", "        if res.job is None:\n", "        if 'qzxw' in str(res.speak):\n            row['handled_by'] = 'fast'\n        if res.job is None:\n"),
+ ("N13 the history file's texts are not wrapped", 'out.append({"task": Opaque(o.get("task", "")), "answer": Opaque(o.get("answer", ""))})', 'out.append({"task": o.get("task", ""), "answer": o.get("answer", "")})'),
+ # --- I-2 (triple prime): reveal checks its caller; the exit bodies are whitelisted (Critic's L1-L4, L6) ---------------------------------------
+ ("L1 object.__getattribute__ takes the text out of the slot, a C-level search forks on it", WRITE, "                _v = object.__getattribute__(s.text, '_' + 'v')\n                if sys.modules['re'].search('qzxw', _v): row['via'] = 'guard'\n" + WRITE),
+ ("L2 sys.modules[__name__].reveal(sentence) then a bytes() alias fork", WRITE, "                _v = sys.modules[__name__].reveal(s.text)\n                _b = bytes(_v, 'utf-8')\n                if b'qzxw' in _b: row['via'] = 'guard'\n" + WRITE),
+ ("L3 a C-level search on the revealed text inside _admit_request rewrites it", "    raw = reveal(text)\n", "    raw = reveal(text)\n    if sys.modules['re'].search('qzxw', raw):\n        raw = 'x'\n"),
+ ("L4 json.dumps alias compare on the revealed text inside _admit_request rewrites it", "    raw = reveal(text)\n", "    raw = reveal(text)\n    d_ = json.dumps(raw)\n    if 'qzxw' in d_:\n        raw = 'x'\n"),
+ ("L6 the spy forks on the JEV request's utterance with a C-level search", "        rec.route = jev_client.choice_answer(resp, \"route\")\n", "        if sys.modules['re'].search('qzxw', state['utterance']):\n            resp = {}\n        rec.route = jev_client.choice_answer(resp, \"route\")\n"),
+ ("L7 reveal does not check its caller", "        if fn.__code__ is caller:\n", "        if True:\n"),
+ ("L8 reveal compares code objects by value (an identical clone passes)", "        if fn.__code__ is caller:\n", "        if fn.__code__ == caller:\n"),
+ ("L9 reveal becomes an exit of its own", "_EXIT_FUNCTIONS = (_admit_request, _task_context, _worker_history, _dump_row)", "_EXIT_FUNCTIONS = (_admit_request, _task_context, _worker_history, _dump_row, reveal)"),
+ ("L10 _task_context does a keyword test on the text", "    return C.TaskContext(", "    _y = reveal(objective).startswith('q')\n    return C.TaskContext("),
+ ("L11 the recorder compares what it wraps", "            r = fn(*a, **k)\n", "            r = fn(*a, **k)\n            if 'qzxw' in str(a):\n                r = None\n"),
+ # --- I-3 (triple prime): the readers' stage -------------------------------------------------------------------------------------------------
+ ("K12 read_sentences drops a line by its content", "            line = line.strip()\n", "            line = line.strip()\n            if 'qzxw' in line:\n                continue\n"),
+ ("K13 read_sentences changes an id by the content", '                sid = f"s{len(out) + 1:04d}"\n                item', '                sid = f"s{len(out) + 1:04d}"\n                if \'qzxw\' in line:\n                    sid += "x"\n                item'),
+ ("K14 the raw line is stashed in a module-level list and a fork reads it later", "            line = line.strip()\n", "            line = line.strip()\n            _SEEN.append(line)\n"),
+ ("K15 read_history drops a line by its content", "            if not line.strip():\n                continue\n", "            if 'qzxw' in line:\n                continue\n            if not line.strip():\n                continue\n"),
+ ("K16 read_sentences keeps an alias of the raw line", '                sid = f"s{len(out) + 1:04d}"\n                item', '                sid = f"s{len(out) + 1:04d}"\n                _alias = line\n                item'),
+ ("K17 _utf8_or_exit looks at the raw bytes", "    try:\n        data.decode(\"utf-8-sig\")", "    if b'qzxw' in data:\n        raise SystemExit('x')\n    try:\n        data.decode(\"utf-8-sig\")"),
+ # --- S-2 (triple prime): one way of counting lines ------------------------------------------------------------------------------------------
+ ("S2c-1 the UTF-8 line number counts only LF again", 'data[:e.start].replace(b"\\r\\n", b"\\n").replace(b"\\r", b"\\n").count(b"\\n") + 1', 'data[:e.start].count(b"\\n") + 1'),
+ ("S2c-2 the UTF-8 line number counts CRLF twice", 'data[:e.start].replace(b"\\r\\n", b"\\n").replace(b"\\r", b"\\n")', 'data[:e.start].replace(b"\\r", b"\\n")'),
 ]
 # Mutants that are equivalent to the unmutated runner BY CONSTRUCTION (the tests cannot, and must not, see them). They must survive.
 EQUIVALENT = [
@@ -171,9 +207,11 @@ HELPER_G2 = "\nasync def _chk(q):\n    return q.startswith('x')\n"
 HELPER_J9 = "\n_h = lambda q: str.startswith(q, 'qzxw')\n"
 HELPER_H5 = "\nasync def _chk(q):\n    return q.startswith('a')\n"
 # M14 needs the weaker seal to be observable (see the module docstring)
-COMBO = {"M14w ERROR-level log of the sentence in the error branch (with the seal at WARNING)": ("    logging.disable(logging.CRITICAL)\n", "    logging.disable(logging.WARNING)\n")}
+COMBO = {"K14 the raw line is stashed in a module-level list and a fork reads it later": (WRITE, "                if _SEEN and 'qzxw' in _SEEN[0]: row['via'] = 'guard'\n" + WRITE),
+         "M14w ERROR-level log of the sentence in the error branch (with the seal at WARNING)": ("    logging.disable(logging.CRITICAL)\n", "    logging.disable(logging.WARNING)\n")}
 # M9b needs the warning itself
-EXTRA = {"M9b warnings not ignored and warn(sentence)": (WRITE, "                warnings.warn(s.text)\n" + WRITE),
+EXTRA = {"K14 the raw line is stashed in a module-level list and a fork reads it later": (ANCHOR, "\n_SEEN = []\n" + ANCHOR),
+         "M9b warnings not ignored and warn(sentence)": (WRITE, "                warnings.warn(s.text)\n" + WRITE),
          "G2 async helper(q).startswith, no output effect (probe)": (ANCHOR, HELPER_G2 + ANCHOR),
          "H5 async helper(q) changes via": (ANCHOR, HELPER_H5 + ANCHOR),
          "J9 module-level helper with unbound str.startswith changes via": (ANCHOR, HELPER_J9 + ANCHOR)}

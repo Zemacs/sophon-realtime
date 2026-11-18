@@ -24,6 +24,18 @@ SENTENCES = ["ZQXV7731今天北京天气怎么样", "KJWB5528好的谢谢", "记
 MARKERS = ["ZQXV7731", "KJWB5528", "PLMN4406", "NHTD9902"]
 
 
+def peek(o) -> str:   # noqa: ANN001   test code looks inside an Opaque directly (reveal() serves only the runner's fixed exits)
+    return o._v
+
+
+def _opq_hist(hist: list[dict]) -> list[dict]:
+    return [{"task": br.Opaque(h["task"]), "answer": br.Opaque(h["answer"])} for h in hist]
+
+
+def _plain_hist(hist: list[dict]) -> list[dict]:
+    return [{"task": peek(h["task"]), "answer": peek(h["answer"])} for h in hist]
+
+
 def _write(d: str, lines: list[str], name: str = "in.txt") -> str:
     p = os.path.join(d, name)
     with open(p, "w", encoding="utf-8") as f:
@@ -74,8 +86,12 @@ class _Base(unittest.TestCase):
         try:
             with br.quiet_and_sealed(False):
                 task = kw.pop("task", None)
-                return asyncio.run(br.run_one(kw.pop("sid", "x"), br.Opaque(text), ledger=ledger or C.Ledger(), jev=jev, worker=worker or br._fake_worker,
-                                              task=br.Opaque(task) if task is not None else None, **kw))
+                if kw.get("history") is not None:
+                    kw["history"] = _opq_hist(kw["history"])
+                row = asyncio.run(br.run_one(kw.pop("sid", "x"), br.Opaque(text), ledger=ledger or C.Ledger(), jev=jev, worker=worker or br._fake_worker,
+                                             task=br.Opaque(task) if task is not None else None, **kw))
+                row["reply"] = peek(row["reply"])                  # the row as written to the file (br._dump_row), for the assertions
+                return row
         finally:
             api.USE_JEV = prev
 
@@ -359,7 +375,7 @@ class Behaviour(_Base):
             seen.append(len(history or []))
             return await real_fake(job)
         hist = [{"task": f"t{i}", "answer": f"a{i}"} for i in range(11)]
-        sink = list(hist)
+        sink = _opq_hist(hist)
         from sophon_live import coordinator as C
         async def go():
             for k in range(3):
@@ -367,7 +383,7 @@ class Behaviour(_Base):
         with br.quiet_and_sealed(False):
             asyncio.run(go())
         self.assertEqual(len(sink), 12)
-        self.assertEqual(sink[-1]["answer"], br.FAKE_REPLY)
+        self.assertEqual(peek(sink[-1]["answer"]), br.FAKE_REPLY)
 
     # ---- I-2: the keyword functions' conclusions are recorded, nothing else, and everything is restored -----------------------------
     def test_the_keyword_functions_return_values_are_recorded_and_the_functions_restored(self) -> None:
@@ -555,7 +571,7 @@ class Behaviour(_Base):
         orig_run_one = br.run_one
         async def run_one(sid, text, **kw):   # noqa: ANN001
             row = await orig_run_one(sid, text, **kw)
-            if "x" in br.reveal(text):                                 # a planted judgment (in the TEST, never in the runner)
+            if "x" in peek(text):                                 # a planted judgment (in the TEST, never in the runner)
                 row["handled_by"] = "fast"
             return row
         with mock.patch.object(br, "run_one", run_one):
@@ -627,7 +643,7 @@ class Behaviour(_Base):
         with tempfile.TemporaryDirectory() as d:
             bom = os.path.join(d, "bom.jsonl")
             open(bom, "w", encoding="utf-8-sig").write(json.dumps({"id": "b", "text": "ZQXV7731"}) + "\n")
-            self.assertEqual([(s.id, br.reveal(s.text)) for s in br.read_sentences(bom)], [("b", "ZQXV7731")])           # parsed as JSON, not taken as a sentence
+            self.assertEqual([(s.id, peek(s.text)) for s in br.read_sentences(bom)], [("b", "ZQXV7731")])           # parsed as JSON, not taken as a sentence
             for bad in ({"id": "a", "text": None}, {"id": "a", "text": ""}, {"id": "a", "text": "  "}, {"id": "a", "text": 5}, {"id": "a"},
                         {"id": "a", "text": "ZQXV7731", "task": 7}, {"id": "a", "text": "ZQXV7731", "task": ""}):
                 p = _write(d, [json.dumps(bad)], "bad.jsonl")
@@ -955,10 +971,11 @@ class OpaqueSentence(unittest.TestCase):
         o = br.Opaque("SECRETOPAQUE abc")
         self.assertEqual(repr(o), "<Opaque sentence>")
         self.assertEqual(repr(br.Opaque("x")), repr(br.Opaque("a much longer sentence")))          # not even the length
-        self.assertEqual(br.reveal(o), "SECRETOPAQUE abc")
         for bad in ("a plain str", None, 3, ["x"]):
             with self.assertRaises(TypeError):
                 br.reveal(bad)  # type: ignore[arg-type]
+        with self.assertRaises(TypeError):                              # an Opaque, but a caller that is not one of the fixed exits
+            br.reveal(o)
 
     def test_the_reader_wraps_every_sentence_and_the_runner_hands_production_a_real_str(self) -> None:
         with tempfile.TemporaryDirectory() as d:
@@ -976,6 +993,297 @@ class OpaqueSentence(unittest.TestCase):
             with tempfile.TemporaryDirectory() as d:
                 self.assertEqual(br.main([_write(d, ["plain"]), os.path.join(d, "o.jsonl")]), 0)
         self.assertEqual(got, [(str, str, str)])
+
+
+# ---------------------------------------------------------------------------------------------------------------------------------------
+# Structure checks (AST whitelists). They are SELF-CHECKS against accidents, not a security boundary: each one is pinned by mutants in
+# tests/mutation_check_blind_runner.py, and each is shown not to be vacuous on a planted violation below.
+# ---------------------------------------------------------------------------------------------------------------------------------------
+def _parents(tree: ast.AST) -> dict:
+    pm: dict = {}
+    for n in ast.walk(tree):
+        for c in ast.iter_child_nodes(n):
+            pm[c] = n
+    return pm
+
+
+def _funcs(tree: ast.AST) -> dict:
+    out: dict = {}
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            out.setdefault(n.name, n)
+    return out
+
+
+def _body_nodes(fn: ast.AST) -> list:
+    """All nodes of a function body, annotations excluded."""
+    skip: set = set()
+    for n in ast.walk(fn):
+        if isinstance(n, ast.AnnAssign):
+            skip.update(ast.walk(n.annotation))
+    return [n for stmt in fn.body for n in ast.walk(stmt) if n not in skip]
+
+
+def _call_name(call: ast.Call) -> str | None:
+    if isinstance(call.func, ast.Name):
+        return call.func.id
+    if isinstance(call.func, ast.Attribute):
+        return call.func.attr
+    return None
+
+
+_NONE_COMPARE_OPS = (ast.Is, ast.IsNot)
+
+
+def _is_none_compare(n: ast.Compare) -> bool:
+    return all(isinstance(o, _NONE_COMPARE_OPS) for o in n.ops) and all(isinstance(c, ast.Constant) and c.value is None for c in n.comparators)
+
+
+EXIT_SPECS = {
+    "_admit_request": {"calls": {"reveal"}, "attrs": {("C", "AdmitRequest")}},
+    "_task_context": {"calls": {"reveal"}, "attrs": {("C", "TaskContext"), ("job", "task_id"), ("job", "version")}},
+    "_worker_history": {"calls": {"reveal"}, "attrs": {("out", "append")}},
+    "_dump_row": {"calls": {"reveal"}, "attrs": {("json", "dumps")}},
+}
+_EXIT_NODES = (ast.Expr, ast.ImportFrom, ast.alias, ast.Assign, ast.AnnAssign, ast.Return, ast.For, ast.Call, ast.keyword, ast.Attribute, ast.Name, ast.Constant,
+               ast.Dict, ast.List, ast.Subscript, ast.Slice, ast.UnaryOp, ast.USub, ast.IfExp, ast.Compare, ast.Is, ast.IsNot, ast.Load, ast.Store)
+
+
+def exit_violations(fn: ast.AST, spec: dict) -> list[str]:
+    """An exit function may do ONE thing: ``reveal`` its Opaque arguments and build the one object it hands on (an AdmitRequest, a TaskContext, the
+    Worker's history dicts, the JSON line). No other call, no comparison but ``is None``, no import but the coordinator, no name outside its own."""
+    v: list[str] = []
+    nodes = _body_nodes(fn)
+    params = {a.arg for a in fn.args.args}
+    local = {t.id for n in nodes if isinstance(n, (ast.Assign, ast.AnnAssign, ast.For)) for t in ast.walk(n.target if not isinstance(n, ast.Assign) else n.targets[0])
+             if isinstance(t, ast.Name)}
+    bases = {b for b, _ in spec["attrs"]}
+    ok_names = params | local | spec["calls"] | bases | {"C", "json", "HISTORY_TURNS"}
+    for n in nodes:
+        if not isinstance(n, _EXIT_NODES):
+            v.append(f"{fn.name}: node {type(n).__name__} is not allowed")
+        if isinstance(n, ast.ImportFrom) and not (n.module == "sophon_live" and [(a.name, a.asname) for a in n.names] == [("coordinator", "C")]):
+            v.append(f"{fn.name}: import")
+        if isinstance(n, ast.Call):
+            if isinstance(n.func, ast.Name):
+                if n.func.id not in spec["calls"]:
+                    v.append(f"{fn.name}: call {n.func.id}")
+            elif not (isinstance(n.func, ast.Attribute) and isinstance(n.func.value, ast.Name) and (n.func.value.id, n.func.attr) in spec["attrs"]):
+                v.append(f"{fn.name}: call of an attribute outside the whitelist")
+        if isinstance(n, ast.Attribute):
+            if not (isinstance(n.value, ast.Name) and (n.value.id, n.attr) in spec["attrs"]):
+                v.append(f"{fn.name}: attribute {n.attr}")
+        if isinstance(n, ast.Name) and n.id not in ok_names:
+            v.append(f"{fn.name}: name {n.id}")
+        if isinstance(n, ast.Compare) and not _is_none_compare(n):
+            v.append(f"{fn.name}: comparison")
+        if isinstance(n, ast.Subscript):
+            sl = n.slice
+            okslice = (isinstance(sl, ast.Constant) and isinstance(sl.value, str)) or (
+                isinstance(sl, ast.Slice) and sl.upper is None and isinstance(sl.lower, ast.UnaryOp) and isinstance(sl.lower.operand, ast.Name)
+                and sl.lower.operand.id == "HISTORY_TURNS")
+            if not okslice:
+                v.append(f"{fn.name}: subscript")
+    return v
+
+
+_SPY_NODES = (ast.Try, ast.ExceptHandler, ast.Await, ast.Call, ast.keyword, ast.Name, ast.Attribute, ast.Tuple, ast.Assign, ast.Raise, ast.Return, ast.Constant,
+              ast.If, ast.Compare, ast.Eq, ast.Starred, ast.Load, ast.Store, ast.BoolOp, ast.Or, ast.BinOp, ast.Add, ast.List, ast.Expr)
+_SPY_ATTRS = {("rec", a) for a in ("route", "control", "error_kind", "error_exc", "slots", "save_intent")} | {("jev_client", "choice_answer")}
+_SPY_CALLS = {"jev", "jev_error_kind", "type", "fn", "list", "bool", "choice_answer"}
+
+
+def watcher_violations(fn: ast.AST, tree: ast.AST) -> list[str]:
+    """The spy and the recorder see production's state (the JEV request, a keyword function's arguments and result). They may only forward their
+    arguments to the function they wrap and keep its answer: no comparison but their own ``sink == "..."``, no indexing, no other call."""
+    v: list[str] = []
+    pm = _parents(tree)
+    for n in _body_nodes(fn):
+        if not isinstance(n, _SPY_NODES):
+            v.append(f"{fn.name}: node {type(n).__name__} is not allowed")
+        if isinstance(n, ast.Compare) and not (isinstance(n.left, ast.Name) and n.left.id == "sink" and all(isinstance(o, ast.Eq) for o in n.ops)
+                                               and all(isinstance(c, ast.Constant) for c in n.comparators)):
+            v.append(f"{fn.name}: comparison")
+        if isinstance(n, ast.Call):
+            if isinstance(n.func, ast.Name) and n.func.id not in _SPY_CALLS:
+                v.append(f"{fn.name}: call {n.func.id}")
+            if isinstance(n.func, ast.Attribute) and not (isinstance(n.func.value, ast.Name) and (n.func.value.id, n.func.attr) in _SPY_ATTRS):
+                v.append(f"{fn.name}: attribute call {n.func.attr}")
+        if isinstance(n, ast.Attribute) and not ((isinstance(n.value, ast.Name) and (n.value.id, n.attr) in _SPY_ATTRS)
+                                                  or (n.attr == "__name__" and isinstance(n.value, ast.Call) and _call_name(n.value) == "type")):
+            v.append(f"{fn.name}: attribute {n.attr}")
+        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id in {"state", "questions", "kw", "a", "k", "resp", "r", "e"}:
+            p = pm[n]
+            while isinstance(p, (ast.Starred, ast.keyword, ast.BoolOp)):
+                p = pm[p]
+            allowed = {"state": {"jev"}, "questions": {"jev"}, "kw": {"jev"}, "a": {"fn"}, "k": {"fn"}, "resp": {"choice_answer"},
+                       "r": {"list", "bool"}, "e": {"jev_error_kind", "type"}}[n.id]
+            if not ((isinstance(p, ast.Call) and _call_name(p) in allowed) or (n.id in ("resp", "r") and isinstance(p, ast.Return))
+                    or (n.id == "r" and isinstance(p, ast.Assign))):
+                v.append(f"{fn.name}: {n.id} is used other than by being forwarded")
+    return v
+
+
+_PRODUCTION_TEXT_ATTRS = {"objective", "text", "spoken_answer"}
+_PRODUCTION_OBJECTS = {"res", "job", "out", "wr", "speak"}
+_PRODUCTION_PATHS = {"job.objective", "job.require_tools", "out.kind", "out.rejected", "out.text", "res.control", "res.control.op", "res.job", "res.route",
+                     "res.route.lower", "res.speak.text", "res.via", "wr.evidence", "wr.status"}
+_PRODUCTION_CALLEES = {"worker", "_task_context", "_route_via", "_control_via", "finish_job", "admit", "_admit_request"}
+
+
+def production_text_violations(run_one: ast.AST, tree: ast.AST) -> list[str]:
+    """What run_one reads from production: a text that may quote the sentence is wrapped in Opaque at the line it is read; production's objects
+    are only handed on (or an attribute that is not a text is read)."""
+    v: list[str] = []
+    pm = _parents(tree)
+    for n in _body_nodes(run_one):
+        if isinstance(n, ast.Attribute) and n.attr in _PRODUCTION_TEXT_ATTRS:
+            p = pm[n]
+            if not (isinstance(p, ast.Call) and isinstance(p.func, ast.Name) and p.func.id == "Opaque" and p.args == [n] and not p.keywords):
+                v.append(f"line {n.lineno}: production text .{n.attr} is read other than as Opaque(...)")
+        if isinstance(n, ast.Attribute) and not isinstance(pm.get(n), ast.Attribute):          # the outermost link of an attribute chain
+            parts, x = [], n
+            while isinstance(x, ast.Attribute):
+                parts.append(x.attr)
+                x = x.value
+            if isinstance(x, ast.Name) and x.id in _PRODUCTION_OBJECTS and ".".join([x.id] + parts[::-1]) not in _PRODUCTION_PATHS:
+                v.append(f"line {n.lineno}: reads {'.'.join([x.id] + parts[::-1])}, which is not one of the audited production fields")
+        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id in _PRODUCTION_OBJECTS:
+            p = pm[n]
+            if not (isinstance(p, ast.Attribute) or (isinstance(p, ast.Call) and _call_name(p) in _PRODUCTION_CALLEES)):
+                v.append(f"line {n.lineno}: {n.id} is used other than by attribute or being handed on")
+        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id in {"objective", "reply"}:
+            p = pm[n]
+            if not ((isinstance(p, ast.Call) and _call_name(p) == "_task_context") or isinstance(p, (ast.Assign, ast.Dict))):
+                v.append(f"line {n.lineno}: {n.id} (an Opaque) is used other than by being stored or handed to an exit")
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in ("getattr", "setattr", "delattr"):
+            if not all(isinstance(a, ast.Name) and a.id in {"o", "n", "f", "v"} for a in n.args):
+                v.append(f"line {n.lineno}: reflection")
+    return v
+
+
+_ALLOWED_TOP_IMPORTS = {"__future__", "argparse", "asyncio", "contextlib", "json", "logging", "os", "sys", "warnings", "typing"}
+_ALLOWED_DUNDER_ATTRS = {"__name__", "__cause__"}
+_BANNED_NAMES = {"object", "globals", "locals", "vars", "__import__", "eval", "exec", "compile", "breakpoint", "memoryview", "bytearray", "bytes", "repr", "ascii"}
+_BANNED_ATTRS = {"modules", "_getframe", "f_locals", "f_globals", "gi_frame", "cr_frame", "get_referents", "get_objects", "getmembers", "getsource", "__code__", "__dict__"}
+
+
+def whole_file_violations(tree: ast.AST) -> list[str]:
+    """Imports are a fixed list (no gc/inspect/ctypes/re/operator/functools/copy/pickle/io...); no name or attribute that takes a value out of a slot
+    or reaches the module's own namespace; no ``global``; no module-level (or default-argument) mutable container to stash a sentence in."""
+    v: list[str] = []
+    fns = _funcs(tree)
+    reveal_nodes = set(ast.walk(fns["reveal"]))
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Import):
+            for a in n.names:
+                if a.name.split(".")[0] not in _ALLOWED_TOP_IMPORTS | {"aiohttp"}:
+                    v.append(f"line {n.lineno}: import {a.name}")
+        if isinstance(n, ast.ImportFrom):
+            mod = (n.module or "").split(".")[0]
+            if mod not in _ALLOWED_TOP_IMPORTS | {"sophon_live"} or n.level:
+                v.append(f"line {n.lineno}: from {n.module} import")
+        if isinstance(n, (ast.Global, ast.Nonlocal)):
+            v.append(f"line {n.lineno}: global/nonlocal")
+        if isinstance(n, ast.Name) and n.id in _BANNED_NAMES:
+            v.append(f"line {n.lineno}: name {n.id}")
+        if isinstance(n, ast.Attribute):
+            if n.attr in _BANNED_ATTRS and n not in reveal_nodes:
+                v.append(f"line {n.lineno}: attribute {n.attr}")
+            if n.attr.startswith("__") and n.attr.endswith("__") and n.attr not in _ALLOWED_DUNDER_ATTRS and n not in reveal_nodes:
+                v.append(f"line {n.lineno}: dunder attribute {n.attr}")
+            if isinstance(n.ctx, ast.Store) and not (isinstance(n.value, ast.Name) and (n.value.id in {"self", "rec"} or (n.value.id, n.attr) == ("api", "USE_JEV"))):
+                v.append(f"line {n.lineno}: attribute store on something other than self/rec/api.USE_JEV")
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for d in list(n.args.defaults) + [d for d in n.args.kw_defaults if d is not None]:
+                if not isinstance(d, (ast.Constant, ast.Tuple)):
+                    v.append(f"line {n.lineno}: a default argument that is not a constant")
+    mutable = (ast.List, ast.Dict, ast.Set, ast.ListComp, ast.DictComp, ast.SetComp, ast.GeneratorExp, ast.Call)
+    scopes = [tree] + [c for c in tree.body if isinstance(c, ast.ClassDef)]
+    for scope in scopes:
+        for st in scope.body:
+            if isinstance(st, (ast.Assign, ast.AnnAssign)) and st.value is not None and isinstance(st.value, mutable):
+                v.append(f"line {st.lineno}: a module-level or class-level mutable container / call")
+    return v
+
+
+_READ_NODES = (ast.Expr, ast.Assign, ast.AnnAssign, ast.Return, ast.For, ast.If, ast.With, ast.withitem, ast.Try, ast.ExceptHandler, ast.Raise, ast.Continue,
+               ast.Call, ast.keyword, ast.Attribute, ast.Name, ast.Constant, ast.Dict, ast.List, ast.Tuple, ast.Subscript, ast.Slice, ast.UnaryOp, ast.Not,
+               ast.BoolOp, ast.Or, ast.And, ast.IfExp, ast.Compare, ast.Is, ast.IsNot, ast.In, ast.BinOp, ast.Add, ast.JoinedStr, ast.FormattedValue,
+               ast.Load, ast.Store)
+_READ_CALLS_NAMES = {"isinstance", "str", "len", "enumerate", "open", "Opaque", "Sentence", "SystemExit", "TypeError", "set", "_utf8_or_exit"}
+_READ_CALLS_ATTRS = {"strip", "startswith", "get", "loads", "add", "append", "read", "decode", "replace", "count"}
+_CONTENT_NAMES = {"line", "text", "task", "o", "data"}
+_CONTENT_METHODS = {"strip", "startswith", "get", "decode", "replace", "count"}
+
+
+def _flows_into_content_names_only(node: ast.AST, pm: dict) -> bool:
+    """True when ``node`` (a content value) is assigned only to content names (``line = line.strip()``, ``o = json.loads(line)``); an alias such as
+    ``x = line`` is how a value would escape this check."""
+    p = pm[node]
+    while isinstance(p, ast.Tuple):
+        p = pm[p]
+    if not isinstance(p, ast.Assign):
+        return False
+    return all(isinstance(t, ast.Name) and t.id in _CONTENT_NAMES or isinstance(t, ast.Tuple) and all(isinstance(x, ast.Name) and x.id in _CONTENT_NAMES for x in t.elts)
+               for t in p.targets)
+
+
+def read_violations(fn: ast.AST, tree: ast.AST) -> list[str]:
+    """The reading stage sees the raw line before it is wrapped. On it: ``strip()``, ``startswith("{")``, ``json.loads``, wrapping in Opaque, and for the
+    parsed JSON only a constant-key lookup or ``get("...")``. No ``in``/comparison/indexing/f-string on content. ``sid in seen`` is the one membership test."""
+    v: list[str] = []
+    pm = _parents(tree)
+    for n in _body_nodes(fn):
+        if not isinstance(n, _READ_NODES):
+            v.append(f"{fn.name}: node {type(n).__name__} is not allowed")
+        if isinstance(n, ast.Compare):
+            sid_in_seen = (isinstance(n.left, ast.Name) and n.left.id == "sid" and [type(o) for o in n.ops] == [ast.In]
+                           and len(n.comparators) == 1 and isinstance(n.comparators[0], ast.Name) and n.comparators[0].id == "seen")
+            if not (_is_none_compare(n) or sid_in_seen):
+                v.append(f"{fn.name}: comparison / membership test (line {n.lineno})")
+        if isinstance(n, ast.Call):
+            if isinstance(n.func, ast.Name) and n.func.id not in _READ_CALLS_NAMES:
+                v.append(f"{fn.name}: call {n.func.id}")
+            if isinstance(n.func, ast.Attribute):
+                if n.func.attr not in _READ_CALLS_ATTRS:
+                    v.append(f"{fn.name}: method {n.func.attr}")
+                if n.func.attr == "startswith" and not (len(n.args) == 1 and isinstance(n.args[0], ast.Constant) and n.args[0].value == "{"):
+                    v.append(f"{fn.name}: startswith with something other than the JSON marker")
+                if n.func.attr in _CONTENT_METHODS and not all(isinstance(a, ast.Constant) for a in n.args):
+                    v.append(f"{fn.name}: {n.func.attr} with a non-constant argument")
+            if _call_name(n) in _CONTENT_METHODS | {"loads"}:                      # the RESULT of a content method is content too: where may it go?
+                p = pm[n]
+                ok = (isinstance(p, (ast.If, ast.IfExp, ast.BoolOp, ast.Expr, ast.Attribute, ast.BinOp))
+                      or (isinstance(p, (ast.Assign, ast.Tuple)) and _flows_into_content_names_only(n, pm))
+                      or (isinstance(p, ast.UnaryOp) and isinstance(p.op, ast.Not))
+                      or (isinstance(p, ast.Compare) and _is_none_compare(p))
+                      or (isinstance(p, ast.Call) and _call_name(p) in ("isinstance", "Opaque")))
+                if not ok:
+                    v.append(f"{fn.name}: the result of {_call_name(n)}() goes somewhere not allowed (line {n.lineno})")
+        if isinstance(n, ast.Attribute) and isinstance(n.ctx, ast.Store):
+            v.append(f"{fn.name}: attribute store")
+        if isinstance(n, ast.FormattedValue) and any(isinstance(x, ast.Name) and x.id in _CONTENT_NAMES for x in ast.walk(n.value)):
+            v.append(f"{fn.name}: content in an f-string")
+        if isinstance(n, ast.Subscript) and isinstance(n.value, ast.Name) and n.value.id == "data" and not isinstance(pm[n], ast.Attribute):
+            v.append(f"{fn.name}: a slice of the raw bytes goes somewhere not allowed (line {n.lineno})")
+        if isinstance(n, ast.Subscript) and isinstance(n.value, ast.Name) and n.value.id == "o":          # o["text"]: the value is content
+            p = pm[n]
+            if not ((isinstance(p, (ast.Tuple, ast.Assign)) and _flows_into_content_names_only(n, pm))
+                    or (isinstance(p, ast.Call) and _call_name(p) in ("str", "Opaque", "isinstance"))):
+                v.append(f"{fn.name}: a looked-up JSON value goes somewhere not allowed (line {n.lineno})")
+        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id in _CONTENT_NAMES:
+            p = pm[n]
+            ok = ((isinstance(p, ast.Attribute) and p.attr in _CONTENT_METHODS and isinstance(pm[p], ast.Call) and pm[p].func is p)
+                  or (isinstance(p, ast.Call) and _call_name(p) in ("loads", "Opaque", "isinstance"))
+                  or (isinstance(p, ast.Compare) and _is_none_compare(p))
+                  or (isinstance(p, ast.UnaryOp) and isinstance(p.op, ast.Not))
+                  or (isinstance(p, ast.Subscript) and p.value is n and ((isinstance(p.slice, ast.Constant) and n.id == "o")
+                                                                       or (isinstance(p.slice, ast.Slice) and n.id == "data")))
+                  or (isinstance(p, (ast.Tuple, ast.Assign)) and _flows_into_content_names_only(n, pm)))
+            if not ok:
+                v.append(f"{fn.name}: content name {n.id} used at line {n.lineno} other than strip()/startswith/json.loads/Opaque/constant-key lookup")
+    return v
 
 
 class RunnerHoldsNoJudgment(unittest.TestCase):
@@ -1013,33 +1321,157 @@ class RunnerHoldsNoJudgment(unittest.TestCase):
                 if isinstance(n, ast.Subscript) and isinstance(n.value, ast.Name):
                     self.assertNotIn(n.value.id, self.SENTENCE_NAMES, f"{fn.name}: indexing a sentence variable")
 
-    def test_reveal_is_called_from_exactly_one_function_and_nothing_reaches_into_the_wrapper(self) -> None:
-        tree = self.TREE
-        funcs = {n.name: n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
-        def inside(node: ast.AST, fn: ast.AST) -> bool:
-            return any(x is node for x in ast.walk(fn))
-        opaque_init = [n for c in ast.walk(tree) if isinstance(c, ast.ClassDef) and c.name == "Opaque" for n in c.body if isinstance(n, ast.FunctionDef) and n.name == "__init__"][0]
-        calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "reveal"]
-        self.assertTrue(calls)
-        for c in calls:
-            self.assertTrue(inside(c, funcs["_admit_request"]), f"reveal() called outside _admit_request at line {c.lineno}")
-        names = [n for n in ast.walk(tree) if isinstance(n, ast.Name) and n.id == "reveal"]
-        self.assertEqual(len(names), len(calls), "reveal is referenced other than by a direct call (an alias)")
-        for n in ast.walk(tree):
-            if isinstance(n, ast.Attribute) and n.attr == "_v":
-                self.assertTrue(inside(n, funcs["reveal"]) or inside(n, opaque_init), f"the wrapper's slot is touched at line {n.lineno}")
-        for n in ast.walk(tree):                      # reflection on a sentence (the patching code's getattr(module, name) is fine)
-            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in ("getattr", "setattr", "delattr", "vars", "object", "type"):
-                for arg in n.args:
-                    for x in ast.walk(arg):
-                        self.assertFalse(isinstance(x, ast.Name) and x.id in self.SENTENCE_NAMES, f"reflection on a sentence variable at line {n.lineno}")
-                        self.assertFalse(isinstance(x, ast.Attribute) and x.attr in ("text", "task"), f"reflection on a sentence field at line {n.lineno}")
-        self.assertEqual(len([n for n in ast.walk(tree) if isinstance(n, ast.Constant) and n.value == "_v"]), 1)         # only Opaque's ``__slots__ = ("_v",)``
-
     def test_the_guard_is_not_vacuous_it_sees_a_planted_comparison_and_a_from_import(self) -> None:
         planted = ast.parse("from re import search\ndef f(text):\n    return 'x' in text\n")
         self.assertTrue(any(isinstance(n, ast.ImportFrom) and n.module == "re" for n in ast.walk(planted)))
         self.assertTrue(any(isinstance(n, ast.Compare) and {x.id for x in ast.walk(n) if isinstance(x, ast.Name)} & self.SENTENCE_NAMES for n in ast.walk(planted)))
+
+
+class StructureWhitelists(unittest.TestCase):
+    """I-1''' / I-2''' / I-3''': the runner's own source obeys the whitelists above, and each whitelist sees a planted violation."""
+    SRC = (LIVE / "tools" / "blind_runner.py").read_text(encoding="utf-8")
+    TREE = ast.parse(SRC)
+
+    def _planted(self, old: str, new: str) -> ast.AST:
+        self.assertEqual(self.SRC.count(old), 1, old)
+        return ast.parse(self.SRC.replace(old, new))
+
+    def test_the_exit_functions_are_the_only_callers_of_reveal_and_their_bodies_are_whitelisted(self) -> None:
+        fns = _funcs(self.TREE)
+        for name, spec in EXIT_SPECS.items():
+            self.assertEqual(exit_violations(fns[name], spec), [], name)
+        tuple_node = [n for n in self.TREE.body if isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Name) and n.targets[0].id == "_EXIT_FUNCTIONS"][0].value
+        self.assertEqual(sorted(e.id for e in tuple_node.elts), sorted(EXIT_SPECS))                      # the runtime set == the audited set
+        self.assertEqual(sorted(f.__name__ for f in br._EXIT_FUNCTIONS), sorted(EXIT_SPECS))
+        exits = {name: set(ast.walk(fns[name])) for name in EXIT_SPECS}
+        calls = [n for n in ast.walk(self.TREE) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "reveal"]
+        self.assertEqual(len(calls), 6)
+        for c in calls:
+            self.assertTrue(any(c in nodes for nodes in exits.values()), f"reveal() called outside an exit function at line {c.lineno}")
+        names = [n for n in ast.walk(self.TREE) if isinstance(n, ast.Name) and n.id == "reveal"]
+        self.assertEqual(len(names), len(calls), "reveal is referenced other than by a direct call (an alias)")
+        inits = [set(ast.walk(f)) for f in ast.walk(self.TREE) if isinstance(f, ast.FunctionDef) and f.name == "__init__"]
+        for n in ast.walk(self.TREE):
+            if isinstance(n, ast.Attribute) and n.attr == "_v":
+                self.assertTrue(n in set(ast.walk(fns["reveal"])) or any(n in nodes for nodes in inits), f"the wrapper's slot is touched at line {n.lineno}")
+        self.assertEqual(len([n for n in ast.walk(self.TREE) if isinstance(n, ast.Constant) and n.value == "_v"]), 1)         # only ``__slots__ = ("_v",)``
+
+    def test_reveal_checks_its_caller_by_code_object_at_run_time(self) -> None:
+        import types
+        o = br.Opaque("SECRETOPAQUE")
+        alias = br.reveal
+        for how in (lambda: br.reveal(o), lambda: alias(o), lambda: getattr(sys.modules[br.__name__], "reveal")(o), lambda: vars(br)["reveal"](o),
+                    lambda: br.__dict__["reveal"](o)):
+            with self.assertRaises(TypeError):
+                how()
+        # a function with an IDENTICAL body and an equal (but not the same) code object is not an exit either
+        clone = types.FunctionType(br._dump_row.__code__.replace(), vars(br), "clone")
+        with self.assertRaises(TypeError):
+            clone({"reply": o})
+        self.assertEqual(br._dump_row({"id": "a", "reply": o}), json.dumps({"id": "a", "reply": "SECRETOPAQUE"}))          # a real exit still works
+        self.assertEqual(br._worker_history([{"task": br.Opaque("t"), "answer": br.Opaque("a")}]), [{"task": "t", "answer": "a"}])
+        with self.assertRaises(TypeError):                                           # even an exit function takes Opaque values only
+            br._dump_row({"id": "a", "reply": "a plain string"})
+        with self.assertRaises(TypeError):
+            br._worker_history([{"task": "plain", "answer": "plain"}])
+
+    def test_the_spy_and_the_recorder_only_forward_what_they_watch(self) -> None:
+        fns = _funcs(self.TREE)
+        for name in ("spy", "wrapper"):
+            self.assertEqual(watcher_violations(fns[name], self.TREE), [], name)
+
+    def test_run_one_wraps_every_production_text_where_it_reads_it(self) -> None:
+        run_one = _funcs(self.TREE)["run_one"]
+        self.assertEqual(production_text_violations(run_one, self.TREE), [])
+        reads = [n for n in _body_nodes(run_one) if isinstance(n, ast.Attribute) and n.attr in _PRODUCTION_TEXT_ATTRS]
+        self.assertEqual(sorted(n.attr for n in reads), ["objective", "text", "text"])               # job.objective, res.speak.text, out.text: all wrapped
+
+    def test_the_whole_file_has_no_way_into_a_slot_or_the_modules_namespace_and_no_stash(self) -> None:
+        self.assertEqual(whole_file_violations(self.TREE), [])
+
+    def test_the_readers_only_strip_test_for_the_json_marker_parse_and_wrap(self) -> None:
+        fns = _funcs(self.TREE)
+        for name in ("read_sentences", "read_history", "_utf8_or_exit"):
+            self.assertEqual(read_violations(fns[name], self.TREE), [], name)
+
+    def test_each_whitelist_sees_a_planted_violation(self) -> None:
+        def seen(kind, old, new, fname=None):
+            tree = self._planted(old, new)
+            fns = _funcs(tree)
+            if kind == "exit":
+                return exit_violations(fns[fname], EXIT_SPECS[fname])
+            if kind == "watch":
+                return watcher_violations(fns[fname], tree)
+            if kind == "prod":
+                return production_text_violations(fns["run_one"], tree)
+            if kind == "whole":
+                return whole_file_violations(tree)
+            return read_violations(fns[fname], tree)
+        planted = [
+            ("exit", "    raw = reveal(text)\n", "    raw = reveal(text)\n    if 'qzxw' in raw:\n        raw = ''\n", "_admit_request"),
+            ("exit", "    raw = reveal(text)\n", "    raw = reveal(text)\n    _x = json.dumps(raw)\n", "_admit_request"),
+            ("exit", "    return C.TaskContext(", "    _y = reveal(objective).startswith('q')\n    return C.TaskContext(", "_task_context"),
+            ("exit", 'return json.dumps({**row, "reply": reveal(row["reply"])}, ensure_ascii=False)',
+             'return json.dumps({**row, "reply": reveal(row["reply"]), "n": len(row)}, ensure_ascii=False)', "_dump_row"),
+            ("watch", '        rec.route = jev_client.choice_answer(resp, "route")\n',
+             "        if 'qzxw' in state['utterance']:\n            rec.route = 'x'\n" + '        rec.route = jev_client.choice_answer(resp, "route")\n', "spy"),
+            ("watch", "            r = fn(*a, **k)\n", "            r = fn(*a, **k)\n            _t = str(a)\n", "wrapper"),
+            ("prod", "        job = res.job\n", "        job = res.job\n        if 'qzxw' in job.objective:\n            row['handled_by'] = 'fast'\n"),
+            ("prod", "        reply = Opaque(out.text)", "        reply = Opaque(out.text)\n        if 'qzxw' in out.text:\n            pass\n"),
+            ("prod", "        if res.job is None:\n", "        if 'qzxw' in str(res.speak):\n            row['handled_by'] = 'fast'\n        if res.job is None:\n"),
+            ("whole", "import json\n", "import json\nimport gc\n"),
+            ("whole", "ALLOW_REAL_ENV = ", "_STASH = []\nALLOW_REAL_ENV = "),
+            ("whole", "def read_history(path: str)", "def _k(x, cache=[]):\n    return cache\n\n\ndef read_history(path: str)"),
+            ("read", "            if not line:\n                continue\n", "            if 'qzxw' in line:\n                continue\n            if not line:\n                continue\n", "read_sentences"),
+            ("read", '                sid = f"s{len(out) + 1:04d}"\n', '                sid = f"s{len(out) + 1:04d}"\n                _alias = line\n', "read_sentences"),
+            ("read", "            if not line.strip():\n                continue\n", "            if len(line) > 3 and not line.strip():\n                continue\n", "read_history"),
+        ]
+        for case in planted:
+            kind, old, new, *rest = case
+            self.assertTrue(seen(kind, old, new, rest[0] if rest else None), f"not seen: {kind} {new[:50]!r}")
+
+    def test_inputs_with_other_characters_but_the_same_line_structure_read_the_same_way(self) -> None:
+        """I-3''': what the readers return (the number of sentences, their ids, whether each has a task, the history length) depends on the line
+        structure only (blank lines, a leading brace, the JSON keys), never on what the lines say."""
+        def structure(words: list[str]) -> tuple:
+            w = words
+            lines = [w[0], "", w[1], json.dumps({"id": "case-1", "text": w[2]}), "   ", json.dumps({"text": w[3], "task": w[4]}), "  " + w[5] + "  ",
+                     json.dumps({"id": "z9", "text": w[6]}), w[7]]
+            with tempfile.TemporaryDirectory() as d:
+                inp = _write(d, lines, "in.jsonl")
+                sents = br.read_sentences(inp)
+                hist = _write(d, [json.dumps({"task": w[0], "answer": w[1]}), "", json.dumps({"task": w[2]}), json.dumps({"answer": w[3]})], "h.jsonl")
+                h = br.read_history(hist)
+            return ([s.id for s in sents], [s.task is not None for s in sents], [type(s.text) is br.Opaque for s in sents], len(h),
+                    [sorted(x) for x in h])
+        base = structure(["alpha", "beta", "gamma", "delta", "eps", "zeta", "eta", "theta"])
+        # characters of every kind, words a runner might fork on, JSON-looking and brace-leading texts (inside a string value), very long and very short
+        sets = [["qzxw", "weather", "天气怎么样", "取消", "记住我喜欢", "}", "{", "x"], ["a" * 500, "好", "\u3000x", "。", "NULL", "true", "{\"a\": 1}", "[1]"],
+                ["今天北京天气", "stop", "停", "cancel", "你好", "zq", "qzxw qzxw", "id"], ["#", "//", "--", "\\", "'", "\"", "{}", "%s"],
+                ["\U0001F600", "é", "ß", "İ", "ǅ", "٣", "ⅷ", "x\u200b"], ["8", "88号", "eighty", "两万三", "http://x", "a@b.c", "C:\\x", "../.."]]
+        for words in sets:
+            self.assertEqual(structure(words), base, words)
+
+    def test_the_utf8_error_line_number_counts_breaks_the_way_the_readers_do(self) -> None:
+        """S-2''': a lone CR, CRLF and LF are one break each in the readers' text mode; the UTF-8 message uses the same count, so the numbers agree."""
+        seps = [b"\n", b"\r\n", b"\r", b"\r\r\n", b"\n\r"]
+        with tempfile.TemporaryDirectory() as d:
+            for i, sep in enumerate(seps):
+                parts = [b"one", b"two", b"th\xffree", b"four"]
+                path = os.path.join(d, f"bad{i}.bin")
+                open(path, "wb").write(sep.join(parts))
+                with self.assertRaises(SystemExit) as cm:
+                    br._utf8_or_exit(path, "input file")
+                with open(path, "rb") as fb:                                    # what a text-mode reader makes of the same file, up to the bad byte
+                    good = fb.read().split(b"\xff")[0]
+                lines_before = len(io.StringIO(good.decode("utf-8"), newline=None).readlines())
+                self.assertIn(f"line {lines_before}", str(cm.exception), sep)
+                # and a JSON error on the same physical line is reported with the same number by read_sentences
+                good_path = os.path.join(d, f"badjson{i}.txt")
+                open(good_path, "wb").write(sep.join([b"one", b"two", b"{not json", b"four"]))
+                with self.assertRaises(SystemExit) as cm2:
+                    br.read_sentences(good_path)
+                self.assertEqual(str(cm2.exception).split(":")[0], f"input line {lines_before}", sep)
 
 
 if __name__ == "__main__":

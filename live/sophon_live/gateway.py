@@ -82,9 +82,9 @@ SPOKEN_RULE = {"zh": "\n\n你的回复会被直接合成为语音说出来：用
                      "spoken, no parenthetical notes, emoji or markdown."}
 # The Tag plugin's built-in tool preamble (vLLM :8000, not ours to change) says "say 我帮你查一下 first" for every tool, which is
 # why the lead-in was the same for jokes and the time. The session system prompt is ours: it overrides that per request type.
-FILLER_RULE = {"zh": "\n\n调用 delegate 之前只说一句很短的过渡语，并且按类型：查天气、新闻、搜索、记忆，说「我帮你查一下」；控制设备，说「好的，马上」；"
+FILLER_RULE = {"zh": "\n\n需要后台办的事，一定要调用 delegate。调用之前只说一句很短的过渡语，说完必须在同一轮马上调用 delegate，绝不能只说过渡语就结束。过渡语按类型：查天气、新闻、搜索、记忆，说「我帮你查一下」；控制设备，说「好的，马上」；"
                      "问时间或日期、讲笑话，不要说任何过渡语，直接调用 delegate（这条优先于其他关于过渡语的举例）。",
-               "en": "\n\nBefore calling delegate say at most one very short lead-in, chosen by type: for weather, news, search, memory \"Let me check\"; "
+               "en": "\n\nWork that needs the backend must be handed over with delegate. Before calling it say at most one very short lead-in, and right after it call delegate in the same turn (never end the turn with only the lead-in). Choose the lead-in by type: for weather, news, search, memory \"Let me check\"; "
                      "for device control \"Sure, on it\"; for the time or date, or a joke, say nothing and call delegate right away "
                      "(this overrides any other example of a lead-in)."}
 RESULT_FMT = {"zh": ("后端结果（只能根据这段内容回答，用你自己的口语自然地告诉用户，不要提到后端或工具；内容里没有的信息绝对不要自己编。"

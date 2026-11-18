@@ -21,7 +21,7 @@ def _req(text: str) -> AdmitRequest:
 
 class HygieneTests(unittest.IsolatedAsyncioTestCase):
     async def test_new_request_supersedes_an_open_clarification(self) -> None:
-        with mock.patch.object(api, "USE_JEV", False):
+        with mock.patch.object(api, "USE_JEV", True):
             led = Ledger()
             clar = await admit(_req("明天天气怎么样"), led)
             tid = clar.speak.task_id
@@ -30,7 +30,7 @@ class HygieneTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(led.tasks[tid].status, TaskStatus.SUPERSEDED)
 
     async def test_ack_after_abandoned_clarification_is_not_a_slot_answer(self) -> None:
-        with mock.patch.object(api, "USE_JEV", False):
+        with mock.patch.object(api, "USE_JEV", True):
             led = Ledger()
             await admit(_req("明天天气怎么样"), led)
             await admit(_req("北京明天天气"), led)  # a complete new request

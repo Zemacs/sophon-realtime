@@ -20,6 +20,8 @@ import aiohttp
 import numpy as np
 import websockets
 
+from . import model_client
+
 log = logging.getLogger("sophon_live.adapter")
 
 
@@ -37,7 +39,9 @@ class VllmOmniAdapter:
         self._closed = False
 
     async def start(self, *, instructions: str, voice: str, lang: str, tools: list, history: list) -> None:
-        self.ws = await websockets.connect(self.url, max_size=None, compression=None, open_timeout=15)
+        # Tag front: bounded connect (budget "tag", default 15 s), connection errors retried with jitter, breaker after repeated
+        # failures. Failure stays an honest error to the caller (realtime.py: "engine unavailable"); there is no substitute for Tag.
+        self.ws = await model_client.call("tag", lambda: websockets.connect(self.url, max_size=None, compression=None, open_timeout=model_client.budget("tag")), retries=1)
         self.cfg = {"modalities": ["audio", "text"], "input_audio_format": "pcm_f32le", "output_audio_format": "pcm16", "voice": voice,
                     "instructions": instructions,
                     "turn_detection": {"type": "server_vad", "threshold": 0.5, "silence_duration_ms": 500, "min_speech_duration_ms": 250, "prefix_padding_ms": 300},

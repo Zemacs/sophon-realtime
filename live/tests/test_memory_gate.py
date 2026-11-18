@@ -194,7 +194,7 @@ class GatewayBindingTests(GateCase):
             return "北京明天晴。"
 
         _arm(session, "d1", "北京明天天气")
-        with mock.patch.object(api, "USE_JEV", False), mock.patch.object(tools, "run_worker_job", as_worker(orch)):
+        with mock.patch.object(api, "USE_JEV", True), mock.patch.object(tools, "run_worker_job", as_worker(orch)):
             _run(session._coord_resolve("d1", "北京明天天气"))
         tid = session.coord_ledger.order[0]
         self.assertEqual(self.stored(), {})
@@ -214,7 +214,7 @@ class GatewayBindingTests(GateCase):
             return "好的，记住了。"
 
         _arm(session, "d1", "记住我喜欢美式")
-        with mock.patch.object(api, "USE_JEV", False), mock.patch.object(tools, "run_worker_job", as_worker(orch)):
+        with mock.patch.object(api, "USE_JEV", True), mock.patch.object(tools, "run_worker_job", as_worker(orch)):
             _run(session._coord_resolve("d1", "记住我喜欢美式"))
         self.assertEqual(self.stored(), {"coffee": "美式"})
 

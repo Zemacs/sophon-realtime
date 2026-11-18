@@ -751,7 +751,8 @@ class LiveSession:
         if tr is not None:
             tr.mark("route")
             tr.set(route=result.route, decision=result.control.op if result.control else ("NEW" if result.job else result.route),
-                   via=result.via, jev_ms=None if result.jev_ms is None else round(result.jev_ms))
+                   via=result.via, jev_ms=None if result.jev_ms is None else round(result.jev_ms),
+                   jev_state=result.jev_state, degraded_reason=result.degraded_reason)
         # CANCEL / REFINE: the old (task_id, version) must stop now; its result is never spoken.
         stale = getattr(result, "stale_task", None)
         if stale is not None:
@@ -983,6 +984,23 @@ def runtime_banner(env=None) -> tuple[str, bool]:  # noqa: ANN001
             f"Set SOPHON_LIVE_COORD=1 (see docs/runbook-path1-coord.md); ORCH={int(orch)}"), False
 
 
+def jev_startup_wanted(env=None) -> bool:  # noqa: ANN001
+    """Probe / wait for JEV at start-up only when this process will actually ask it (Coordinator path with JEV on)."""
+    return _flag("SOPHON_LIVE_COORD", env) and (os.environ.get("SOPHON_LIVE_JEV", "1") if env is None else env.get("SOPHON_LIVE_JEV", "1")).strip().lower() in ("1", "true", "yes", "on")
+
+
+async def jev_startup_check(max_wait: float | None = None, url: str | None = None) -> tuple[str, bool]:
+    """Wait (bounded) for JEV's ``/healthz`` and say so in one line. Not ready after the bound -> start anyway, in degraded mode:
+    every turn takes the degraded path (fixed sentence / new task for the orchestrator) until the background prober sees JEV."""
+    from .coordinator import jev_client
+    ready, waited, detail = await jev_client.wait_ready(url, max_wait=max_wait)
+    endpoint = jev_client._endpoint(url)
+    if ready:
+        return f"JEV ready: {jev_client.healthz_url(endpoint)} ok after {waited:.1f}s ({detail})", True
+    return (f"JEV NOT READY after {waited:.1f}s ({detail}): starting in DEGRADED mode; turns use the degraded path "
+            f"(via=degraded) until {jev_client.healthz_url(endpoint)} answers (background probe every {jev_client.CFG.probe_interval:.0f}s)"), False
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="0.0.0.0"); ap.add_argument("--port", type=int, default=8780)
@@ -1071,6 +1089,12 @@ def main() -> None:
             await s.close("client_disconnected")
 
     async def run():
+        prober = None
+        if jev_startup_wanted():
+            msg, ready = await jev_startup_check()          # bounded wait for /healthz; never blocks start-up for good
+            (log.info if ready else log.warning)("%s", msg)
+            from .coordinator import jev_client
+            prober = asyncio.create_task(jev_client.probe_loop())
         async with websockets.serve(handler, args.host, args.port, max_size=None, compression=None, process_request=process_request):
             log.info("Sophon Live gateway on ws://%s:%d%s -> %s", args.host, args.port, args.path, args.engine)
             banner, intended = runtime_banner()

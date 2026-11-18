@@ -17,6 +17,8 @@ _LIVE_ROOT = Path(__file__).resolve().parents[1]
 if str(_LIVE_ROOT) not in sys.path:
     sys.path.insert(0, str(_LIVE_ROOT))
 
+from sophon_live.coordinator import route as route_mod  # noqa: E402
+from tests import jev_standin  # noqa: E402  (scripted JEV for control-flow tests)
 from sophon_live.assistant_tools import orchestrator as orch
 from sophon_live.coordinator import Ledger, WorkerJob, WorkerResult, clarify_for_slots, finish_job
 from sophon_live.coordinator.schemas import TaskStatus
@@ -176,7 +178,7 @@ class GatewayWorkerTests(unittest.IsolatedAsyncioTestCase):
 
         session = _session()
         seen: list[str] = []
-        real_route = api.heuristic_route
+        real_route = route_mod.heuristic_route
 
         async def worker(job, instructions="", history=None):
             seen.append(job.objective)
@@ -187,8 +189,8 @@ class GatewayWorkerTests(unittest.IsolatedAsyncioTestCase):
         _arm(session, "d1", "明天天气怎么样")
         _arm(session, "d2", "北京的")
         # 「明天天气怎么样」 already gets a C-layer CLARIFY from admit; force the Worker path instead
-        with mock.patch.object(api, "USE_JEV", False), mock.patch.object(tools, "run_worker_job", worker), \
-                mock.patch.object(api, "heuristic_route", lambda text, led: "WORKER" if text == "明天天气怎么样" else real_route(text, led)):
+        with jev_standin.standin(), mock.patch.object(tools, "run_worker_job", worker), \
+                mock.patch.object(route_mod, "heuristic_route", lambda text, led: "WORKER" if text == "明天天气怎么样" else real_route(text, led)):
             await session._coord_resolve("d1", "明天天气怎么样")
             tid = session.coord_ledger.order[0]
             self.assertEqual(session.coord_ledger.tasks[tid].status, TaskStatus.NEEDS_INPUT)

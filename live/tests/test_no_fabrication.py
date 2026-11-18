@@ -19,8 +19,7 @@ if str(_LIVE_ROOT) not in sys.path:
 from sophon_live.assistant_tools import orchestrator as orch
 from sophon_live.assistant_tools.registry import list_tool_names
 from sophon_live.coordinator import AdmitRequest, Ledger, WorkerJob, WorkerResult, admit, api, finish_job, intent
-from sophon_live.coordinator.api import NO_TOOL_ANSWER
-from sophon_live.coordinator.schemas import TaskStatus
+from sophon_live.coordinator.schemas import FAILED_GENERIC, NO_TOOL_ANSWER, TaskStatus
 from tests.test_orch_worker import _job, _say, _tool_call
 from tests.test_orchestrator import _FakeResp, _FakeSession
 from tests.test_refine_guard import _jev, _ledger
@@ -140,12 +139,12 @@ class WorkerGuardTests(unittest.IsolatedAsyncioTestCase):
 
 
 class FinishJobGuardTests(unittest.TestCase):
-    def _run(self, evidence: list[dict], status: str = "completed", require=("get_weather",)):
+    def _run(self, evidence: list[dict], status: str = "completed", require=("get_weather",), say: str = "北京晴，零下三到十一度。"):
         led = Ledger()
         rec = led.create("明天北京会下雨吗")
         led.mark_running(rec.task_id)
         job = WorkerJob(task_id=rec.task_id, version=rec.version, objective=rec.objective, require_tools=list(require))
-        res = WorkerResult(task_id=rec.task_id, version=rec.version, status=status, spoken_answer="北京晴，零下三到十一度。", evidence=evidence)
+        res = WorkerResult(task_id=rec.task_id, version=rec.version, status=status, spoken_answer=say, evidence=evidence)
         return led, rec, finish_job(led, job, res)
 
     def test_answer_without_tool_evidence_is_rejected(self) -> None:
@@ -184,9 +183,79 @@ class FinishJobGuardTests(unittest.TestCase):
         _, _, out = self._run([], require=())
         self.assertEqual((out.kind, out.rejected), ("answer", ""))
 
-    def test_failed_and_needs_input_results_pass_through(self) -> None:
-        _, _, out = self._run([], status="failed")
-        self.assertEqual(out.rejected, "")
+    def test_failed_result_with_a_fixed_honest_sentence_is_spoken(self) -> None:
+        # (r1 expected a failed result to pass its free text through, Q3 fake included; Critic I-5 tightened it:
+        # only fixed honest sentences or a failed required tool's own sentence are ever spoken for a FAILED job.)
+        led = Ledger()
+        rec = led.create("明天北京会下雨吗")
+        led.mark_running(rec.task_id)
+        job = WorkerJob(task_id=rec.task_id, version=rec.version, objective=rec.objective, require_tools=["get_weather"])
+        res = WorkerResult(task_id=rec.task_id, version=rec.version, status="failed", spoken_answer="后台模型暂时不可用，请稍后再试。")
+        out = finish_job(led, job, res)
+        self.assertEqual((out.text, out.rejected), ("后台模型暂时不可用，请稍后再试。", ""))
+        self.assertEqual(led.tasks[rec.task_id].status, TaskStatus.FAILED)
+
+    def test_failed_required_tool_own_sentence_is_spoken_only_when_the_evidence_carries_it(self) -> None:
+        sentence = "暂时查不到北京的天气，请稍后再试。"
+        _, _, out = self._run([{"tool": "get_weather", "ok": False, "failure_text": sentence}], status="failed", say=sentence)
+        self.assertEqual((out.text, out.rejected), (sentence, ""))
+        _, _, out = self._run([{"tool": "get_weather", "ok": False}], status="failed", say=sentence)          # same words, no evidence of them
+        self.assertEqual((out.text, out.rejected), (NO_TOOL_ANSWER, "failed_text"))
+
+
+class MutationFakeNeverSpokenTests(unittest.TestCase):
+    """Critic I-5, finish_job as the LAST line of defence: the Q3 fake sentence must never reach the user,
+    whatever the (mutated / dishonest) Worker reports."""
+
+    FAKE = "北京晴，零下三到十一度。"
+
+    def _out(self, status: str, evidence: list[dict]):
+        led = Ledger()
+        rec = led.create("明天北京会下雨吗")
+        led.mark_running(rec.task_id)
+        job = WorkerJob(task_id=rec.task_id, version=rec.version, objective=rec.objective, require_tools=["get_weather"])
+        res = WorkerResult(task_id=rec.task_id, version=rec.version, status=status, spoken_answer=self.FAKE, evidence=evidence)
+        return led, rec, finish_job(led, job, res)
+
+    def test_the_fake_is_blocked_in_every_shape(self) -> None:
+        shapes = {
+            "completed, no evidence": ("completed", []),
+            "completed, tool without ok": ("completed", [{"tool": "get_weather"}]),            # Critic's hole 1: missing ok != success
+            "completed, ok=None": ("completed", [{"tool": "get_weather", "ok": None}]),
+            "completed, ok='yes' (not True)": ("completed", [{"tool": "get_weather", "ok": "yes"}]),
+            "completed, ok=False": ("completed", [{"tool": "get_weather", "ok": False}]),
+            "failed, no evidence": ("failed", []),                                              # Critic's hole 2: failed passed free text
+            "failed, ok=False": ("failed", [{"tool": "get_weather", "ok": False}]),
+            "failed, ok=True": ("failed", [{"tool": "get_weather", "ok": True}]),
+            "failed, failure_text is something else": ("failed", [{"tool": "get_weather", "ok": False, "failure_text": "别的话"}]),
+        }
+        for name, (status, ev) in shapes.items():
+            led, rec, out = self._out(status, ev)
+            self.assertNotIn("零下", out.text, name)
+            self.assertNotIn(self.FAKE, led.tasks[rec.task_id].spoken_answer, name)
+            self.assertEqual(out.text, NO_TOOL_ANSWER, name)
+            self.assertEqual(led.tasks[rec.task_id].status, TaskStatus.FAILED, name)
+
+    def test_the_only_way_through_is_a_successful_call(self) -> None:
+        _, _, out = self._out("completed", [{"tool": "get_weather", "ok": True}])
+        self.assertEqual(out.text, self.FAKE)           # (the numbers themselves are checked by the acceptance judge, not here)
+
+    def test_non_tool_job_failure_gets_the_generic_sentence_not_model_text(self) -> None:
+        led = Ledger()
+        rec = led.create("讲个笑话")
+        led.mark_running(rec.task_id)
+        job = WorkerJob(task_id=rec.task_id, version=rec.version, objective=rec.objective)
+        out = finish_job(led, job, WorkerResult(rec.task_id, rec.version, "failed", "编出来的话"))
+        self.assertEqual((out.text, out.rejected), (FAILED_GENERIC, "failed_text"))
+
+    def test_needs_input_text_from_the_worker_is_never_spoken(self) -> None:
+        led = Ledger()
+        rec = led.create("明天天气")
+        led.mark_running(rec.task_id)
+        job = WorkerJob(task_id=rec.task_id, version=rec.version, objective=rec.objective, require_tools=["get_weather"])
+        out = finish_job(led, job, WorkerResult(rec.task_id, rec.version, "needs_input", "晴，零下三度", needs_slots=["city"]))
+        self.assertEqual(out.kind, "clarify")
+        self.assertNotIn("零下", out.text)
 
 
 if __name__ == "__main__":

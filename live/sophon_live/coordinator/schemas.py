@@ -41,6 +41,25 @@ class SpeakPlan:
     version: int | None = None
 
 
+# The only sentences a *failed* WorkerResult may carry to the user's ears (besides a failed required tool's own sentence,
+# which the Worker records as evidence ``failure_text``). Model free text is never spoken for a failed job (Critic I-5).
+NO_TOOL_ANSWER = "这个我这边没查到准确结果，你再问我一次吧。"
+FAILED_GENERIC = "这个我这边没办成，你再问我一次吧。"
+FIXED_FAILURES = frozenset({
+    NO_TOOL_ANSWER,
+    FAILED_GENERIC,
+    "后台模型暂时不可用，请稍后再试。",
+    "后台模型连接失败，请稍后再试。",
+    "我还在查，请稍等一下再问一次。",
+    "后台编排出错了，请稍后再试。",
+})
+
+
+def tool_succeeded(ev: dict) -> bool:
+    """A tool call counts as evidence only when the Worker says ``ok`` is exactly True (a missing ``ok`` is NOT success)."""
+    return ev.get("ok") is True and not ev.get("missing") and not ev.get("refused")
+
+
 def freshness_token_for(task_id: str, version: int) -> str:
     """The one place that spells the token: it names exactly one (task_id, version) of the Ledger."""
     return f"{task_id}:{version}"

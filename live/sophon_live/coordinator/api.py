@@ -11,6 +11,7 @@ from .clarify import clarify_for_slots, missing_slots_for_text
 from .ledger import Ledger
 from .route import build_route_questions, build_state, heuristic_control, heuristic_route, slot_edit
 from .schemas import AdmitRequest, ControlDecision, PlaybackReceipt, SpeakPlan, TaskStatus, WorkerJob, WorkerResult, freshness_token_for
+from .schemas import FAILED_GENERIC, FIXED_FAILURES, NO_TOOL_ANSWER, tool_succeeded
 
 log = logging.getLogger("sophon_live.coordinator")
 
@@ -259,9 +260,6 @@ def complete_job(ledger: Ledger, job: WorkerJob, answer: str) -> bool:
     return ledger.mark_completed(job.task_id, answer)
 
 
-NO_TOOL_ANSWER = "这个我这边没查到准确结果，你再问我一次吧。"
-
-
 @dataclass
 class JobOutcome:
     """What the Coordinator wants said for a finished WorkerResult."""
@@ -279,7 +277,19 @@ def _ungrounded(job: WorkerJob, result: WorkerResult) -> bool:
     A call that failed (``ok`` false) is not evidence either: after a failed tool the model would only be guessing."""
     if not job.require_tools or result.status != "completed":
         return False
-    return not any(ev.get("tool") in job.require_tools and ev.get("ok") is not False and not ev.get("missing") for ev in result.evidence)
+    return not any(ev.get("tool") in job.require_tools and tool_succeeded(ev) for ev in result.evidence)
+
+
+def _failure_text(job: WorkerJob, result: WorkerResult) -> str:
+    """What may be said for a FAILED result: a fixed honest sentence, or the failed required tool's own sentence
+    (recorded by the Worker as evidence ``failure_text``). Anything else is model free text: replaced (Critic I-5)."""
+    said = (result.spoken_answer or "").strip()
+    if said in FIXED_FAILURES:
+        return said
+    if said and any(ev.get("tool") in (job.require_tools or []) and ev.get("ok") is False and ev.get("failure_text") == said
+                    for ev in result.evidence):
+        return said
+    return NO_TOOL_ANSWER if job.require_tools else FAILED_GENERIC
 
 
 def finish_job(ledger: Ledger, job: WorkerJob, result: WorkerResult) -> JobOutcome:
@@ -312,9 +322,16 @@ def finish_job(ledger: Ledger, job: WorkerJob, result: WorkerResult) -> JobOutco
         tried = any(ev.get("tool") in job.require_tools for ev in result.evidence)
         return JobOutcome(kind="answer", text=NO_TOOL_ANSWER, task_id=job.task_id, version=job.version,
                           rejected="tool_failed" if tried else "no_tool_result")
+    if result.status == "failed":
+        text = _failure_text(job, result)
+        replaced = text != (result.spoken_answer or "").strip()
+        if replaced:
+            log.warning("replace free-text failure task=%s v%s answer=%r", job.task_id, job.version, (result.spoken_answer or "")[:60])
+        if not ledger.mark_failed(job.task_id, text):
+            return stale
+        return JobOutcome(kind="answer", text=text, task_id=job.task_id, version=job.version, rejected="failed_text" if replaced else "")
     text = (result.spoken_answer or "").strip() or "好的，我这边查过了。"
-    ok = ledger.mark_failed(job.task_id, text) if result.status == "failed" else ledger.mark_completed(job.task_id, text)
-    if not ok:
+    if not ledger.mark_completed(job.task_id, text):
         return stale
     return JobOutcome(kind="answer", text=text, task_id=job.task_id, version=job.version)
 

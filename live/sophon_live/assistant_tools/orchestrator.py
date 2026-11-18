@@ -18,7 +18,7 @@ import aiohttp
 
 from ..coordinator import slots
 from ..coordinator.clarify import clarify_for_slots
-from ..coordinator.schemas import WorkerJob, WorkerResult
+from ..coordinator.schemas import NO_TOOL_ANSWER, WorkerJob, WorkerResult, tool_succeeded
 from . import toolmeta
 from .registry import TOOL_SCHEMAS
 from .runner import run_tool
@@ -145,7 +145,7 @@ def _ungrounded_city(name: str, args: dict, msgs: list[dict[str, Any]]) -> bool:
 def _evidence_has_required(job: WorkerJob, evidence: list[dict]) -> bool:
     """True when the job needs no tool, or at least one of its required tools was called AND succeeded (``ok``)."""
     req = [t for t in (job.require_tools or []) if _in_scope(job, t)]
-    return not req or any(ev.get("tool") in req and ev.get("ok") is not False and not ev.get("missing") for ev in evidence)
+    return not req or any(ev.get("tool") in req and tool_succeeded(ev) for ev in evidence)
 
 
 def _tool_failure_text(out: str) -> str:
@@ -165,9 +165,6 @@ def _force_choice(job: WorkerJob) -> Any:
     if len(req) == 1:
         return {"type": "function", "function": {"name": req[0]}}
     return "required"
-
-
-NO_TOOL_ANSWER = "这个我这边没查到准确结果，你再问我一次吧。"
 
 
 def _in_scope(job: WorkerJob, name: str) -> bool:
@@ -320,7 +317,9 @@ async def run_job(
                     # A tool-backed job whose tool failed: say so plainly. The model never gets to word it, it could
                     # "recover" with numbers of its own (Critic B-1).
                     log.warning("orch step=%d required tool %s failed -> failed with the tool's own sentence", step, name)
-                    return _result(job, "failed", _tool_failure_text(out), evidence)
+                    text = _tool_failure_text(out)
+                    evidence[-1]["failure_text"] = text      # the Coordinator may speak exactly this sentence for the failed job
+                    return _result(job, "failed", text, evidence)
                 news_ok = name == "get_news" and ("第1条" in out or "Headlines on" in out) and not failed
                 weather_ok = name == "get_weather" and ("度" in out or "°" in out or "°C" in out) and not failed
                 if news_ok or weather_ok:

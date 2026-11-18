@@ -16,7 +16,7 @@ if str(_LIVE_ROOT) not in sys.path:
 
 from sophon_live.assistant_tools import orchestrator as orch
 from sophon_live.coordinator import Ledger, WorkerJob, WorkerResult, api, finish_job
-from sophon_live.coordinator.api import NO_TOOL_ANSWER
+from sophon_live.coordinator.schemas import NO_TOOL_ANSWER
 from sophon_live.coordinator.schemas import TaskStatus, freshness_token_for
 from tests.test_gateway_coord_control import _commentary, _session
 from tests.test_orch_worker import _say, _tool_call
@@ -132,6 +132,24 @@ class ToolFailureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(sess.posts), 1)                      # the model never got to paraphrase / invent
         self.assertEqual((res.status, res.spoken_answer), ("failed", tool_says))
         self.assertFalse(res.evidence[0]["ok"])
+
+    def test_orchestrator_counts_only_ok_true_as_success(self) -> None:
+        job = WorkerJob(task_id="t", version=1, objective="北京天气", require_tools=["get_weather"])
+        for ev in ({"tool": "get_weather"}, {"tool": "get_weather", "ok": None}, {"tool": "get_weather", "ok": False}):
+            self.assertFalse(orch._evidence_has_required(job, [ev]), ev)
+        self.assertTrue(orch._evidence_has_required(job, [{"tool": "get_weather", "ok": True}]))
+
+    async def test_failed_required_tool_records_its_own_sentence_as_evidence(self) -> None:
+        sess = _FakeSession([_FakeResp(200, _tool_call("get_weather", '{"city":"北京"}'))])
+        job = WorkerJob(task_id="t1", version=1, objective="北京天气", require_tools=["get_weather"])
+        said = "暂时查不到北京的天气，请稍后再试。"
+        with mock.patch.object(orch.aiohttp, "ClientSession", return_value=sess), mock.patch.object(orch, "run_tool", new=mock.AsyncMock(return_value=said)):
+            res = await orch.run_job(job)
+        self.assertEqual(res.evidence[0]["failure_text"], said)
+        led = Ledger(); rec = led.create("北京天气"); led.mark_running(rec.task_id)
+        job2 = WorkerJob(task_id=rec.task_id, version=rec.version, objective="北京天气", require_tools=["get_weather"])
+        res.task_id, res.version = rec.task_id, rec.version
+        self.assertEqual(finish_job(led, job2, res).text, said)       # spoken, because the evidence vouches for it
 
     async def test_machine_looking_tool_failure_falls_back_to_the_generic_sentence(self) -> None:
         sess = _FakeSession([_FakeResp(200, _tool_call("get_weather", '{"city":"北京"}'))])

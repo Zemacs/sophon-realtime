@@ -184,7 +184,7 @@ class RealtimeSession:
         self.tasks: list = []
         self.lang = "en"
         self.resp: dict | None = None          # current response {id, item_id, text, done, calls:[...], audio_s}
-        self.pending_outputs: list = []        # (call_id, output) from conversation.item.create(function_call_output)
+        self.pending_outputs: list = []        # (call_id, output, failed) from conversation.item.create(function_call_output); failed = grounding.output_failed(item)
         self.heard: list = []                  # ASR text of each caller turn (always transcribed, for the grounding guard)
         self.seen: list = []                   # tool outputs (+ instructions / tool schema) the agent has seen
         self.asr_tasks: list = []
@@ -291,7 +291,7 @@ class RealtimeSession:
                 if fut is not None:
                     if not fut.done(): fut.set_result(str(item.get("output", "")))
                 else:
-                    self.pending_outputs.append((item.get("call_id"), str(item.get("output", ""))))
+                    self.pending_outputs.append((item.get("call_id"), str(item.get("output", "")), grounding.output_failed(item)))
                 item = dict(item, id=item.get("id") or _id("item"), object="realtime.item", status="completed")
                 await self.send({"type": "conversation.item.added", "previous_item_id": ev.get("previous_item_id"), "item": item})
                 await self.send({"type": "conversation.item.done", "previous_item_id": ev.get("previous_item_id"), "item": item})
@@ -309,9 +309,9 @@ class RealtimeSession:
             r["empty_timer"] = asyncio.get_running_loop().call_later(12.0, lambda: asyncio.ensure_future(self._finish_if_empty(r)))
             if self.pending_outputs:
                 outs, self.pending_outputs = self.pending_outputs, []
-                for i, (cid, out) in enumerate(outs):
+                for i, (cid, out, failed) in enumerate(outs):
                     self.seen.append(out)
-                    if GROUND: out = out + grounding.failure_hint(out, self.heard)
+                    if GROUND: out = out + grounding.failure_hint(failed, self.heard)
                     await self.engine.tool_result(cid, out, speak=(i == len(outs) - 1))
                 log.info("realtime %s: %d tool result(s) -> follow-up", self.id, len(outs))
             # otherwise the engine answers on its own turn detection; nothing to force

@@ -29,7 +29,7 @@
 前端仍只调用 `delegate`。
 
 - **推荐：** `SOPHON_LIVE_ORCH=1` → `orchestrator.py` 调本地 vLLM，用上表 schemas 选型，再 `run_tool` 执行并 `commentary` 回灌（`backend=orch`）。  
-- **遗留演示：** `SOPHON_LIVE_BUILTIN_TOOLS=1` → 启发式 `run_task`（**不是**正式架构）。
+- **已删除（Round 4g）：** 旧的启发式 `SOPHON_LIVE_BUILTIN_TOOLS` / `run_task`（用关键词给任务选工具，违反「模型判断、代码只强制」）。该环境变量不再有任何作用。
 
 ## 3. 启用（路径 1 共置编排）
 
@@ -41,14 +41,14 @@ export SOPHON_LIVE_ORCH_MODEL=qwen3.8-27b-bo
 BUILD=tag PORT=8000 LIVE_PORT=8780 bash start_live.sh
 ```
 
-测试页收到 `delegation.backend === "orch"`（或 `"builtin"`）时不再跑浏览器 demoBackend。总方案见 deplux `docs/sophon-path1-colocated-backend.md`。
+测试页收到 `delegation.backend === "orch"`时不再跑浏览器 demoBackend。总方案见 deplux `docs/sophon-path1-colocated-backend.md`。
 
 ## 4. 架构选择（通用助手）
 
 ```text
 用户语音 → LiveSession → 引擎（仅 delegate）
                 ↓
-        assistant_tools.run_task(task)
+        orchestrator.run_job(job)   # 由模型选工具
                 ↓
         commentary → tool_result → 口语转述
 ```

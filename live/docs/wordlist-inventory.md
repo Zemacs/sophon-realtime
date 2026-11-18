@@ -1,6 +1,6 @@
 # Word-list / keyword-rule inventory (sophon-realtime `live/`)
 
-Written in Round 4f for Critic's B-4. Snapshot of branch `builder/r4-review-fix` (parent of this commit: `2ed385b`; line numbers are for this commit).
+Written for Critic's B-4 (commit `7cce424`) and updated in the next round (Round 4g: failure_hint + legacy builtin path). Snapshot of branch `builder/r4-review-fix`; line numbers are for the commit that updates this file.
 
 **Principle (user, 2026-11-19 00:27):** no hard-coded keyword / regex / word-list semantic judgment anywhere. The model judges; code only
 enforces (provenance, structured return codes, state-machine version checks; literal comparison only to verify that a model-produced value
@@ -22,7 +22,7 @@ Method: `grep` for `CITY_NAMES`/`CITIES` references, then for module-level tuple
 | `assistant_tools/orchestrator.py:128` `_ungrounded_city` (was `:142` `slots.CITY_NAMES`) | "is the model's weather city grounded?" | **REMOVED this round.** Provenance only: `appears_in_words(city, user/tool messages, translate=True)`; the import of `coordinator.slots` is gone. |
 | `coordinator/schemas.py:142,147` `_city_aliases` | translates 北京 ⇄ Beijing so provenance can be checked | KEPT-provenance (reads the weather tool's own `CITIES`; a test pins that it is the only reader in `schemas.py`) |
 | `assistant_tools/weather.py:28,146,351` `CITIES` | the weather tool's geocoding / canonical-name table | KEPT-data |
-| `assistant_tools/runner.py:65` | `_route_task` picks a city by scanning the task for table names | FROZEN → stage 3/4 (see §3, legacy `run_task`) |
+| ~~`assistant_tools/runner.py:65`~~ | `_route_task` picked a city by scanning the task for table names | **REMOVED in Round 4g** (whole legacy `run_task` path deleted, see §2b) |
 | `coordinator/slots.py:12` `CITY_NAMES` | city words for "same request, one slot changed" | FROZEN → stage 3/4 |
 | `coordinator/slots.py:43` `skeleton()` | strips `CITY_NAMES + DAY_WORDS` before comparing requests | FROZEN → stage 3/4 |
 | `coordinator/route.py:173` `slot_edit()` | REFINE guard: finds old/new city (and day) words | FROZEN → stage 3/4 |
@@ -51,11 +51,12 @@ After this round `CITY_NAMES` has **no reader outside the intent/routing layer**
 
 | File:line | Construct | Decides | Status |
 |---|---|---|---|
-| `assistant_tools/runner.py:54-92`, `:95` | `_route_task` / `run_task`: regex heuristic mapping a task to a tool (legacy `SOPHON_LIVE_BUILTIN_TOOLS=1` demo, documented as "not architecture", `docs/ASSISTANT_TOOLS.md:32`) | tool choice | **OPEN, deletable.** Not deleted this round: it is a live gateway code path (`gateway.py:604,613,624,853-857`) behind an env flag whose value on the GPU server I did not check (no server actions), and two tests (`test_assistant_tools.py::TestRouting`) pin it. Proposal: delete with the flag in stage 3/4 once the server env is confirmed unset. |
-| `assistant_tools/news.py:39-41,56-62` | `_TECH_KEYS`, `_FIN_KEYS`, `_WORLD_KEYS` → `_bucket(topic)` | which RSS feed a topic uses | **OPEN.** Tool-internal topic routing over a *model-produced* `topic` argument. Proposal: stage 4, let the model pass a structured `category` enum argument. |
-| `assistant_tools/news.py:150-158` `_filter_topic` | keeps headlines containing the topic's tokens (drops "新闻/头条/资讯/news/headlines") | relevance filter | **OPEN**, same proposal as above. |
+| ~~`assistant_tools/runner.py` `_route_task` / `run_task`~~ | legacy `SOPHON_LIVE_BUILTIN_TOOLS=1` demo: regexes mapping a task to a tool | tool choice | **REMOVED in Round 4g.** Verified read-only on the server (by the user's side, before this round): the flag is unset on every running gateway (:8780 pid 3548220 and pid 3564091), and the branch was reachable only with COORD and ORCH both off. Deleted: `run_task`, `_route_task`, the `use_builtin` branch and `_builtin_resolve` in `gateway.py`, the `backend="builtin"` line in `static/index.html`, the `__init__.py` doc line and `run_task` export, and the `ASSISTANT_TOOLS.md` mentions. The env var now has no effect (test: `test_assistant_tools.py::TestLegacyHeuristicRoutingIsGone`). |
+| `assistant_tools/news.py:39-41,56-62` | `_TECH_KEYS`, `_FIN_KEYS`, `_WORLD_KEYS` → `_bucket(topic)` | which RSS feed a topic uses | **FROZEN (no new entries). Plan: 下一轮 Round 4f，r4-review-fix 合入前完成。** `topic` becomes a tool parameter passed by the orchestrator model (a structured argument in the tool schema); the code only fetches by that parameter (feed selection by parameter value, no reading of the user's words). Both `_bucket` and the keyword tables are deleted in that round. |
+| `assistant_tools/news.py:150-158` `_filter_topic` | keeps headlines containing the topic's tokens (drops "新闻/头条/资讯/news/headlines") | relevance filter | **FROZEN. Same plan, same round (下一轮 Round 4f，r4-review-fix 合入前完成).** The model passes the topic; code fetches by parameter and no longer filters headlines by keyword. |
 | `coordinator/schemas.py:66-92` `TOOL_FAILURE_TEMPLATES` | the exact sentences our tools speak on failure | provenance of a spoken failure sentence | KEPT-provenance (templates, not a reading of user words) |
-| `grounding.py:13` `PLACEHOLDER_DOMAINS`, `:196` `failure_hint` regex (`not found|no user|…|error`) | reads a tool's *output text* for failure words (legacy realtime/grounding path, not the Coordinator/Worker path) | whether a tool output counts as failed, for a hint to the model | **OPEN.** Same defect class as the B-3 text probes. Proposal: stage 3/4, switch that path to structured return codes like the Worker (`failcodes`). |
+| `grounding.py:196` `failure_hint` (regex `not found|no user|…|error` over a tool's output text) | whether a client tool output counts as failed, to append a spell-it-out hint (Realtime face; the Coordinator/Worker path was already structured) | **REMOVED in Round 4g.** `failure_hint(failed, heard)` now takes a flag; the flag is `grounding.output_failed(item)`: a truthy item `error`, item `status` `failed`/`incomplete`, or an output that is a JSON object with `ok:false` / `success:false` / non-empty `error`. Prose that merely says "not found" is not a failure. `realtime.py` carries the flag per queued output. |
+| `grounding.py:13` `PLACEHOLDER_DOMAINS`, `PLACEHOLDER_NAMES`, `PLACEHOLDER_VALUES`, `FREE_TEXT_KEYS` | values the model may not invent as tool arguments (John Doe, example.com, 12345...) | argument-grounding guard on the Realtime face | **OPEN (not touched).** These are value blacklists on *model-produced arguments*, a provenance-adjacent check, but still lists. Needs Critic's call: keep as provenance, or replace by pure provenance (argument must occur in the caller's words / tool output, which `grounding.check` already also enforces). |
 | `assistant_tools/orchestrator.py` `SYS` prompt | instructions to the model | n/a | not a rule; prompts are the sanctioned mechanism |
 
 ### 2c. Script / format tests (KEPT-benign)
@@ -70,8 +71,11 @@ After this round `CITY_NAMES` has **no reader outside the intent/routing layer**
 * B-4 (this round): `slots.CITY_NAMES` in `_ungrounded_city`.
 * I-18 (this round): text probes for tool success in `orchestrator.py` (`"第1条"`, `"Headlines on"`, `"度"`, `"°"`, `"°C"`).
 
+* Round 4g: `grounding.failure_hint` text regex; the legacy `SOPHON_LIVE_BUILTIN_TOOLS` / `run_task` keyword router (and the `runner.py:65` city scan inside it).
+
 ## 4. Guard rails so they stay gone
 
 * `tests/test_r4e_b4_i18.py`: `_ungrounded_city` answers are identical with `slots.CITY_NAMES` patched to `()` or to a hostile list; AST check that `orchestrator.py` references neither `CITY_NAMES` nor `CITIES` nor imports `slots`; no success-text probe strings in the source.
 * `tests/test_r4d_s23_s24.py`: AST check that `schemas.py` reads a place table only inside `_city_aliases`; no `in out` failure probe in `run_job`.
-* `tests/mutation_check_r4c.py`: mutants that reintroduce each of the above (35 mutants; see the script header for exit codes).
+* `tests/test_r4g_failure_hint.py` (structured-only hint, including the real `RealtimeSession` path) and `tests/test_assistant_tools.py::TestLegacyHeuristicRoutingIsGone` (entry points gone, no source mentions the flag, env var has no effect).
+* `tests/mutation_check_r4c.py`: mutants that reintroduce each of the above (42 mutants; see the script header for exit codes).

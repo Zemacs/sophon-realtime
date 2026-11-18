@@ -14,6 +14,8 @@ T_INT = ["tests.test_r4_intent_i10", "tests.test_r4_intent_gate"]
 T_D = ["tests.test_r4d_s23_s24", "tests.test_r4_news_evidence"]
 T_E = ["tests.test_r4d_s23_s24", "tests.test_r4_s18_s21", "tests.test_no_fabrication", "tests.test_r4_review_b1", "tests.test_r4_search_evidence", "tests.test_r4_news_evidence"]
 ORCH = "sophon_live/assistant_tools/orchestrator.py"
+GR = "sophon_live/grounding.py"; RT = "sophon_live/realtime.py"; GW = "sophon_live/gateway.py"
+T_G = ["tests.test_r4g_failure_hint", "tests.test_assistant_tools"]
 T_F = ["tests.test_r4e_b4_i18", "tests.test_orch_worker", "tests.test_orchestrator"]
 NEWS = "sophon_live/assistant_tools/news.py"; WS = "sophon_live/assistant_tools/web_search.py"; WX = "sophon_live/assistant_tools/weather.py"
 INF = "sophon_live/assistant_tools/inflight.py"; SCH = "sophon_live/coordinator/schemas.py"; INT = "sophon_live/coordinator/intent.py"
@@ -55,6 +57,16 @@ M = [
  ("I-18: the nudge ignores the structured success report", ORCH, "succeeded = not failed and tool_meta.get(failcodes.SUCCESS_KEY) is True", "succeeded = False", T_F),
  ("I-18: news does not report success", NEWS, "    toolmeta.note(**{failcodes.SUCCESS_KEY: True}, count=len(picked))", "    pass", T_F),
  ("I-18: weather reports success even without temperatures", WX, "True if (not meta.get(\"failure\") and meta.get(\"tmin\") is not None and meta.get(\"tmax\") is not None) else None", "True", T_F),
+ # Round 4g (failure_hint structure / legacy builtin path deleted)
+ ("I-20: failure_hint fires for every output", GR, '    if not failed:\n        return ""', '    if False:\n        return ""', T_G),
+ ("I-20: output_failed reads the output's words again", GR, '    if item.get("error") or item.get("status") in ("failed", "incomplete"):\n        return True',
+  '    if item.get("error") or item.get("status") in ("failed", "incomplete") or re.search(r"not found|no user|invalid|error", str(item.get("output", "")), re.I):\n        return True', T_G),
+ ("I-20: output_failed ignores a JSON ok:false", GR, 'return out.get("ok") is False or out.get("success") is False or bool(out.get("error"))', 'return False', T_G),
+ ("I-20: realtime marks every output failed", RT, 'grounding.output_failed(item)))', 'True))', T_G),
+ ("I-20: realtime ignores the per-item flag", RT, "grounding.failure_hint(failed, self.heard)", "grounding.failure_hint(False, self.heard)", T_G),
+ ("legacy: the builtin backend is announced again", GW, '        deleg_body = {"id": did, "type": "delegation", "target": "client", "task": what}\n',
+  '        deleg_body = {"id": did, "type": "delegation", "target": "client", "task": what}\n        if os.environ.get("SOPHON_LIVE_BUILTIN_TOOLS"):\n            deleg_body["backend"] = "builtin"\n', T_G),
+ ("legacy: run_task is back in the runner", "sophon_live/assistant_tools/runner.py", "async def run_tool(", "async def run_task(task):\n    return None\n\n\nasync def run_tool(", T_G),
  ("S-24: news says 'feeds unreachable' when the cap refused", NEWS, "        if busy:\n            toolmeta.note(failure=failcodes.BUSY)", "        if False:\n            toolmeta.note(failure=failcodes.BUSY)", T_D),
  ("S-24: search says 'network' when the cap refused", WS, "        if busy:\n            toolmeta.note(failure=failcodes.BUSY)", "        if False:\n            toolmeta.note(failure=failcodes.BUSY)", T_D),
  ("S-24: weather says 'cannot find' when the cap refused", WX, "        if busy:\n            meta[\"failure\"] = failcodes.BUSY", "        if False:\n            meta[\"failure\"] = failcodes.BUSY", T_D),

@@ -199,7 +199,6 @@ async function onDelegation(d) {
   const setR = t => card.querySelector(".r").textContent = t;
   // GPU-side backends inject commentary themselves; the page only displays the card.
   if (d.backend === "orch") { setR("GPU 编排（文本 LLM + 工具）处理中…"); return; }
-  if (d.backend === "builtin") { setR("内置启发式工具处理中…"); return; }
   if ($("#be").value === "manual") { pendingDeleg = {id: d.id, setR}; $("#manual").style.display = ""; $("#mtask").textContent = d.task || d.id; $("#mtext").focus(); setR("等你手动回答…"); return; }
   let r = null;
   try { r = await demoBackend(d.task || (curUser && curUser.textContent) || ""); } catch (e) { r = null; }

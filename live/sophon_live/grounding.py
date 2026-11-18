@@ -192,8 +192,30 @@ def guard_message(bad, heard: list[str]) -> str:
     return s
 
 
-def failure_hint(output: str, heard: list[str]) -> str:
-    if not re.search(r"not found|no user|could not find|cannot find|does not exist|invalid|error", output, re.I):
+def output_failed(item: dict) -> bool:
+    """Did the client report this ``function_call_output`` as a failure? STRUCTURE only; the words of the output are never read.
+
+    Contract (the same one our own tools use, ``failcodes`` / the ``{"ok": false}`` envelope): the item carries a truthy ``error``, or its
+    ``status`` is ``failed`` / ``incomplete``; or ``output`` is a JSON object with ``ok: false``, ``success: false`` or a non-empty ``error``.
+    An output that merely *says* "not found" or "error" in prose is NOT a reported failure (B-3 / I-20: no word probes)."""
+    if not isinstance(item, dict):
+        return False
+    if item.get("error") or item.get("status") in ("failed", "incomplete"):
+        return True
+    out = item.get("output")
+    if isinstance(out, str) and out.lstrip().startswith("{"):
+        try:
+            out = json.loads(out)
+        except ValueError:
+            return False
+    if isinstance(out, dict):
+        return out.get("ok") is False or out.get("success") is False or bool(out.get("error"))
+    return False
+
+
+def failure_hint(failed: bool, heard: list[str]) -> str:
+    """The spell-it-out hint for a tool call the client reported as failed (``output_failed``); nothing for any other output."""
+    if not failed:
         return ""
     recent = " | ".join(h.strip() for h in heard[-2:] if h.strip())
     joins = [j for h in heard[-3:] for j in spelled_joins(h)]

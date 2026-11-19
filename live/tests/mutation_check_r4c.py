@@ -27,6 +27,7 @@ FA = "failed = fail_code is not None"
 T_F = ["tests.test_r4e_b4_i18", "tests.test_orch_worker", "tests.test_orchestrator"]
 NEWS = "sophon_live/assistant_tools/news.py"; WS = "sophon_live/assistant_tools/web_search.py"; WX = "sophon_live/assistant_tools/weather.py"
 T_R1 = ["tests.test_model_client"]
+T_GB = ["tests.test_r4m_g1_literal_only"]
 INF = "sophon_live/assistant_tools/inflight.py"; SCH = "sophon_live/coordinator/schemas.py"
 CB = "    fut.add_done_callback(lambda _f: s.release())\n    return await asyncio.wrap_future(fut)"
 M = [
@@ -79,7 +80,7 @@ M = [
  ("S-24: weather says 'cannot find' when the cap refused", WX, "        if busy:\n            meta[\"failure\"] = failcodes.BUSY", "        if False:\n            meta[\"failure\"] = failcodes.BUSY", T_D),
  ("S-24: busy sentence not whitelisted for web_search", SCH, '    "web_search": tuple(re.compile(p) for p in (\n        r"网络暂时不可用，没法完成网页搜索，请稍后再试。",\n        BUSY_ZH_RE, BUSY_EN_RE,', '    "web_search": tuple(re.compile(p) for p in (\n        r"网络暂时不可用，没法完成网页搜索，请稍后再试。",', T_D),
  # Round 4h (I-20 grounding provenance only / news topic is a schema parameter)
- ("I-20: a free-text key is exempt from grounding again", GR, "        vn = norm_text(v)\n        if not vn or", '        if k.lower() in {"summary", "reason", "query", "note", "notes", "message", "description", "comment", "content"}:\n            continue\n        vn = norm_text(v)\n        if not vn or', T_H),
+ ("I-20: a free-text key is exempt from grounding again", GR, "        vn = norm_text(v)\n        if not vn:", '        if k.lower() in {"summary", "reason", "query", "note", "notes", "message", "description", "comment", "content"}:\n            continue\n        vn = norm_text(v)\n        if not vn:', T_H),
  ("I-20: placeholder-looking values are blocked even when the caller said them", GR, "        if re.fullmatch(r\"(?=.*[A-Za-z])",
   '        if vn in {"12345", "johndoe", "john", "doe", "example.com", "5551234567"}:\n            return False\n        if re.fullmatch(r"(?=.*[A-Za-z])', T_H),
  ("I-20: placeholder-looking values are allowed even when the caller never said them", GR, "        if re.fullmatch(r\"(?=.*[A-Za-z])",
@@ -135,8 +136,6 @@ M = [
  ("N-1: the literal path converts 十分 / 万一 specially", GR, "    def literal(v: str, vn: str) -> bool:\n", "    def literal(v: str, vn: str) -> bool:\n        if vn in (\"十分\", \"万一\"): return True\n", T_KE + T_KL),
  ("R-1: a number may be a piece of a longer number", GR, "        if not ((value_n[0].isdigit() and i > 0 and corpus_n[i - 1].isdigit()) or (value_n[-1].isdigit() and j < len(corpus_n) and corpus_n[j].isdigit())):", "        if True:", T_KE),
  ("R-1: turns are joined without a separator (a match can straddle two turns)", GR, 'return "|".join(norm_text(x) for x in turns)', 'return "".join(norm_text(x) for x in turns)', T_KE),
- ("R-1: short values (digits, 2-character CJK) are skipped again", GR, "if not vn or (len(vn) < 3 and not any(c.isdigit() for c in vn) and not (len(vn) >= 2 and _CJK.search(vn))):", "if not vn or len(vn) < 3:", T_KE),
- ("R-1: a one-character value with a digit is skipped", GR, "        if len(vn) < 2 and _CJK.search(vn):", "        if len(vn) < 2:", T_KE),
  ("R-2: a span needs no occurrence in what was said", GR, "            if occurs(span_n, corpus):", "            if True:", T_KE),
  ("R-2: the model need not state the value comes from the span", GR, 'if en.get("value_comes_from_span") is not True:', "if False:", T_KE),
  ("R-2: any truthy value_comes_from_span counts", GR, 'if en.get("value_comes_from_span") is not True:', 'if not en.get("value_comes_from_span"):', T_KE),
@@ -160,8 +159,7 @@ M = [
  ("R-5: no per-session cap on rejections", RT, "capped = self.guard_total > GUARD_SESSION_MAX_REJECTIONS", "capped = False", T_KE),
  ("R-5: the per-session cap is 1000", RT, "GUARD_SESSION_MAX_REJECTIONS = 12", "GUARD_SESSION_MAX_REJECTIONS = 1000", T_KE),
  ("R-5: the counter table is not cleared when the session ends", RT, 'self.guard_counts.clear(); self.audit.clear(); self.spoken.clear(); getattr(self, "rejected", {}).clear()', "pass", T_KE),
- ("N-4: fuzzy matching of Latin words is back (0.85)", GR, '        parts = [norm_text(p) for p in re.split(r"[\\s,]+", v) if norm_text(p)]', '        import difflib\n        if vn.isascii() and not any(c.isdigit() for c in vn) and max((difflib.SequenceMatcher(None, vn, w).ratio() for w in words), default=0.0) >= 0.85:\n            return True\n        parts = [norm_text(p) for p in re.split(r"[\\s,]+", v) if norm_text(p)]', T_KL),
- ("R-6: a long value passes when ANY of its words was said", GR, "return len(parts) > 1 and all(", "return len(parts) > 1 and any(", T_KE),
+ ("N-4: fuzzy matching of Latin words is back (0.85)", GR, "        return occurs(vn, corpus) or appears_in_words(v, said)", "        import difflib\n        if vn.isascii() and not any(c.isdigit() for c in vn) and max((difflib.SequenceMatcher(None, vn, w).ratio() for w in said.lower().split()), default=0.0) >= 0.85:\n            return True\n        return occurs(vn, corpus) or appears_in_words(v, said)", T_KL),
  ("R-7: the instructions count as provenance again", RT, 'bad = await grounding.check_async(e.get("name", ""), args, self.heard, self.seen,', 'bad = await grounding.check_async(e.get("name", ""), args, self.heard, self.seen + [self.cfg.get("instructions") or ""],', T_KE),
  ("R-7: the tool schema counts as provenance again", RT, 'bad = await grounding.check_async(e.get("name", ""), args, self.heard, self.seen,', 'bad = await grounding.check_async(e.get("name", ""), args, self.heard, self.seen + [json.dumps(self.cfg.get("tools") or [])],', T_KE),
  ("R-3: needs_input is not spoken", RT, "grounding.needs_input_message(bad, give_up=capped)}), speak=True)", "grounding.needs_input_message(bad, give_up=capped)}), speak=False)", T_KE),
@@ -203,7 +201,6 @@ M = [
  ("N-3: silence after the read-back is not noticed", GR, "                if first >= len(heard):", "                if first > len(heard) + 99:", T_KL),
  ("N-3: a refused value is not remembered", RT, "rej.setdefault(k_, set()).add(v_)", "pass", T_KL),
  ("N-4: a Latin token may be a piece of a longer word again", GR, '        if re.fullmatch(r"(?=.*[A-Za-z])[A-Za-z0-9@._\\-]+", v.strip()):', "        if False:", T_KL),
- ("N-4: an email half may be a piece of a longer address", GR, "if loc and dom and appears_in_words(loc, said) and appears_in_words(dom.split(\".\")[0], said):", "if loc and dom and occurs(norm_text(loc), corpus) and occurs(norm_text(dom.split(\".\")[0]), corpus):", T_KL),
  ("N-6: any value on a property with a default is exempt", GR, 'return "default" in prop and str(prop["default"]) == str(value)', 'return "default" in prop', T_KL),
  ("N-6: x-grounding: none is ignored", GR, 'if prop.get("x-grounding") == "none":', "if False:", T_KL),
  ("N-6: the session does not give the guard the tool schema", RT, 'schema=grounding.tool_parameters(self.cfg.get("tools"), e.get("name", "")),', "schema=None,", T_KL),
@@ -212,7 +209,6 @@ M = [
  ("N-6: the prompt no longer says to leave optional arguments out", GR, "and do not fill an optional argument the caller did not mention (leave it out)", "", T_KL),
  ("N-8: the audit is not written to the log", RT, 'log.info("realtime %s: grounding audit %s", self.id, json.dumps(rec, ensure_ascii=False, default=str)[:500])', "pass", T_KL),
  ("N-8: a keyword regex is added to grounding.py (the old allowlist waved it through)", GR, "def norm_text(s: str) -> str:", 'WEATHER = re.compile("天气|气温|下雨")\n\n\ndef norm_text(s: str) -> str:', T_KS),
- ("N-8: a word is added to the spoken-form currency table", GR, '"dollar": "usd", ', '"dollar": "usd", "bitcoin": "btc", ', T_KS),
  ("N-9: the harness is not retried after a timeout (and a second timeout is not an error)", "tests/test_r4j_page_behaviour.py", "    for attempt in (1, 2):", "    for attempt in (1,):", T_KL),
  ('R1 model_client: a timeout inside the call is classified as an application error', "sophon_live/model_client.py", '            except (asyncio.TimeoutError, TimeoutError):\n                br.failure("timeout")', '            except (KeyError,):\n                br.failure("timeout")', T_R1),
  ('R1 model_client: a timeout counts as a retryable connection error', "sophon_live/model_client.py", '    if isinstance(e, (asyncio.TimeoutError, TimeoutError)):\n        return False\n    try:', '    if isinstance(e, (asyncio.TimeoutError, TimeoutError)):\n        return True\n    try:', T_R1),
@@ -231,6 +227,21 @@ M = [
  ('R1 gateway: any query returns the detail', GW, '    return _health_detail() if "detail=1" in query.split("&") else None', '    return _health_detail()', T_R1),
  ('R1 gateway: the downstream snapshot is left out of the detail', GW, '"downstream": model_client.snapshot(),', '"downstream": {},', T_R1),
  ('R1 gateway: the bind address defaults to all interfaces', GW, 'or "127.0.0.1"\n', 'or "0.0.0.0"\n', T_R1),
+ # Round B (Critic G-1): the literal path is an exact comparison; each removed rule must stay removed (tests/test_r4m_g1_literal_only.py)
+ ("G-1: a date whose year was never said passes when MMDD was said", GR, "        if re.fullmatch(r\"(?=.*[A-Za-z])[A-Za-z0-9@._\\-]+\", v.strip()):", "        dm = re.fullmatch(r\"\\d{4}-(\\d{2})-(\\d{2})\", v.strip())\n        if dm and (dm.group(1) + dm.group(2)) in corpus:\n            return True\n        if re.fullmatch(r\"(?=.*[A-Za-z])[A-Za-z0-9@._\\-]+\", v.strip()):", T_GB),
+ ("G-1: an e-mail passes when its local part and the FIRST label of the domain were said", GR, "        if re.fullmatch(r\"(?=.*[A-Za-z])[A-Za-z0-9@._\\-]+\", v.strip()):", "        loc, _, dom = v.strip().partition(\"@\")\n        if loc and dom and appears_in_words(loc, said) and appears_in_words(dom.split(\".\")[0], said):\n            return True\n        if re.fullmatch(r\"(?=.*[A-Za-z])[A-Za-z0-9@._\\-]+\", v.strip()):", T_GB),
+ ("G-1: a multi-word value passes when every part occurs anywhere", GR, "        if re.fullmatch(r\"(?=.*[A-Za-z])[A-Za-z0-9@._\\-]+\", v.strip()):", "        parts = [norm_text(p) for p in re.split(r\"[\\s,]+\", v) if norm_text(p)]\n        if len(parts) > 1 and all(occurs(p, corpus) for p in parts):\n            return True\n        if re.fullmatch(r\"(?=.*[A-Za-z])[A-Za-z0-9@._\\-]+\", v.strip()):", T_GB),
+ ("G-1: a spelled-out run is a literal candidate again", GR, "        if re.fullmatch(r\"(?=.*[A-Za-z])[A-Za-z0-9@._\\-]+\", v.strip()):", "        if vn in {norm_text(j) for h in heard for j in spelled_joins(h)}:\n            return True\n        if re.fullmatch(r\"(?=.*[A-Za-z])[A-Za-z0-9@._\\-]+\", v.strip()):", T_GB),
+ ("G-1: a number word is special-cased on the literal path", GR, "        if re.fullmatch(r\"(?=.*[A-Za-z])[A-Za-z0-9@._\\-]+\", v.strip()):", "        if vn == \"4000\" and \"fourthousand\" in corpus:\n            return True\n        if re.fullmatch(r\"(?=.*[A-Za-z])[A-Za-z0-9@._\\-]+\", v.strip()):", T_GB),
+ ("G-1: a currency word is special-cased on the literal path", GR, "        if re.fullmatch(r\"(?=.*[A-Za-z])[A-Za-z0-9@._\\-]+\", v.strip()):", "        if vn == \"krw\" and \"won\" in corpus:\n            return True\n        if re.fullmatch(r\"(?=.*[A-Za-z])[A-Za-z0-9@._\\-]+\", v.strip()):", T_GB),
+ ("G-1: a value under 3 characters is skipped again", GR, "        vn = norm_text(v)\n        if not vn:", "        vn = norm_text(v)\n        if not vn or len(vn) < 3:", T_GB + T_KE),
+ ("G-1: a single character is skipped again", GR, "        vn = norm_text(v)\n        if not vn:", "        vn = norm_text(v)\n        if not vn or len(vn) < 2:", T_GB + T_KE),
+ ("G-1: a Latin token only has to occur as a substring", GR, "            return appears_in_words(unicodedata.normalize(\"NFKC\", v), unicodedata.normalize(\"NFKC\", said))", "            return occurs(vn, corpus)", T_GB + T_KL),
+ ("G-1: the generic whole-word rule becomes a substring test", GR, "        return occurs(vn, corpus) or appears_in_words(v, said)", "        return occurs(vn, corpus) or v in said", T_GB),
+ ("G-1: a non-bool judge answer counts as a verdict", GR, 'table[(p["kind"], p["argument"], p["value"], p["span"])] = r if isinstance(r, bool) else None', 'table[(p["kind"], p["argument"], p["value"], p["span"])] = bool(r) if r is not None and not isinstance(r, BaseException) else None', T_GB),
+ ("G-1: a judge exception counts as a yes", GR, 'table[(p["kind"], p["argument"], p["value"], p["span"])] = r if isinstance(r, bool) else None', 'table[(p["kind"], p["argument"], p["value"], p["span"])] = True if isinstance(r, Exception) else (r if isinstance(r, bool) else None)', T_GB),
+ ("G-1: a number-word table is back in grounding.py", GR, "from .coordinator.schemas import appears_in_words\n", "from .coordinator.schemas import appears_in_words\n_UNITS = {w: i for i, w in enumerate('zero one two three four five six seven eight nine ten'.split())}\n", T_GB + T_KS),
+ ("G-1: a currency-word table is back in grounding.py", GR, "from .coordinator.schemas import appears_in_words\n", "from .coordinator.schemas import appears_in_words\n_CURRENCY = {'dollar': 'usd', 'euro': 'eur'}\n", T_GB + T_KS),
 ]
 def run_group(tests, env):
     """-> (returncode, passed, failed, errors, failed_names, output). Uses pytest; module names are mapped to files."""

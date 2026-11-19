@@ -112,7 +112,8 @@ class EveryNumberNeedsProvenance(unittest.TestCase):
         self.assertEqual(bad({"age": "37"}, ["我三十七岁"], evidence=ev("age", "三十七岁")), [])
         self.assertTrue(bad({"floor": 12}, ["十二楼"]))
         self.assertEqual(bad({"floor": 12}, ["十二楼"], evidence=ev("floor", "十二楼")), [])
-        self.assertEqual(bad({"qty": 2}, ["two tickets please"]), [])
+        self.assertTrue(bad({"qty": 2}, ["two tickets please"], judge=lambda *a: False))     # Round B (G-1): "two" is not converted by code
+        self.assertEqual(bad({"qty": 2}, ["two tickets please"], evidence=ev("qty", "two tickets")), [])
 
     def test_a_number_cannot_be_assembled_from_two_turns(self) -> None:
         self.assertTrue(bad({"n": "88"}, ["张江路8", "8号"]))
@@ -122,9 +123,13 @@ class EveryNumberNeedsProvenance(unittest.TestCase):
         self.assertTrue(bad({"n": "88"}, ["我是1988年生的"]))
         self.assertTrue(bad({"n": "88"}, ["8800"]))
 
-    def test_only_a_value_with_nothing_to_look_up_is_skipped(self) -> None:
-        self.assertEqual(bad({"state": "TX"}, ["hello"]), [])
-        self.assertEqual(bad({"c": "京"}, ["hello"]), [])
+    def test_only_a_value_with_nothing_left_after_normalisation_is_skipped(self) -> None:
+        """Round B (G-1): no short-value exemption. TX and 京 need provenance; only punctuation (nothing to compare) is skipped."""
+        self.assertTrue(bad({"state": "TX"}, ["hello"]))
+        self.assertTrue(bad({"c": "京"}, ["hello"]))
+        self.assertEqual(bad({"state": "TX"}, ["I live in TX"]), [])
+        self.assertEqual(bad({"c": "京"}, ["我在京"]), [])
+        self.assertEqual(bad({"c": "-"}, ["hello"]), [])
         self.assertTrue(bad({"c": "李明"}, ["hello"]))
         self.assertTrue(bad({"n": "4"}, ["hello"]))
 

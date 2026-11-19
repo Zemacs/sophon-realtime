@@ -3,8 +3,9 @@ the agent actually saw -- the caller's words (ASR), an earlier tool result, or t
 made up (or a name it misheard) are sent back to the model instead of executed.
 
 PROVENANCE ONLY (Round 4h / I-20): there is no list of "placeholder" names, values, domains or "free-text" argument keys. A value is
-fine when it occurs in what the agent saw (literally, as a whole word, or in a spoken form of it); a value that occurs nowhere is not,
-whatever it looks like. So 12345 / John Doe / example.com are allowed when the caller actually said them and blocked when the model made
+fine when it occurs, character for character after format normalisation, in what the agent saw (a Latin token as a whole word); a value that occurs
+nowhere is not, whatever it looks like. EVERY other "same value" (a spoken number, a date, an email said aloud, a homophone, a translation) is the model's
+claim plus an independent model's yes (``grounding_evidence`` + ``judge``); no yes, a timeout or no judge = not grounded. So 12345 / John Doe / example.com are allowed when the caller actually said them and blocked when the model made
 them up, exactly like any other invented value."""
 from __future__ import annotations
 
@@ -17,117 +18,16 @@ from typing import Callable
 
 from .coordinator.schemas import appears_in_words
 
-NUM_WORDS = {"zero": "0", "oh": "0", "one": "1", "two": "2", "three": "3", "four": "4", "five": "5", "six": "6", "seven": "7",
-             "eight": "8", "nine": "9"}
-
-
-def _norm(s: str) -> str:
-    return re.sub(r"[^a-z0-9@._]", "", s.lower())
-
-
-_UNITS = {w: i for i, w in enumerate("zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen".split())}
-_TENS = {w: 10 * i for i, w in enumerate("_ _ twenty thirty forty fifty sixty seventy eighty ninety".split()) if w != "_"}
-_SCALE = {"hundred": 100, "thousand": 1000, "million": 1000000}
-
-
-def word_numbers(text: str) -> list[str]:
-    """'four thousand' -> '4000', 'two hundred fifty' -> '250', '1.5 thousand' ignored; '$4,000' -> '4000'."""
-    out = [re.sub(r"[,$]", "", m) for m in re.findall(r"\$?\d[\d,]*(?:\.\d+)?", text)]
-    toks = re.findall(r"[a-z]+", text.lower().replace("-", " "))
-    cur = tot = 0; on = False
-    for t in toks + ["<end>"]:
-        if t in _UNITS: cur += _UNITS[t]; on = True
-        elif t in _TENS: cur += _TENS[t]; on = True
-        elif t in _SCALE and on:
-            if _SCALE[t] == 100: cur *= 100
-            else: tot += cur * _SCALE[t]; cur = 0
-        elif t in _SCALE:                       # "a hundred", "thousand dollars"
-            if _SCALE[t] == 100: cur = 100
-            else: tot = _SCALE[t]
-            on = True
-        elif t == "and" and on: continue
-        else:
-            if on: out.append(str(tot + cur))
-            cur = tot = 0; on = False
-    return out
-
-
-_MONTHS = {m: i + 1 for i, m in enumerate("january february march april may june july august september october november december".split())}
-_ORD = {"first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5, "sixth": 6, "seventh": 7, "eighth": 8, "ninth": 9, "tenth": 10,
-        "eleventh": 11, "twelfth": 12, "thirteenth": 13, "fourteenth": 14, "fifteenth": 15, "sixteenth": 16, "seventeenth": 17,
-        "eighteenth": 18, "nineteenth": 19, "twentieth": 20, "thirtieth": 30}
-
-
-_CURRENCY = {"dollar": "usd", "buck": "usd", "euro": "eur", "pound": "gbp", "sterling": "gbp", "quid": "gbp", "yen": "jpy",
-             "yuan": "cny", "renminbi": "cny", "rmb": "cny", "canadian": "cad", "australian": "aud", "aussie": "aud",
-             "swiss": "chf", "franc": "chf", "rupee": "inr", "peso": "mxn", "won": "krw", "kiwi": "nzd", "zealand": "nzd",
-             "hong kong": "hkd", "singapore": "sgd", "krona": "sek", "krone": "nok", "real": "brl", "rand": "zar", "ruble": "rub", "lira": "try"}
-
-
-def spoken_forms(text: str) -> list[str]:
-    """Extra normalised candidates from conversational speech: dates -> YYYY-MM-DD / MM-DD, spoken emails, grouped digits."""
-    t = text.lower().replace("-", " ")
-    out = [c for w, c in _CURRENCY.items() if re.search(rf"\b{w}", t)]
-    # dates: "december 14th, 2026" / "december fourteenth twenty twenty six" / "the 14th of december"
-    t2 = re.sub(r"twenty twenty (one|two|three|four|five|six|seven|eight|nine)", lambda m: "202" + str(_UNITS[m.group(1)]), t)
-    for m in re.finditer(r"(january|february|march|april|may|june|july|august|september|october|november|december)\s+(?:the\s+)?(\d{1,2}|[a-z]+(?:\s[a-z]+)?)(?:st|nd|rd|th)?(?:,?\s*(\d{4}))?", t2):
-        mo = _MONTHS[m.group(1)]; dtok = m.group(2)
-        d = int(dtok) if dtok.isdigit() else None
-        if d is None:
-            parts = dtok.split()
-            if parts[0] in _ORD: d = _ORD[parts[0]]
-            elif parts[0] in _TENS and len(parts) > 1 and parts[1] in _ORD: d = _TENS[parts[0]] + _ORD[parts[1]]
-        if d:
-            out.append(f"{mo:02d}-{d:02d}")
-            if m.group(3): out.append(f"{m.group(3)}-{mo:02d}-{d:02d}")
-    for m in re.finditer(r"(?:the\s+)?(\d{1,2}|[a-z]+)(?:st|nd|rd|th)?\s+of\s+(january|february|march|april|may|june|july|august|september|october|november|december)", t2):
-        dtok = m.group(1); d = int(dtok) if dtok.isdigit() else _ORD.get(dtok)
-        if d: out.append(f"{_MONTHS[m.group(2)]:02d}-{d:02d}")
-    # seats like "fourteen C" / "14 C"
-    for m in re.finditer(r"\b(?:(twenty|thirty)\s+)?(\d{1,2}|[a-z]+)\s+([a-f])\b", t):
-        n = m.group(2); v = int(n) if n.isdigit() else _UNITS.get(n, _TENS.get(n))
-        if v is not None and m.group(1) and v < 10: v += _TENS[m.group(1)]
-        if v: out.append(f"{v}{m.group(3)}")
-    # spoken email: "name dot surname thirty one at gmail dot com"
-    if " at " in t and " dot " in t:
-        e = t
-        for w, v in list(_UNITS.items()) + list(_TENS.items()): e = re.sub(rf"\b{w}\b", str(v), e)
-        e = re.sub(r"(\d+)\s+(\d)\b", lambda m: str(int(m.group(1)) + int(m.group(2))) if int(m.group(1)) % 10 == 0 and int(m.group(1)) >= 20 else m.group(0), e)
-        e = e.replace(" underscore ", "_").replace(" dash ", "-").replace(" at ", "@").replace(" dot ", ".")
-        for m in re.finditer(r"[a-z0-9._ \-]+@[a-z0-9. ]+", e):
-            out.append(re.sub(r"\s+", "", m.group(0)).strip("."))
-    # grouped digits: "eight sixteen" -> 816, "nineteen one twenty two" -> 19122
-    toks = re.findall(r"[a-z]+|\d+", t); run = []
-    for tok in toks + ["<end>"]:
-        v = _UNITS.get(tok, _TENS.get(tok)) if tok != "oh" else 0
-        if tok.isdigit(): v = int(tok)
-        if v is not None and tok != "<end>":
-            if run and tok in _UNITS and run[-1] in _TENS and _UNITS[tok] < 10:
-                run[-1] = str(int(_TENS[run[-1]]) + _UNITS[tok]) if False else run[-1]
-            run.append(tok)
-        else:
-            if len(run) >= 2:
-                vals, i = [], 0
-                while i < len(run):
-                    a_ = run[i]
-                    if a_ in _TENS and i + 1 < len(run) and run[i + 1] in _UNITS and 0 < _UNITS[run[i + 1]] < 10:
-                        vals.append(str(_TENS[a_] + _UNITS[run[i + 1]])); i += 2; continue
-                    vals.append(str(_UNITS[a_] if a_ in _UNITS else _TENS[a_] if a_ in _TENS else 0 if a_ == "oh" else int(a_))); i += 1
-                out.append("".join(vals))
-            run = []
-    return out
-
 
 def spelled_joins(text: str) -> list[str]:
-    """'Y, U, S, U, F' -> 'yusuf'; '1 9 1 2 2' / 'one nine one two two' -> '19122'; 'W 2 3 7 8' -> 'w2378'."""
+    """DISPLAY ONLY (the spell-it-out hint of ``failure_hint`` / ``guard_message``): 'Y, U, S, U, F' -> 'yusuf'; '1 9 1 2 2' -> '19122'. Nothing decides
+    on it: it is never a candidate for provenance (Round B / Critic G-1); a value the caller spelled out is grounded through the evidence + judge path."""
     text = re.sub(r"(\w)['’](\w)", r"\1\2", text)              # it's -> its (not a spelled "s")
     toks = re.findall(r"[A-Za-z]+|\d+", text)
     out, run = [], []
     for t in toks + ["<end>"]:
-        tl = t.lower()
-        unit = (len(t) == 1 and t.isalpha()) or t.isdigit() and len(t) <= 3 or tl in NUM_WORDS
-        if unit and t != "<end>":
-            run.append(NUM_WORDS.get(tl, tl))
+        if t != "<end>" and ((len(t) == 1 and t.isalpha()) or (t.isdigit() and len(t) <= 3)):
+            run.append(t.lower())
         else:
             if len(run) >= 3: out.append("".join(run))
             run = []
@@ -143,7 +43,6 @@ def _values(args, key=""):
         yield key, str(args)
 
 
-_CJK = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+")
 EVIDENCE_KEY = "grounding_evidence"      # reserved argument the gateway adds to every tool schema it shows the engine, and strips before the client sees the call
 
 # ---------------------------------------------------------------- format normaliser: NFKC, case, punctuation. NOTHING ELSE.
@@ -277,44 +176,30 @@ def check(name: str, args: dict, heard: list[str], seen: list[str], evidence=Non
 
     EVERY value is checked, whatever its length or script (a number is never exempt), against ONLY what the caller said (``heard``, ASR turns) and what
     tools returned (``seen``): never the instructions or tool schema (R-7). A value is grounded when
-      1. it occurs, after format normalisation (NFKC / case / punctuation, no numeral conversion), in the caller's words or a tool result (or is a spoken
-         form of them: digits / dates / emails / spellings), or
+      1. it occurs, after format normalisation (NFKC / case / punctuation; no numeral conversion, no spoken forms, no partial email / date / multi-word
+         matches), in the caller's words or a tool result (a Latin token as a whole word), or
       2. the MODEL attached ``grounding_evidence`` for it: a ``span`` that occurs verbatim in the caller's words or a tool result, plus its own statement
          ``value_comes_from_span: true``, AND an independent model (``judge``) answers yes to "does the span say the value" (N-2). No judge, an unavailable
          one or a non-yes answer = refused; a claim waiting for the judge is appended to ``pending`` (``check_async`` resolves those),
       3. (``read_back_to_caller``) the value was refused before (``rejected``), the assistant then said it aloud (``spoken`` = [(text, len(heard) then)]), the
          span is inside the caller's FIRST turn after that, the model's closed-set ``caller_reply`` is ``confirm``, and the judge agrees the reply confirms (N-3).
-    Not checked: values with nothing to look up (no digit and under 3 characters: 'TX', one CJK character), and values the DEVELOPER exempted in the tool's
-    schema (``default`` equal to the value, or ``x-grounding: none``; N-6). Every acceptance is appended to ``audit``.
+    Not checked: values with nothing left after normalisation (punctuation only), and values the DEVELOPER exempted in the tool's schema (``default`` equal to
+    the value, or ``x-grounding: none``; N-6). A short value ('TX', one CJK character) is checked like any other (Round B / G-1). Every acceptance is appended to ``audit``.
     There is no fuzzy matching at all (N-4): a name or identifier the ASR got slightly wrong takes the evidence / read-back path."""
     evidence = parse_evidence(evidence)
     spoken = spoken or []
     heard_c, seen_c = _turns_n(heard), _turns_n(seen)
     corpus = heard_c + "|" + seen_c
-    joins = ([j for h in heard for j in spelled_joins(h)] + [n for h in heard for n in word_numbers(h)]
-             + [x for h in heard for x in spoken_forms(h)])
-    joins_n = {norm_text(j) for j in joins}
-    words = set(re.findall(r"[a-z0-9@._]+", " ".join(list(heard) + list(seen)).lower())) | {j.lower() for j in joins}
     said = "\n".join(list(heard) + list(seen))
     bad = []
 
     def literal(v: str, vn: str) -> bool:
-        if re.fullmatch(r"(?=.*[A-Za-z])[A-Za-z0-9@._\-]+", v.strip()):      # one Latin token (name, email, identifier): the WHOLE token, never a piece of a longer one
-            if appears_in_words(unicodedata.normalize("NFKC", v), unicodedata.normalize("NFKC", said)) or vn in joins_n:     # (Daniel is not Danielle, min@x.com is not admin@x.com)
-                return True
-        elif occurs(vn, corpus) or vn in joins_n:
-            return True
-        if appears_in_words(v, said):
-            return True
-        dm = re.fullmatch(r"\d{4}-(\d{2})-(\d{2})", v.strip())
-        if dm and (dm.group(1) + dm.group(2)) in joins_n:                  # year usually not said
-            return True
-        if "@" in vn:                                            # emails are often said as "name at domain dot com"
-            loc, _, dom = v.strip().partition("@")                # both halves as whole words ("jon at acme dot com"); never a piece of a longer address
-            if loc and dom and appears_in_words(loc, said) and appears_in_words(dom.split(".")[0], said):
-                return True
-        parts = [norm_text(p) for p in re.split(r"[\s,]+", v) if norm_text(p)]
-        return len(parts) > 1 and all(p in words or p in joins_n or occurs(p, corpus) and (any(c.isdigit() for c in p) or not p.isascii()) for p in parts)
+        """Exact provenance only: the value, after format normalisation, occurs in what was heard / returned. A Latin token must be a WHOLE word
+        (Daniel is not Danielle, min@x.com is not admin@x.com); anything else is a plain occurrence with a digit boundary (88 is not in 1988).
+        No spoken forms, no number words, no partial email / date / multi-word matches: every other kind of "same value" is the judge's call."""
+        if re.fullmatch(r"(?=.*[A-Za-z])[A-Za-z0-9@._\-]+", v.strip()):
+            return appears_in_words(unicodedata.normalize("NFKC", v), unicodedata.normalize("NFKC", said))
+        return occurs(vn, corpus) or appears_in_words(v, said)
 
     def verdict(kind: str, k: str, v: str, span: str, context: str) -> "bool | None":
         if judge is None:
@@ -377,10 +262,8 @@ def check(name: str, args: dict, heard: list[str], seen: list[str], evidence=Non
         if k == EVIDENCE_KEY:
             continue
         vn = norm_text(v)
-        if not vn or (len(vn) < 3 and not any(c.isdigit() for c in vn) and not (len(vn) >= 2 and _CJK.search(vn))):
-            continue                                             # nothing to look up
-        if len(vn) < 2 and _CJK.search(vn):
-            continue
+        if not vn:
+            continue                                             # nothing but punctuation: there is nothing to compare
         if literal(v, vn):
             if audit is not None:
                 audit.append({"argument": k, "value": v, "how": "literal"})

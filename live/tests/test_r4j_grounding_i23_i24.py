@@ -56,8 +56,10 @@ class ChineseValuesAreChecked(unittest.TestCase):
         self.assertTrue(bad({"name": "李明 Zhang"}, ["我叫李明 Li"]))        # the Latin half is invented
         self.assertTrue(bad({"name": "张伟 Li"}, ["我叫李明 Li"]))            # the Chinese half is invented
 
-    def test_a_single_character_has_no_provenance_signal_and_is_not_checked(self) -> None:
-        self.assertEqual(bad({"x": "京"}, ["hello"]), [])
+    def test_a_single_character_is_checked_like_any_other_value(self) -> None:
+        """Round B (G-1): the short-value exemption is gone."""
+        self.assertTrue(bad({"x": "京"}, ["hello"]))
+        self.assertEqual(bad({"x": "京"}, ["我在京"]), [])
 
 
 class LongValuesAreChecked(unittest.TestCase):
@@ -79,19 +81,30 @@ class LongValuesAreChecked(unittest.TestCase):
     def test_a_number_in_a_long_value_must_itself_be_grounded(self) -> None:
         self.assertTrue(bad({"address": "999 Evergreen Terrace Springfield Illinois"}, self.HEARD))
 
-    def test_digits_read_out_one_by_one_are_one_value(self) -> None:
-        self.assertEqual(bad({"phone": "4 8 2 9 1 3 7"}, ["it is four eight two nine one three seven"]), [])
+    def test_digits_read_out_as_words_are_not_literal_provenance(self) -> None:
+        """Round B (G-1): number words are not converted by code. The value passes only through evidence + an independent yes."""
+        heard = ["it is four eight two nine one three seven"]
+        self.assertTrue(bad({"phone": "4 8 2 9 1 3 7"}, heard))
+        ev = [{"argument": "phone", "span": heard[0], "value_comes_from_span": True}]
+        args = {"phone": "4 8 2 9 1 3 7"}
+        self.assertEqual(grounding.check("t", args, heard, [], evidence=ev, judge=lambda *a: True), [])
+        self.assertTrue(grounding.check("t", args, heard, [], evidence=ev, judge=lambda *a: False))
         self.assertTrue(bad({"phone": "4 8 2 9 1 3 7"}, ["my number is 5 5 5 1 2 3 4"]))
 
-    def test_a_summary_reusing_the_callers_words_passes_and_an_invented_one_does_not(self) -> None:
+    def test_a_summary_is_not_literal_provenance_even_when_every_word_was_said(self) -> None:
+        """Round B (G-1): the "every part occurs somewhere" rule is gone. A summary is a composed value: evidence + an independent yes, else refused."""
         said = ["I want a refund for the blender I bought last week it is broken"]
-        self.assertEqual(bad({"summary": "refund for the broken blender bought last week"}, said), [])
+        args = {"summary": "refund for the broken blender bought last week"}
+        self.assertTrue(bad(args, said))
+        ev = [{"argument": "summary", "span": said[0], "value_comes_from_span": True}]
+        self.assertEqual(grounding.check("t", args, said, [], evidence=ev, judge=lambda *a: True), [])
         self.assertTrue(bad({"summary": "wants to upgrade the premium subscription tier immediately"}, said))
 
     def test_short_latin_values_are_unchanged(self) -> None:
         self.assertTrue(bad({"order_id": "A98231"}, ["hello"]))
         self.assertEqual(bad({"order_id": "A98231"}, ["order A98231 please"]), [])
-        self.assertEqual(bad({"state": "TX"}, ["hello"]), [])             # under 3 characters: nothing to look up
+        self.assertTrue(bad({"state": "TX"}, ["hello"]))                  # Round B (G-1): a short value is checked like any other
+        self.assertEqual(bad({"state": "TX"}, ["I live in TX"]), [])
 
 
 # ------------------------------------------------------------------ I-24

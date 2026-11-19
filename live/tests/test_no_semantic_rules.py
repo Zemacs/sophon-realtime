@@ -162,15 +162,21 @@ _PROMPT = "prompt / question text sent to a model; nothing matches against it"
 _TABLE = "data table (city names for translation provenance); the model chooses the city, the table only translates / validates it"
 _CITY = "strip the administrative suffix 市 before comparing a city NAME with the words the user said (provenance), not a decision about meaning"
 _ENUM = "closed set of developer-declared identifiers / enum values / type literals / stage names; nothing matches the user's words against it"
-_OPEN = ("PRE-EXISTING from r4 (7440dc9): the English spoken-form acceptance side of the grounding guard (number / month / currency words, spoken e-mail, "
-         "lenient literal rules). Critic G-1 (b11afd4 review): numeral conversion, word lists and language special cases in a literal path. "
-         "Scheduled for deletion in the NEXT round (round B): those forms go through the evidence + independent-judge path instead. "
-         "Pinned meanwhile by test_r4k_static_guards, so it cannot change unnoticed")
-
+_FORMAT = "format normalisation / tokenising for an exact comparison (NFKC, case, punctuation); no conversion of meaning"
+_WHOLE = "whole-token test for exact provenance: a Latin token must occur as a whole word (Daniel is not Danielle); no meaning is read"
+_HINT = "DISPLAY ONLY: the spell-it-out hint shows letter / digit runs the caller said; nothing decides on it (Round B: never a provenance candidate)"
 # (file, enclosing function, kind, digest of the expression) -> (reason, removal). The digest is of the hit EXPRESSION: editing a table or a pattern,
 # or adding a second one beside it, is a new hit and fails the test until a reviewer reads it (Critic rc3 G-1: the old key was (file, function, kind),
 # so one allowed regex let any other regex in the same function through). The trailing comment is the first line of the expression, for the reader.
 ALLOW: dict[tuple[str, str, str, str], tuple[str, str]] = {
+    ('grounding.py', '<module>', 'WORD_COLLECTION', 'decc6564'): (_ENUM, "permanent"),   # CALLER_REPLIES = ("confirm", "reject", "other")
+    ('grounding.py', '<module>', 'WORD_COLLECTION', 'fb455303'): (_ENUM, "permanent"),   # JUDGE_EQUIVALENT, JUDGE_CONFIRMS = "equivalent", "confirms"
+    ('grounding.py', '_evidence_items', 'WORD_COLLECTION', 'e4dd7f33'): (_ENUM, "permanent"),   # }, "required": ["argument", "span", "value_comes_from_span"]}
+    ('grounding.py', 'check.literal', 'RE_CALL', 'd392e94a'): (_WHOLE, "permanent"),   # if re.fullmatch(r"(?=.*[A-Za-z])[A-Za-z0-9@._\-]+", v.strip()):
+    ('grounding.py', 'norm_text', 'RE_CALL', '5cf0b726'): (_FORMAT, "permanent"),   # return re.sub(r"[^\w@.]", "", unicodedata.normalize("NFKC", str(s)).lower())
+    ('grounding.py', 'output_failed', 'WORD_COLLECTION', '7f7bf678'): (_ENUM, "permanent"),   # item.get("status") in ("failed", "incomplete"): the client's structured status enum
+    ('grounding.py', 'spelled_joins', 'RE_CALL', '1700b69c'): (_HINT, "permanent"),   # text = re.sub(r"(\w)['’](\w)", r"\1\2", text)
+    ('grounding.py', 'spelled_joins', 'RE_CALL', 'cfb90f5e'): (_HINT, "permanent"),   # toks = re.findall(r"[A-Za-z]+|\d+", text)
     ('adapters.py', '<module>', 'IMPORT_RE', '5269d420'): (_B64, "permanent"),   # import base64
     ('adapters.py', 'VllmOmniAdapter._recv', 'OBFUSCATION', '8bad184c'): (_B64D, "permanent"),   # b = base64.b64decode(e.get("delta") or "")
     ('adapters.py', 'VllmOmniAdapter.start', 'WORD_COLLECTION', 'acccab84'): (_ENUM, "permanent"),   # self.cfg = {"modalities": ["audio", "text"], "input_audio_format": "pc
@@ -255,38 +261,6 @@ ALLOW: dict[tuple[str, str, str, str], tuple[str, str]] = {
     ('gateway.py', 'clean_text', 'RE_CALL', 'e07b1597'): (_FMT, "permanent"),   # t = re.sub(r"\s*\n\s*", "" if lang == "zh" else " ", t)
     ('gateway.py', 'clean_text', 'RE_CALL', 'fcf4a16f'): (_FMT, "permanent"),   # return re.sub(r" {2,}", " ", t)
     ('grounding.py', '<module>', 'IMPORT_RE', 'c307405b'): (_IMP, "permanent"),   # import re
-    ('grounding.py', '<module>', 'RE_CALL', '62ef9ea6'): (_OPEN, "round B (Critic G-1)"),   # _CJK = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+")
-    ('grounding.py', '<module>', 'WORD_COLLECTION', '0692dc54'): (_OPEN, "round B (Critic G-1)"),   # _TENS = {w: 10 * i for i, w in enumerate("_ _ twenty thirty forty fift
-    ('grounding.py', '<module>', 'WORD_COLLECTION', '2a53c894'): (_OPEN, "round B (Critic G-1)"),   # _MONTHS = {m: i + 1 for i, m in enumerate("january february march apri
-    ('grounding.py', '<module>', 'WORD_COLLECTION', '5d95b0e8'): (_OPEN, "round B (Critic G-1)"),   # _SCALE = {"hundred": 100, "thousand": 1000, "million": 1000000}
-    ('grounding.py', '<module>', 'WORD_COLLECTION', '78cc8e20'): (_OPEN, "round B (Critic G-1)"),   # _CURRENCY = {"dollar": "usd", "buck": "usd", "euro": "eur", "pound": "
-    ('grounding.py', '<module>', 'WORD_COLLECTION', '893f0038'): (_OPEN, "round B (Critic G-1)"),   # _UNITS = {w: i for i, w in enumerate("zero one two three four five six
-    ('grounding.py', '<module>', 'WORD_COLLECTION', '8993101d'): (_OPEN, "round B (Critic G-1)"),   # _ORD = {"first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5, 
-    ('grounding.py', '<module>', 'WORD_COLLECTION', 'decc6564'): (_OPEN, "round B (Critic G-1)"),   # CALLER_REPLIES = ("confirm", "reject", "other")      # closed set the 
-    ('grounding.py', '<module>', 'WORD_COLLECTION', 'fb455303'): (_OPEN, "round B (Critic G-1)"),   # JUDGE_EQUIVALENT, JUDGE_CONFIRMS = "equivalent", "confirms"
-    ('grounding.py', '_evidence_items', 'WORD_COLLECTION', 'e4dd7f33'): (_OPEN, "round B (Critic G-1)"),   # }, "required": ["argument", "span", "value_comes_from_span"]}
-    ('grounding.py', '_norm', 'RE_CALL', 'cbacceb2'): (_OPEN, "round B (Critic G-1)"),   # return re.sub(r"[^a-z0-9@._]", "", s.lower())
-    ('grounding.py', 'check', 'RE_CALL', 'f9706c7d'): (_OPEN, "round B (Critic G-1)"),   # words = set(re.findall(r"[a-z0-9@._]+", " ".join(list(heard) + list(se
-    ('grounding.py', 'check.literal', 'RE_CALL', '7badd5d3'): (_OPEN, "round B (Critic G-1)"),   # parts = [norm_text(p) for p in re.split(r"[\s,]+", v) if norm_text(p)]
-    ('grounding.py', 'check.literal', 'RE_CALL', '8bec7e42'): (_OPEN, "round B (Critic G-1)"),   # dm = re.fullmatch(r"\d{4}-(\d{2})-(\d{2})", v.strip())
-    ('grounding.py', 'check.literal', 'RE_CALL', 'd392e94a'): (_OPEN, "round B (Critic G-1)"),   # if re.fullmatch(r"(?=.*[A-Za-z])[A-Za-z0-9@._\-]+", v.strip()):      #
-    ('grounding.py', 'norm_text', 'RE_CALL', '5cf0b726'): (_OPEN, "round B (Critic G-1)"),   # return re.sub(r"[^\w@.]", "", unicodedata.normalize("NFKC", str(s)).lo
-    ('grounding.py', 'output_failed', 'WORD_COLLECTION', '7f7bf678'): (_OPEN, "round B (Critic G-1)"),   # if item.get("error") or item.get("status") in ("failed", "incomplete")
-    ('grounding.py', 'spelled_joins', 'RE_CALL', '1700b69c'): (_OPEN, "round B (Critic G-1)"),   # text = re.sub(r"(\w)['’](\w)", r"\1\2", text)              # it's -> i
-    ('grounding.py', 'spelled_joins', 'RE_CALL', 'cfb90f5e'): (_OPEN, "round B (Critic G-1)"),   # toks = re.findall(r"[A-Za-z]+|\d+", text)
-    ('grounding.py', 'spoken_forms', 'RE_CALL', '35e6862b'): (_OPEN, "round B (Critic G-1)"),   # out = [c for w, c in _CURRENCY.items() if re.search(rf"\b{w}", t)]
-    ('grounding.py', 'spoken_forms', 'RE_CALL', '4efd96cb'): (_OPEN, "round B (Critic G-1)"),   # for m in re.finditer(r"(january|february|march|april|may|june|july|aug
-    ('grounding.py', 'spoken_forms', 'RE_CALL', '99734429'): (_OPEN, "round B (Critic G-1)"),   # for m in re.finditer(r"(?:the\s+)?(\d{1,2}|[a-z]+)(?:st|nd|rd|th)?\s+o
-    ('grounding.py', 'spoken_forms', 'RE_CALL', 'a4d7e832'): (_OPEN, "round B (Critic G-1)"),   # for m in re.finditer(r"\b(?:(twenty|thirty)\s+)?(\d{1,2}|[a-z]+)\s+([a
-    ('grounding.py', 'spoken_forms', 'RE_CALL', 'a59025ac'): (_OPEN, "round B (Critic G-1)"),   # for m in re.finditer(r"[a-z0-9._ \-]+@[a-z0-9. ]+", e):
-    ('grounding.py', 'spoken_forms', 'RE_CALL', 'b695776a'): (_OPEN, "round B (Critic G-1)"),   # for w, v in list(_UNITS.items()) + list(_TENS.items()): e = re.sub(rf"
-    ('grounding.py', 'spoken_forms', 'RE_CALL', 'bb9a63a3'): (_OPEN, "round B (Critic G-1)"),   # e = re.sub(r"(\d+)\s+(\d)\b", lambda m: str(int(m.group(1)) + int(m.gr
-    ('grounding.py', 'spoken_forms', 'RE_CALL', 'bde75b9a'): (_OPEN, "round B (Critic G-1)"),   # out.append(re.sub(r"\s+", "", m.group(0)).strip("."))
-    ('grounding.py', 'spoken_forms', 'RE_CALL', 'bf929d5c'): (_OPEN, "round B (Critic G-1)"),   # t2 = re.sub(r"twenty twenty (one|two|three|four|five|six|seven|eight|n
-    ('grounding.py', 'spoken_forms', 'RE_CALL', 'e6c3d548'): (_OPEN, "round B (Critic G-1)"),   # toks = re.findall(r"[a-z]+|\d+", t); run = []
-    ('grounding.py', 'word_numbers', 'RE_CALL', '002dfb51'): (_OPEN, "round B (Critic G-1)"),   # out = [re.sub(r"[,$]", "", m) for m in re.findall(r"\$?\d[\d,]*(?:\.\d
-    ('grounding.py', 'word_numbers', 'RE_CALL', '0e4e4d16'): (_OPEN, "round B (Critic G-1)"),   # toks = re.findall(r"[a-z]+", text.lower().replace("-", " "))
-    ('grounding.py', 'word_numbers', 'RE_CALL', '83f7d1b8'): (_OPEN, "round B (Critic G-1)"),   # out = [re.sub(r"[,$]", "", m) for m in re.findall(r"\$?\d[\d,]*(?:\.\d
     ('model_client.py', '<module>', 'WORD_COLLECTION', '8af86e3d'): (_ENUM, "permanent"),   # DEFAULT_BUDGET_S = {"jev": 1.5, "orch": 30.0, "tag": 15.0}
     ('realtime.py', '<module>', 'IMPORT_RE', '5269d420'): (_B64, "permanent"),   # import base64
     ('realtime.py', 'RealtimeSession._engine_events', 'WORD_COLLECTION', '3a7d3cfd'): (_ENUM, "permanent"),   # if t in ("audio", "text"):
@@ -402,13 +376,26 @@ class ScannerCatchesBypasses(unittest.TestCase):
         self.assertTrue(any(k[2] == "RE_CALL" for k in new))
 
     def test_editing_an_allowed_table_or_pattern_is_a_new_hit_G1(self) -> None:
-        """A word added to the (allowed) spoken-form tables or a widened regex changes the expression digest: it is not the allowed expression any more."""
-        for rel, old, new_ in (("grounding.py", '"hundred": 100,', '"hundred": 100, "dozen": 12,'),
-                                                              ("grounding.py", '"dollar": "usd",', '"dollar": "usd", "grand": "usd",')):
+        """A word added to an allowed closed set or a widened regex changes the expression digest: it is not the allowed expression any more."""
+        for rel, old, new_ in (("grounding.py", '("confirm", "reject", "other")', '("confirm", "reject", "other", "maybe")'),
+                                                              ("grounding.py", '[A-Za-z0-9@._\\-]+", v.strip()', '[A-Za-z0-9@._\\-]+|\\d+", v.strip()')):
             src = (_PKG / rel).read_text(encoding="utf-8")
             self.assertIn(old, src, (rel, old))
             new = [k for k in scan_source(rel, src.replace(old, new_, 1)) if k not in ALLOW]
             self.assertTrue(new, (rel, new_))
+
+    def test_the_grounding_literal_path_holds_no_word_list_or_number_table_G1_round_b(self) -> None:
+        """Round B: the grounding module's only allowed hits are closed sets of our own identifiers and format / whole-token patterns; a number-word, month or
+        currency table (or a pattern that rebuilds spoken numbers, dates or e-mails) would be a new, unallowed hit."""
+        for k in scan_package():
+            if k[0] == "grounding.py":
+                self.assertIn(k, ALLOW, k)
+                if k[2] != "IMPORT_RE":
+                    self.assertIn(ALLOW[k][0], (_ENUM, _WHOLE, _FORMAT, _HINT), k)
+        src = (_PKG / "grounding.py").read_text(encoding="utf-8")
+        for planted in ('_ONES = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10}\n',
+                        '_M = ("january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december")\n', 'import re as _r\n_E = _r.compile(r"\\sat\\s")\n'):
+            self.assertTrue([k for k in scan_source("grounding.py", src + "\n" + planted) if k not in ALLOW], planted)
 
     def test_the_allowlist_is_keyed_by_the_expression_not_the_function(self) -> None:
         self.assertTrue(all(len(k) == 4 and len(k[3]) == 8 for k in ALLOW))

@@ -290,10 +290,12 @@ class N4_NoFuzzyMatching(unittest.TestCase):
             bad, _ = check({"v": value}, [f"it is {said}"])
             self.assertTrue(bad, (value, said))
 
-    def test_exact_values_and_spoken_forms_still_pass(self) -> None:
-        for value, said in (("jon.smith@acme.com", "it is jon.smith@acme.com"), ("jon@acme.com", "jon at acme dot com"), ("Allan", "my name is Allan"),
-                            ("19122", "one nine one two two")):
+    def test_exact_values_pass_and_spoken_forms_do_not(self) -> None:
+        """Round B (G-1): only an exact occurrence is literal; a spoken form is refused alone (and goes to evidence + the judge, see test_r4m_g1_literal_only)."""
+        for value, said in (("jon.smith@acme.com", "it is jon.smith@acme.com"), ("Allan", "my name is Allan")):
             self.assertEqual(check({"v": value}, [said])[0], [], (value, said))
+        for value, said in (("jon@acme.com", "jon at acme dot com"), ("19122", "one nine one two two")):
+            self.assertTrue(check({"v": value}, [said])[0], (value, said))
 
     def test_a_misheard_name_takes_the_evidence_path(self) -> None:
         bad, judged = check({"name": "Allen"}, ["my name is Allan"], evidence=ev("name", "my name is Allan"), judge=lambda *a: True)

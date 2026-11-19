@@ -53,9 +53,10 @@ class GroundingIsProvenanceOnly(unittest.TestCase):
         self.assertEqual(_bad({"zip": "90210"}, ["look it up"], ["{'zip': '90210', 'city': 'Beverly Hills'}"]), [])
         self.assertTrue(_bad({"zip": "90210"}, ["look it up"], ["{'zip': '10001'}"]))
 
-    def test_spoken_forms_of_a_said_value_still_count(self) -> None:
-        self.assertEqual(_bad({"email": "jon@acme.com"}, ["jon at acme dot com"]), [])
-        self.assertEqual(_bad({"zip": "19122"}, ["one nine one two two"]), [])
+    def test_spoken_forms_of_a_said_value_are_not_literal_provenance(self) -> None:
+        """Round B (G-1): a spoken form is not an exact occurrence. Without the model's evidence + an independent yes it is refused; see test_r4m_g1_literal_only.py."""
+        self.assertTrue(_bad({"email": "jon@acme.com"}, ["jon at acme dot com"]))
+        self.assertTrue(_bad({"zip": "19122"}, ["one nine one two two"]))
 
     def test_no_argument_key_is_exempt_by_name(self) -> None:
         """4g and before: values under summary / reason / query / note ... were never checked. A short model-invented value there is now caught."""

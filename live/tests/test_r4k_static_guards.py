@@ -54,8 +54,9 @@ class RegexPatternsArePinned(unittest.TestCase):
 class CorePatternsAndTablesArePinned(unittest.TestCase):
     """N-8: the regular expressions and the literal tables of grounding.py (the module that decides whether a value was said) are pinned the same way.
     A new pattern, or a changed spoken-form table, fails here until the pin is changed in review. Nothing else in the judging modules may use ``re`` at all."""
-    GROUNDING_PATTERNS = ["(?:the\\s+)?(\\d{1,2}|[a-z]+)(?:st|nd|rd|th)?\\s+of\\s+(january|february|march|april|may|june|july|august|september|october|november|december)", "(?=.*[A-Za-z])[A-Za-z0-9@._\\-]+", "(\\d+)\\s+(\\d)\\b", "(\\w)['’](\\w)", "(january|february|march|april|may|june|july|august|september|october|november|december)\\s+(?:the\\s+)?(\\d{1,2}|[a-z]+(?:\\s[a-z]+)?)(?:st|nd|rd|th)?(?:,?\\s*(\\d{4}))?", "[,$]", "[A-Za-z]+|\\d+", "[\\s,]+", "[\\u3400-\\u4dbf\\u4e00-\\u9fff\\uf900-\\ufaff]+", "[^\\w@.]", "[^a-z0-9@._]", "[a-z0-9._ \\-]+@[a-z0-9. ]+", "[a-z0-9@._]+", "[a-z]+", "[a-z]+|\\d+", "\\$?\\d[\\d,]*(?:\\.\\d+)?", "\\b(?:(twenty|thirty)\\s+)?(\\d{1,2}|[a-z]+)\\s+([a-f])\\b", "\\d{4}-(\\d{2})-(\\d{2})", "\\s+", "f'\\\\b{w}'", "f'\\\\b{w}\\\\b'", "twenty twenty (one|two|three|four|five|six|seven|eight|nine)"]
-    GROUNDING_TABLES = {"NUM_WORDS": "e990b103d7c257cf", "_UNITS": "3beaa25643d36892", "_TENS": "60bde3ed5a1d8140", "_SCALE": "a88a1c029caecf4f", "_MONTHS": "ee80feb56c06ba76", "_ORD": "23396ee0f0dc8289", "_CURRENCY": "fc0f099115ad13cf"}
+    # Round B (G-1): 23 patterns -> 4. Latin whole-token test, the format normaliser, and the two of the DISPLAY-ONLY spell-it-out hint (spelled_joins).
+    GROUNDING_PATTERNS = ["(?=.*[A-Za-z])[A-Za-z0-9@._\\-]+", "(\\w)['’](\\w)", "[A-Za-z]+|\\d+", "[^\\w@.]"]
+    REMOVED_TABLES = ("NUM_WORDS", "_UNITS", "_TENS", "_SCALE", "_MONTHS", "_ORD", "_CURRENCY", "word_numbers", "spoken_forms")
 
     @staticmethod
     def _patterns(rel: str) -> list[str]:
@@ -67,12 +68,10 @@ class CorePatternsAndTablesArePinned(unittest.TestCase):
     def test_grounding_uses_exactly_these_patterns(self) -> None:
         self.assertEqual(self._patterns("grounding.py"), self.GROUNDING_PATTERNS)
 
-    def test_the_spoken_form_tables_are_unchanged(self) -> None:
-        import hashlib
-        import json
+    def test_the_spoken_form_tables_and_converters_stay_deleted(self) -> None:
         from sophon_live import grounding
-        got = {n: hashlib.sha256(json.dumps(getattr(grounding, n), sort_keys=True, ensure_ascii=True).encode()).hexdigest()[:16] for n in self.GROUNDING_TABLES}
-        self.assertEqual(got, self.GROUNDING_TABLES)
+        for n in self.REMOVED_TABLES:
+            self.assertFalse(hasattr(grounding, n), n)
 
     def test_no_other_judging_module_uses_re(self) -> None:
         for rel in ("realtime.py", "backend.py", "failcodes.py", "coordinator/span_judge.py", "coordinator/jev_client.py", "model_client.py"):

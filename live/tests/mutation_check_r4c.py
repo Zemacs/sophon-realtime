@@ -14,6 +14,7 @@ T_S18 = ["tests.test_r4_s18_s21", "tests.test_no_fabrication", "tests.test_r4_re
 T_D = ["tests.test_r4d_s23_s24", "tests.test_r4_news_evidence"]
 T_E = ["tests.test_r4d_s23_s24", "tests.test_r4_s18_s21", "tests.test_no_fabrication", "tests.test_r4_review_b1", "tests.test_r4_search_evidence", "tests.test_r4_news_evidence"]
 ORCH = "sophon_live/assistant_tools/orchestrator.py"
+MC = "sophon_live/model_client.py"; JC = "sophon_live/coordinator/jev_client.py"
 GR = "sophon_live/grounding.py"; RT = "sophon_live/realtime.py"; GW = "sophon_live/gateway.py"
 T_G = ["tests.test_r4g_failure_hint", "tests.test_assistant_tools"]
 T_H = ["tests.test_r4h_grounding_news"]
@@ -221,10 +222,25 @@ M = [
  ('R1 orchestrator: the LLM step bypasses the breaker', ORCH, 'await model_client.call("orch", _step, retries=1, total_s=timeout)', 'await _step()', T_R1),
  ('R1 orchestrator: a 5xx is not counted against the breaker', ORCH, '                if status >= 500:', '                if False:', T_R1),
  ('R1 orchestrator: a 400 is not retried without the optional fields', ORCH, '                if status == 400 and ("chat_template_kwargs" in body or "tool_choice" in body):', '                if False:', T_R1),
- ('R1 orchestrator: the worker budget default is 120 s again', ORCH, '_DEFAULT_TIMEOUT = 30.0', '_DEFAULT_TIMEOUT = 120.0', T_R1),
+ ('R1 orchestrator: the worker budget default is 30 s', ORCH, '_DEFAULT_TIMEOUT = 120.0', '_DEFAULT_TIMEOUT = 30.0', T_R1),
+ ('R1 model_client: the orch budget default is 30 s', 'sophon_live/model_client.py', '"orch": 120.0', '"orch": 30.0', T_R1),
  ('R1 adapters: the Tag connect is reported under another breaker name', AD, 'model_client.call("tag",', 'model_client.call("jev",', T_R1),
- ('R1 gateway: /health?detail=1 never returns the detail', GW, '    return _health_detail() if "detail=1" in query.split("&") else None', '    return None', T_R1),
- ('R1 gateway: any query returns the detail', GW, '    return _health_detail() if "detail=1" in query.split("&") else None', '    return _health_detail()', T_R1),
+ ('R1 gateway: /health?detail=1 never returns the detail', GW, '    return _health_detail() if _wants_detail(query) and _is_local_peer(peer, headers) else None', '    return None', T_R1),
+ ('R1 gateway: any query returns the detail', GW, '    return _health_detail() if _wants_detail(query) and _is_local_peer(peer, headers) else None', '    return _health_detail() if _is_local_peer(peer, headers) else None', T_R1),
+ ('I-5 gateway: the peer is not checked (any caller gets the detail)', GW, '    return _health_detail() if _wants_detail(query) and _is_local_peer(peer, headers) else None', '    return _health_detail() if _wants_detail(query) else None', T_R1),
+ ('I-5 gateway: forwarding headers are ignored', GW, '    return _health_detail() if _wants_detail(query) and _is_local_peer(peer, headers) else None', '    return _health_detail() if _wants_detail(query) and _is_local_peer(peer, None) else None', T_R1),
+ ('I-5 gateway: every peer is local', GW, '    return (getattr(ip, "ipv4_mapped", None) or ip).is_loopback', '    return True', T_R1),
+ ('I-5 gateway: private networks count as local', GW, '    return (getattr(ip, "ipv4_mapped", None) or ip).is_loopback', '    return (getattr(ip, "ipv4_mapped", None) or ip).is_private', T_R1),
+ ('I-5 gateway: an IPv4-mapped address is not unwrapped', GW, '    return (getattr(ip, "ipv4_mapped", None) or ip).is_loopback', '    return ip.is_loopback', T_R1),
+ ('I-5 gateway: an unparsable peer is local', GW, '    except (TypeError, ValueError, IndexError):\n        return False', '    except (TypeError, ValueError, IndexError):\n        return True', T_R1),
+ ('I-5 gateway: X-Forwarded-For is no longer a forwarding header', GW, '_PROXY_HEADERS = ("x-forwarded-for", ', '_PROXY_HEADERS = (', T_R1),
+ ('I-5 gateway: a refused detail request is answered 200 ok', GW, '        return conn.respond(403, ', '        return conn.respond(200, ', T_R1),
+ ('I-5 gateway: a refused detail request falls through to plain ok', GW, '    if _wants_detail(query):\n        return conn.respond(403', '    if False:\n        return conn.respond(403', T_R1),
+ ('I-5 model_client: last_error carries the exception message', MC, '    return f"http {e.status}" if isinstance(e, HttpStatusError) else type(e).__name__', '    return str(e)', T_R1),
+ ('I-5 model_client: the breaker records the exception text', MC, 'br.failure(f"{reason}: {error_label(e)}")', 'br.failure(f"{reason}: {e}")', T_R1),
+ ('I-5 model_client: ModelUnavailable carries the exception text', MC, 'raise ModelUnavailable(name, reason, error_label(e)) from e', 'raise ModelUnavailable(name, reason, str(e)) from e', T_R1),
+ ('I-5 jev_client: the HTTP error carries the response body', JC, 'raise model_client.HttpStatusError(resp.status)  ', 'raise RuntimeError(f"jev http {resp.status}: {text[:300]}")  ', T_R1),
+ ('I-5 orchestrator: a non-JSON 5xx body is carried in the exception', ORCH, 'raise model_client.HttpStatusError(status) from e ', 'raise RuntimeError(f"orch bad json {status}: {raw[:200]}") from e ', T_R1),
  ('R1 gateway: the downstream snapshot is left out of the detail', GW, '"downstream": model_client.snapshot(),', '"downstream": {},', T_R1),
  ('R1 gateway: the bind address defaults to all interfaces', GW, 'or "127.0.0.1"\n', 'or "0.0.0.0"\n', T_R1),
  # Round B (Critic G-1): the literal path is an exact comparison; each removed rule must stay removed (tests/test_r4m_g1_literal_only.py)

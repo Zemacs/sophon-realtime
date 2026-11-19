@@ -32,7 +32,7 @@ class AdmitResult:
     ledger: Ledger | None = None
     control: ControlDecision | None = None  # set when a CONTROL op was applied (or refused)
     stale_task: tuple[str, int] | None = None  # (task_id, version) whose in-flight worker must stop
-    via: str = "heuristic"  # who decided: guard | jev | heuristic
+    via: str = "none"  # who decided: jev | degraded (none = not decided by admit)
     jev_ms: float | None = None  # Karpo round trip, when JEV was asked
     judge_invalid: list = field(default_factory=list)   # RC2-8: router answers that were not an offered option ("tool:invalid", "tool:missing")
     degraded_reason: str = ""  # via=degraded: breaker_open | timeout | connection | error | non_option_answer | jev_disabled
@@ -54,8 +54,9 @@ def _clarify_text_for_task(objective: str) -> str:
     return clarify_for_slots(None)
 
 
-def _parse_control_key(key: str | None) -> ControlDecision | None:
-    if not key or key == "NEW":
+def _parse_control_key(key: object) -> ControlDecision | None:
+    """The ``control`` option key ``OP:task_id:version`` -> a decision; anything that is not such a string (a number, a list, a bad version) -> None."""
+    if not isinstance(key, str) or not key or key == "NEW":
         return None
     parts = key.split(":")
     if len(parts) != 3 or parts[0] not in ("CANCEL", "STATUS", "REFINE"):
@@ -77,7 +78,7 @@ def _decision_label(res: "AdmitResult") -> str:
 
 async def admit(req: AdmitRequest, ledger: Ledger) -> AdmitResult:
     """Frontend → Coordinator. Wraps the routing with one structured, per-utterance decision log line."""
-    meta: dict = {"via": "heuristic", "jev_ms": None}
+    meta: dict = {"via": "none", "jev_ms": None}
     t0 = time.monotonic()
     res = await _admit(req, ledger, meta)
     res.via = meta["via"]
@@ -104,6 +105,17 @@ def _invalid(question: str, answer: object, meta: dict) -> None:
     log.warning("router gave a %s answer to the %r question (%r): treated as unknown, not guessed", kind, question, str(answer)[:40])
 
 
+def _pick(resp: object, question: str, meta: dict, *, asked: bool = True) -> str | None:
+    """The router's option key for ``question`` as a string. A missing or non-string answer to a question that WAS asked is counted and traced (``_invalid``),
+    never guessed and never silent; the other questions' answers are unaffected (Critic I-2)."""
+    raw = jev_client.raw_choice(resp, question)
+    if isinstance(raw, str):
+        return raw
+    if asked:
+        _invalid(question, raw, meta)
+    return None
+
+
 async def _admit(req: AdmitRequest, ledger: Ledger, meta: dict) -> AdmitResult:
     text = (req.delegate_task or req.text or "").strip()
     # JEV decides the route. When it cannot (down, slow, breaker open, or an answer that is not one of the offered options)
@@ -125,18 +137,21 @@ async def _admit(req: AdmitRequest, ledger: Ledger, meta: dict) -> AdmitResult:
             t_jev = time.monotonic()
             resp = await jev_client.system_one(state, questions)
             meta["jev_ms"] = (time.monotonic() - t_jev) * 1000
-            route = jev_client.choice_answer(resp, "route")
+            route = _pick(resp, "route", meta)
             if route in _ROUTES:
-                control_key = jev_client.choice_answer(resp, "control")
-                tool_choice = jev_client.choice_answer(resp, intent.TOOL_KEY)
+                meta["via"] = "jev"
+                # RC2-8 / I-2: an answer that is not one of the offered options (or not even a string) is never guessed AND never silent: it is counted
+                # (JUDGE_STATS) and traced (judge_invalid). One bad field does not drop the others.
+                control_key = _pick(resp, "control", meta, asked="control" in questions)
+                tool_choice = _pick(resp, intent.TOOL_KEY, meta)
                 tools = intent.tools_from_answer(tool_choice)
                 explicit_save = intent.explicit_save_from_answer(tool_choice)
-                # RC2-8: an answer that is not one of the offered options is never guessed AND never silent: it is counted and traced
-                if tools is None:
+                if tool_choice is not None and tools is None:
                     _invalid("tool", tool_choice, meta)
-                meta["via"] = "jev"
                 log.info("jev route=%s control=%s utterance=%r", route, control_key, text[:80])
             else:
+                if route is not None:
+                    _invalid("route", route, meta)                  # a string that is not one of the offered routes
                 route, reason = None, "non_option_answer"
         except model_client.ModelUnavailable as e:
             reason = e.reason
@@ -183,11 +198,14 @@ async def _admit(req: AdmitRequest, ledger: Ledger, meta: dict) -> AdmitResult:
         decision = _parse_control_key(control_key)
         if decision is not None:
             return _apply_control(decision, text, req, ledger, tools, explicit_save)
+        if control_key not in (None, "NEW"):
+            _invalid("control", control_key, meta)                  # a string that is not an offered option key: unusable, counted
     if route == "CONTROL":
         if control_key != "NEW":
-            # JEV said CONTROL but named no usable target: only the router could tell what to do, so ask (model-free, fixed sentence).
-            log.warning("route=CONTROL without a usable control option (%r): fixed clarify", control_key)
-            return AdmitResult(speak=SpeakPlan(kind="clarify", text=DEGRADED_CLARIFY), route="CLARIFY", ledger=ledger)
+            # CONTROL but no usable target (none asked because nothing is live, missing, or unusable): the model-free degraded behaviour decides what is safe:
+            # a live task -> one fixed question, no live task -> the sentence is a new task (Critic I-2). The model's tool judgment is kept for that new task.
+            log.warning("route=CONTROL without a usable control option (%r): degraded", control_key)
+            return _degrade(text, req, ledger, meta, "control_without_target", tools=tools, explicit_save=explicit_save)
 
     # WORKER or CONTROL→NEW or CONTROL with nothing to control
     job = _new_job(ledger, text, language=req.language, tools=tools, explicit_save=explicit_save)
@@ -204,7 +222,7 @@ async def _admit(req: AdmitRequest, ledger: Ledger, meta: dict) -> AdmitResult:
     )
 
 
-def _degrade(text: str, req: AdmitRequest, ledger: Ledger, meta: dict, reason: str) -> AdmitResult:
+def _degrade(text: str, req: AdmitRequest, ledger: Ledger, meta: dict, reason: str, *, tools: list[str] | None = None, explicit_save: bool | None = None) -> AdmitResult:
     """Router unavailable: model-free safe behaviour, no keyword semantics.
 
     No live task -> the utterance is a new task for the orchestrator (a model reads it). A live task -> one fixed
@@ -216,9 +234,9 @@ def _degrade(text: str, req: AdmitRequest, ledger: Ledger, meta: dict, reason: s
         log.warning("coord degraded (%s): live task -> fixed clarify", reason)
         return AdmitResult(speak=SpeakPlan(kind="clarify", text=DEGRADED_CLARIFY), route="CLARIFY", ledger=ledger)
     log.warning("coord degraded (%s): no live task -> new task for orch", reason)
-    job = _new_job(ledger, text, language=req.language, tools=None)      # router down: nothing is forced and the judgment is recorded as unknown
+    job = _new_job(ledger, text, language=req.language, tools=tools, explicit_save=explicit_save)      # router down: nothing forced, judgment "unknown" (tools=None)
     return AdmitResult(
-        speak=SpeakPlan(kind="pad", text="", task_id=job.task_id, version=job.version),
+        speak=SpeakPlan(kind="pad", text="" if tools is None else intent.pad_for_tools(tools), task_id=job.task_id, version=job.version),
         job=job, route="WORKER", ledger=ledger,
     )
 

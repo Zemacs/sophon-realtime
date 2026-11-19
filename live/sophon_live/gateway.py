@@ -158,9 +158,42 @@ def _health_detail() -> bytes:
                       ensure_ascii=False).encode()
 
 
-def _health_body(query: str) -> bytes | None:
-    """The JSON body for ``/health?<query>`` when the query asks for ``detail=1``; None = plain liveness ("ok")."""
-    return _health_detail() if "detail=1" in query.split("&") else None
+_PROXY_HEADERS = ("x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "x-real-ip", "forwarded", "via", "x-original-forwarded-for", "cf-connecting-ip")
+
+
+def _is_local_peer(peer, headers=None) -> bool:
+    """True only when the TCP peer of this request is the machine itself (loopback, incl. an IPv4-mapped ::ffff:127.x) AND the request carries no proxy
+    header. Proxy headers are never trusted as an address: their mere presence means the request was forwarded, so a local reverse proxy does not turn an
+    outside caller into a "local" one (R-A' / Critic I-5). ``peer`` is the ``(host, port, ...)`` tuple of ``conn.remote_address``."""
+    import ipaddress
+    if headers is not None and any(hdr in headers for hdr in _PROXY_HEADERS):
+        return False
+    try:
+        ip = ipaddress.ip_address(str(peer[0]).split("%")[0])
+    except (TypeError, ValueError, IndexError):
+        return False
+    return (getattr(ip, "ipv4_mapped", None) or ip).is_loopback
+
+
+def _health_body(query: str, peer=None, headers=None) -> "bytes | None":
+    """The JSON body for ``/health?<query>`` when the query asks for ``detail=1`` AND the request comes from this machine; None otherwise.
+    Use ``_wants_detail`` to tell "plain liveness" from "detail refused"."""
+    return _health_detail() if _wants_detail(query) and _is_local_peer(peer, headers) else None
+
+
+def _wants_detail(query: str) -> bool:
+    return "detail=1" in query.split("&")
+
+
+def _health_response(conn, req):
+    """``/health``: plain liveness for everyone (``ok``); ``?detail=1`` only for this machine (403 for anyone else; X-Forwarded-For is never trusted)."""
+    query = req.path.partition("?")[2]
+    detail = _health_body(query, getattr(conn, "remote_address", None), req.headers)
+    if detail is not None:
+        return Response(200, "OK", Headers([("Content-Type", "application/json")]), detail)
+    if _wants_detail(query):
+        return conn.respond(403, "Forbidden: /health?detail=1 answers only requests from this machine\n")
+    return conn.respond(200, "ok\n")
 
 
 class ASR:
@@ -1032,10 +1065,7 @@ def main() -> None:
             return Response(200, "OK", Headers([("Content-Type", "text/html; charset=utf-8"), ("Content-Length", str(len(body))),
                                                 ("Cache-Control", "no-cache")]), body)
         if path == "/health":
-            detail = _health_body(req.path.partition("?")[2])
-            if detail is not None:
-                return Response(200, "OK", Headers([("Content-Type", "application/json")]), detail)
-            return conn.respond(200, "ok\n")                      # plain liveness of this gateway, unchanged
+            return _health_response(conn, req)                      # plain liveness of this gateway, unchanged
         if path not in (args.path, "/v1/realtime"):
             return conn.respond(404, "Not Found\n")
         if path == "/v1/realtime" and realtime_keys:              # keyed access for external evaluators (e.g. Artificial Analysis)

@@ -30,7 +30,7 @@ _DEFAULT_URL = "http://127.0.0.1:8101/v1/chat/completions"
 _DEFAULT_MODEL = "qwen3.8-27b-bo"
 _DEFAULT_KEY = "local"
 _DEFAULT_STEPS = 6
-_DEFAULT_TIMEOUT = 30.0   # measured Worker p50 0.66 s / p95 2.23 s; see model_client for the evidence (was 120 s)
+_DEFAULT_TIMEOUT = 120.0  # unchanged default; the final value comes from the unfreeze-window latency / truncation data (see model_client); env: SOPHON_LIVE_ORCH_TIMEOUT
 
 SYS = (
     "You are the tool-executing worker behind a voice assistant. "
@@ -264,16 +264,20 @@ async def run_job(
                     except Exception as e:  # noqa: BLE001
                         raw = await r.text()
                         log.warning("orch LLM bad JSON HTTP %s: %r body=%s", status, e, raw[:300])
+                        if status >= 500:
+                            raise model_client.HttpStatusError(status) from e       # a sick service with a non-JSON body: the status is the whole story
                         raise RuntimeError("orch bad json") from e
                 if status == 400 and ("chat_template_kwargs" in body or "tool_choice" in body):
-                    # retry once without chat_template_kwargs / tool_choice if rejected (the guard below still applies)
+                    # ``body`` is OUR request. This checks whether OUR request carried either of these two optional keys (it reads nothing the server sent
+                    # back); if so a 400 is retried ONCE without them. The retry drops ``tool_choice`` too, so a forced tool call is given up and
+                    # ``_evidence_has_required`` below is what still enforces it.
                     body.pop("chat_template_kwargs", None)
                     body.pop("tool_choice", None)
                     async with cs.post(url, json=body, headers=headers) as r2:
                         status = r2.status
                         j = await r2.json(content_type=None)
                 if status >= 500:
-                    raise RuntimeError(f"orch HTTP {status}")      # the service is sick: counts against the breaker
+                    raise model_client.HttpStatusError(status)      # the service is sick: counts against the breaker (status only: no body in the exception)
                 return status, j
 
             try:

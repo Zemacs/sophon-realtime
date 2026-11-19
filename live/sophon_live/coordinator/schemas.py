@@ -205,7 +205,7 @@ class ControlDecision:
     op: Literal["CANCEL", "STATUS", "REFINE"]
     task_id: str
     version: int
-    via: Literal["jev", "heuristic", "guard"] = "heuristic"
+    via: Literal["jev", "guard"] = "jev"
 
     @property
     def key(self) -> str:

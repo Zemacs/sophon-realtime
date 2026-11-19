@@ -191,12 +191,15 @@ class Behaviour(_Base):
     def test_control_without_a_target_with_a_live_task_is_still_not_guessed(self) -> None:
         ledger = self._ledger_with_a_finished_task()
         row = self.run_one("取消吧", jev=_jev_answering("CONTROL"), ledger=ledger)
-        self.assertEqual((row["route"], row["control_via"], row["via"], row["degraded"], row["handled_by"]), ("CLARIFY", None, "jev", False, "clarify"))
+        # R-A' (Critic I-2): a CONTROL with no usable target is handled by the degraded branch (a live task -> the one fixed question), and says so
+        self.assertEqual((row["route"], row["control_via"], row["via"], row["degraded"], row["degraded_reason"], row["handled_by"]),
+                         ("CLARIFY", None, "degraded", True, "control_without_target", "clarify"))
         self.assertNotEqual(row["decision"], "CANCEL")
 
-    def test_control_without_a_usable_target_is_a_fixed_clarify_decided_by_the_model_s_route(self) -> None:
-        row = self.run_one("嗯", jev=_jev_answering("CONTROL"))                    # no target, no ledger task: production asks (fixed sentence), it does not guess
-        self.assertEqual((row["route"], row["decision"], row["control_via"], row["via"], row["degraded"], row["handled_by"]), ("CLARIFY", "CLARIFY", None, "jev", False, "clarify"))
+    def test_control_with_nothing_live_to_control_becomes_a_new_task_through_the_degraded_branch(self) -> None:
+        row = self.run_one("嗯", jev=_jev_answering("CONTROL"))                    # no ledger task: there is no "刚才那件事" to ask about (R-A' / Critic I-2)
+        self.assertEqual((row["route"], row["decision"], row["control_via"], row["via"], row["degraded"], row["degraded_reason"], row["handled_by"]),
+                         ("WORKER", "NEW", None, "degraded", True, "control_without_target", "worker"))
 
     def test_control_via_is_the_applied_decisions_own_label_not_a_constant(self) -> None:
         """The runner records production's label for the applied ControlDecision verbatim. Production now only builds ``via="jev"`` controls, so a stand-in

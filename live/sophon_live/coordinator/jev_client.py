@@ -36,29 +36,39 @@ async def system_one(
                 text = await resp.text()
                 if resp.status >= 400:
                     log.warning("jev HTTP %s: %s", resp.status, text[:300])
-                    raise RuntimeError(f"jev HTTP {resp.status}: {text[:200]}")
+                    raise model_client.HttpStatusError(resp.status)             # the body stays in the log line above, never in the exception
                 try:
                     return await resp.json(content_type=None)
                 except Exception as e:  # noqa: BLE001
-                    raise RuntimeError(f"jev bad json: {text[:200]}") from e
+                    log.warning("jev bad json (HTTP %s): %s", resp.status, text[:200])
+                    raise RuntimeError("jev bad json") from e
 
     # Raises model_client.ModelUnavailable (breaker open / timeout / connection / error); the caller degrades model-free.
     return await model_client.call("jev", _once, retries=1, total_s=DEFAULT_TIMEOUT)
 
 
-def choice_answer(resp: dict[str, Any], key: str) -> str | None:
-    ans = (resp.get("answers") or {}).get(key) or {}
-    if ans.get("type") == "choice":
+def raw_choice(resp: Any, key: str) -> Any:
+    """The ``choice`` of a ``choice`` answer to question ``key`` exactly as the router sent it (any JSON type), or None. Never raises on a wrongly shaped response
+    (a list where a dict belongs, a bare string answer, ...): a bad field is unusable, it must not take the other answers down (Critic I-2)."""
+    answers = resp.get("answers") if isinstance(resp, dict) else None
+    ans = answers.get(key) if isinstance(answers, dict) else None
+    if isinstance(ans, dict) and ans.get("type") == "choice":
         return ans.get("choice")
     return None
 
 
-def noul_prob(resp: dict[str, Any], key: str) -> float | None:
-    ans = (resp.get("answers") or {}).get(key) or {}
-    if ans.get("type") == "noul":
-        v = ans.get("noul")
+def choice_answer(resp: Any, key: str) -> str | None:
+    """The router's option key (a string) for question ``key``; None when the answer is missing or not a string (the caller counts it as invalid)."""
+    c = raw_choice(resp, key)
+    return c if isinstance(c, str) else None
+
+
+def noul_prob(resp: Any, key: str) -> float | None:
+    answers = resp.get("answers") if isinstance(resp, dict) else None
+    ans = answers.get(key) if isinstance(answers, dict) else None
+    if isinstance(ans, dict) and ans.get("type") == "noul":
         try:
-            return float(v)
+            return float(ans.get("noul"))
         except (TypeError, ValueError):
             return None
     return None

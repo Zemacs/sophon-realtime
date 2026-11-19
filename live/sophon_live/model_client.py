@@ -11,8 +11,10 @@ safe: a fixed sentence, an honest failure, or handing the request to the next st
 Budgets (override with ``SOPHON_LIVE_TIMEOUT_<NAME>`` seconds; evidence for the defaults):
   jev   1.5 s  Karpo Decision 31B answers the route question in p50 103 ms / p99 514 ms (P1-G01 probe, server run 11-18);
                 the old 8 s only added dead air when the service was down.
-  orch  30 s   whole tool-backed job (<= 6 LLM steps + tools); measured Worker p50 0.66 s / p95 2.23 s; the old 120 s
-                outlasts any spoken-turn patience.
+  orch  120 s  whole tool-backed job (<= 6 LLM steps + tools). Unchanged from before this round: the measured Worker p50 0.66 s / p95 2.23 s
+                is a relayed sample and says nothing about the TAIL or about truncating a legitimately long job, so the final value is to be
+                set from the latency / truncation distribution recorded in the unfreeze window (override: ``SOPHON_LIVE_ORCH_TIMEOUT``, the one the
+                orchestrator reads; ``SOPHON_LIVE_TIMEOUT_ORCH`` only changes the value ``/health?detail=1`` reports).
   tag   15 s   websocket open + session.created; unchanged (cold vLLM-Omni session setup is a few seconds).
 Breaker (``SOPHON_LIVE_BREAKER_<NAME>_N`` consecutive failures, ``..._OPEN_S`` seconds): default N=3, open 15 s, then one
 half-open probe call decides.
@@ -28,10 +30,24 @@ from typing import Any, Awaitable, Callable
 
 log = logging.getLogger("sophon_live.model_client")
 
-DEFAULT_BUDGET_S = {"jev": 1.5, "orch": 30.0, "tag": 15.0}
+DEFAULT_BUDGET_S = {"jev": 1.5, "orch": 120.0, "tag": 15.0}
 DEFAULT_BREAKER_N = 3
 DEFAULT_BREAKER_OPEN_S = 15.0
 RETRY_BASE_S = 0.1
+
+
+class HttpStatusError(RuntimeError):
+    """A downstream answered with an HTTP error status. Carries ONLY the status code: the response body is never kept in the exception, so it cannot reach
+    ``last_error`` / ``/health`` / a ModelUnavailable message (R-A' / Critic I-5)."""
+
+    def __init__(self, status: int) -> None:
+        super().__init__(f"HTTP {status}")
+        self.status = status
+
+
+def error_label(e: BaseException) -> str:
+    """What may be remembered / shown about a failure: the exception CLASS, or ``http <status>``. Never the message (it can echo a downstream body)."""
+    return f"http {e.status}" if isinstance(e, HttpStatusError) else type(e).__name__
 
 
 class ModelUnavailable(Exception):
@@ -185,8 +201,8 @@ async def call(name: str, fn: Callable[[], Awaitable[Any]], *, retries: int = 1,
                         await asyncio.sleep(pause)
                         continue
                 reason = "connection" if is_connection_error(e) else "error"
-                br.failure(f"{reason}: {e!r}"[:200])
-                raise ModelUnavailable(name, reason, repr(e)[:200]) from e
+                br.failure(f"{reason}: {error_label(e)}")
+                raise ModelUnavailable(name, reason, error_label(e)) from e
     except BaseException as e:
         if not isinstance(e, Exception):          # CancelledError / KeyboardInterrupt: no verdict from the service, free the probe slot
             br.release_probe()

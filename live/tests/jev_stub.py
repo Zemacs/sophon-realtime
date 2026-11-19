@@ -86,7 +86,7 @@ def heuristic_control(text: str, ledger: Ledger) -> ControlDecision | None:
     pending = [r for r in ledger.active() if r.status in (TaskStatus.QUEUED, TaskStatus.RUNNING, TaskStatus.NEEDS_INPUT)]
 
     def pick(op: str, rec) -> ControlDecision:  # noqa: ANN001
-        return ControlDecision(op=op, task_id=rec.task_id, version=rec.version, via="heuristic")  # type: ignore[arg-type]
+        return ControlDecision(op=op, task_id=rec.task_id, version=rec.version, via="jev")  # type: ignore[arg-type]
 
     if any(h in t for h in _CANCEL_HINTS):
         return pick("CANCEL", pending[-1] if pending else latest)

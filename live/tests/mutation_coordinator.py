@@ -18,6 +18,7 @@ from pathlib import Path
 
 LIVE = Path(__file__).resolve().parents[1]
 A, G = "sophon_live/coordinator/api.py", "sophon_live/gateway.py"
+JC = "sophon_live/coordinator/jev_client.py"
 I, MG, CL, LG = "sophon_live/coordinator/intent.py", "sophon_live/coordinator/memory_gate.py", "sophon_live/coordinator/clarify.py", "sophon_live/coordinator/ledger.py"
 K = '("天气" in text or "气温" in text)'
 
@@ -31,14 +32,14 @@ MUTANTS: list[tuple[str, str, str, str]] = [
     ("C25 tools_from_answer: memory_save no longer maps to memory_note", I, 'return ["memory_note"] if choice == MEMORY_SAVE else [choice]', "return [choice]"),
     ("P1 the filler is the lookup lead-in for every tool", I, '    return _PAD_BY_TOOL.get(tools[0], "")', '    return "我帮你查一下。"'),
     ("P2 the filler is spoken although the router could not judge", I, "    if not tools:\n        return \"\"", "    if tools == []:\n        return \"\""),
-    ("RC2-8 invalid tool answers are not counted", A, "                if tools is None:\n                    _invalid(", "                if False:\n                    _invalid("),
+    ("RC2-8 invalid tool answers are not counted", A, "                if tool_choice is not None and tools is None:\n                    _invalid(", "                if False:\n                    _invalid("),
     ("U1 an unusable tool answer is recorded as a model judgment", A, '    judgment = "unknown" if tools is None else "model"', '    judgment = "model"'),
     ("M1 explicit save: an unknown answer writes long-term memory", MG, "ctx.explicit_save is not True", "ctx.explicit_save is False"),
     ("M2 explicit save: the gateway does not carry the model's judgment", G, ", ledger=ledger, explicit_save=job.explicit_save))", ", ledger=ledger))"),
     ("M3 explicit save: a model answer other than memory_save also counts", I, "    if choice is None or choice not in TOOL_CRITERIA:\n        return None\n    return choice == MEMORY_SAVE",
      "    if choice is None or choice not in TOOL_CRITERIA:\n        return None\n    return choice != NONE"),
     ("D1 router down + live task: a keyword decides instead of the fixed clarify", A, "    if ledger.active():\n", "    if False:\n"),
-    ("D2 router down + no live task: nothing is handed to the orchestrator", A, "    job = _new_job(ledger, text, language=req.language, tools=None)", "    job = None; return AdmitResult(speak=SpeakPlan(kind='noop', text=''), route='FAST', ledger=ledger)"),
+    ("D2 router down + no live task: nothing is handed to the orchestrator", A, "    job = _new_job(ledger, text, language=req.language, tools=tools, explicit_save=explicit_save)      # router down", "    job = None; return AdmitResult(speak=SpeakPlan(kind='noop', text=''), route='FAST', ledger=ledger)      # router down"),
     ("R1 a REFINE option is honoured only on the CONTROL route", A, '    if route in ("CONTROL", "WORKER"):', '    if route == "CONTROL":'),
     ("R2 CONTROL without a usable target does not ask", A, '        if control_key != "NEW":', "        if False:"),
     ("R3 a REFINE does not inherit the task's required tools", LG, "            require_tools=list(rec.require_tools),", "            require_tools=[],"),
@@ -48,6 +49,19 @@ MUTANTS: list[tuple[str, str, str, str]] = [
     ("S1 the missing slot is guessed instead of read from the answer", CL, "    return [choice] if choice in _ASK else []", '    return ["city"]'),
     ("S2 an unusable missing-slot answer is not generic", CL, "    return [choice] if choice in _ASK else []", "    return [choice] if choice else []"),
     ("T1 the tool question is not asked", A, "            questions[intent.TOOL_KEY] = intent.build_tool_question()\n", "            pass\n"),
+    # R-A' (Critic I-2): a wrongly shaped answer is unusable, counted, traced, and never takes the other answers down
+    ("W1 choice_answer hands a non-string choice to the caller", JC, "    return c if isinstance(c, str) else None", "    return c"),
+    ("W2 raw_choice raises on a wrongly shaped response", JC, '    answers = resp.get("answers") if isinstance(resp, dict) else None\n    ans = answers.get(key) if isinstance(answers, dict) else None\n    if isinstance(ans, dict) and ans.get("type") == "choice":\n        return ans.get("choice")',
+     '    ans = (resp.get("answers") or {}).get(key) or {}\n    if ans.get("type") == "choice":\n        return ans.get("choice")'),
+    ("W3 _parse_control_key accepts a non-string", A, "    if not isinstance(key, str) or not key or key == \"NEW\":", "    if not key or key == \"NEW\":"),
+    ("W4 a missing / non-string answer to an asked question is not counted", A, "    if asked:\n        _invalid(question, raw, meta)", "    if False:\n        _invalid(question, raw, meta)"),
+    ("W5 a control string that is not an offered key is not counted", A, '            _invalid("control", control_key, meta)', "            pass"),
+    ("W6 a route string that is not an offered route is not counted", A, '                    _invalid("route", route, meta)', "                    pass"),
+    ("W7 CONTROL without a target is a fixed clarify again (not the degraded branch)", A, '            return _degrade(text, req, ledger, meta, "control_without_target", tools=tools, explicit_save=explicit_save)',
+     "            return AdmitResult(speak=SpeakPlan(kind=\"clarify\", text=DEGRADED_CLARIFY), route=\"CLARIFY\", ledger=ledger)"),
+    ("W8 the degraded new task drops the model's tool judgment", A, "    job = _new_job(ledger, text, language=req.language, tools=tools, explicit_save=explicit_save)      # router down", "    job = _new_job(ledger, text, language=req.language, tools=None, explicit_save=explicit_save)      # router down"),
+    ("W9 the control question is counted as missing even when it was not asked", A, 'asked="control" in questions', "asked=True"),
+    ("W10 the turn is never marked as a router decision", A, '            if route in _ROUTES:\n                meta["via"] = "jev"\n', "            if route in _ROUTES:\n"),
     ("H1 /health?detail=1 forgets the router's invalid answers", G, '"router_invalid_answers": dict(_coord_api.JUDGE_STATS)', '"router_invalid_answers": {}'),
 ]
 

@@ -64,7 +64,7 @@ class BreakerTests(unittest.TestCase):
         with mock.patch.dict("os.environ", {"SOPHON_LIVE_BREAKER_Z_N": "1", "SOPHON_LIVE_BREAKER_Z_OPEN_S": "2", "SOPHON_LIVE_TIMEOUT_Z": "0.7"}):
             b = mc.Breaker("z")
             self.assertEqual((b.threshold, b.open_s, mc.budget("z")), (1, 2.0, 0.7))
-        self.assertEqual((mc.budget("jev"), mc.budget("orch"), mc.budget("tag")), (1.5, 30.0, 15.0))
+        self.assertEqual((mc.budget("jev"), mc.budget("orch"), mc.budget("tag")), (1.5, 120.0, 15.0))
 
 
 class CallTests(unittest.TestCase):
@@ -259,18 +259,159 @@ class JevClientWiringTests(unittest.TestCase):
         self.assertEqual(calls["n"], 1)
 
 
-class HealthRouteTests(unittest.TestCase):
-    def test_only_detail_1_returns_the_json_body(self) -> None:
+class LastErrorNeverEchoesADownstreamBodyTests(unittest.TestCase):
+    """R-A' / Critic I-5: ``last_error`` (shown by /health?detail=1) is an exception CLASS or ``http <status>``; no message, no response body."""
+    SECRET = "SECRET-BODY-token-123 user said 北京"
+
+    def setUp(self) -> None:
+        mc.reset()
+
+    def tearDown(self) -> None:
+        mc.reset()
+
+    def _shown(self) -> str:
         import json
         from sophon_live import gateway
-        self.assertEqual(json.loads(gateway._health_body("detail=1"))["gateway"], "ok")
-        self.assertEqual(json.loads(gateway._health_body("x=1&detail=1"))["gateway"], "ok")
-        for q in ("", "detail=10", "detail=0", "xdetail=1"):
-            self.assertIsNone(gateway._health_body(q), q)
+        return gateway._health_body("detail=1", ("127.0.0.1", 1)).decode()
 
-    def test_orch_budget_default_is_30_s(self) -> None:
+    def test_error_label_is_a_class_or_a_status_and_nothing_else(self) -> None:
+        self.assertEqual(mc.error_label(mc.HttpStatusError(503)), "http 503")
+        self.assertEqual(mc.error_label(RuntimeError(self.SECRET)), "RuntimeError")
+        self.assertEqual(mc.error_label(ConnectionRefusedError(self.SECRET)), "ConnectionRefusedError")
+        self.assertNotIn(self.SECRET, str(mc.HttpStatusError(500)))
+
+    def test_an_exception_message_never_reaches_last_error_or_the_unavailable_message(self) -> None:
+        async def boom():
+            raise RuntimeError(self.SECRET)
+
+        async def refused():
+            raise ConnectionRefusedError(self.SECRET)
+        for fn in (boom, refused):
+            with self.assertRaises(mc.ModelUnavailable) as cm:
+                run(mc.call("jev", fn, retries=0))
+            self.assertNotIn(self.SECRET, str(cm.exception))
+            self.assertNotIn(self.SECRET, cm.exception.detail)
+        snap = self._shown()
+        self.assertNotIn("SECRET", snap)
+        self.assertNotIn("北京", snap)
+        self.assertEqual(mc.snapshot()["jev"]["last_error"], "connection: ConnectionRefusedError")
+
+    def test_a_real_orch_5xx_with_a_body_shows_only_the_status(self) -> None:
+        from aiohttp import web
+
+        async def h(request):
+            return web.Response(text=self.SECRET, status=503)
+        case = OrchStatusWiringTests()
+        case.setUp()
+        try:
+            case._run_job(h, n=1)
+            self.assertEqual(mc.snapshot()["orch"]["last_error"], "error: http 503")
+            self.assertNotIn("SECRET", self._shown())
+        finally:
+            case.tearDown()
+
+    def test_a_real_jev_500_with_a_body_shows_only_the_status(self) -> None:
+        from aiohttp import web
+        import socket
+        from tests.jev_stub import real_system_one
+
+        async def go():
+            async def h(request):
+                return web.Response(text=self.SECRET, status=500)
+            app = web.Application()
+            app.router.add_post("/v1/systemone", h)
+            runner = web.AppRunner(app)
+            await runner.setup()
+            sock = socket.socket(); sock.bind(("127.0.0.1", 0)); port = sock.getsockname()[1]; sock.close()
+            await web.TCPSite(runner, "127.0.0.1", port).start()
+            try:
+                with mock.patch.object(jev_client, "system_one", real_system_one):
+                    await jev_client.system_one({}, {}, url=f"http://127.0.0.1:{port}")
+            finally:
+                await runner.cleanup()
+        with self.assertRaises(mc.ModelUnavailable) as cm:
+            run(go())
+        self.assertNotIn("SECRET", str(cm.exception))
+        self.assertEqual(mc.snapshot()["jev"]["last_error"], "error: http 500")
+        self.assertNotIn("SECRET", self._shown())
+
+
+class HealthRouteTests(unittest.TestCase):
+    LOCAL = ("127.0.0.1", 50000)
+
+    def test_only_detail_1_returns_the_json_body_and_only_to_this_machine(self) -> None:
+        import json
+        from sophon_live import gateway
+        self.assertEqual(json.loads(gateway._health_body("detail=1", self.LOCAL))["gateway"], "ok")
+        self.assertEqual(json.loads(gateway._health_body("x=1&detail=1", self.LOCAL))["gateway"], "ok")
+        for q in ("", "detail=10", "detail=0", "xdetail=1"):
+            self.assertIsNone(gateway._health_body(q, self.LOCAL), q)
+
+    def test_detail_is_refused_for_every_peer_that_is_not_loopback_and_when_the_peer_is_unknown(self) -> None:
+        from sophon_live import gateway
+        for peer in (("192.168.1.5", 1), ("10.0.0.7", 1), ("8.8.8.8", 1), ("2001:db8::1", 1, 0, 0), ("::ffff:10.1.2.3", 1), ("0.0.0.0", 1), ("localhost", 1),
+                     ("", 1), (None, 1), None, (), "127.0.0.1"):
+            self.assertIsNone(gateway._health_body("detail=1", peer), peer)
+        for peer in (("127.0.0.1", 1), ("127.9.9.9", 1), ("::1", 1, 0, 0), ("::ffff:127.0.0.1", 1, 0, 0)):
+            self.assertIsNotNone(gateway._health_body("detail=1", peer), peer)
+
+    def test_an_ipv4_mapped_peer_is_judged_by_its_ipv4_part_on_every_python_version(self) -> None:
+        # Python < 3.13 reports ``::ffff:127.0.0.1`` as not loopback; the code unwraps it itself, so the answer does not depend on the interpreter
+        import ipaddress
+        from types import SimpleNamespace as NS
+        from sophon_live import gateway
+        for inner, want in ((True, True), (False, False)):
+            stub = NS(ipv4_mapped=NS(is_loopback=inner), is_loopback=False)
+            with mock.patch.object(ipaddress, "ip_address", lambda _a, _s=stub: _s):
+                self.assertIs(gateway._is_local_peer(("::ffff:1.2.3.4", 1)), want)
+
+    def test_forwarding_headers_are_never_trusted_and_their_presence_refuses_even_a_loopback_peer(self) -> None:
+        from websockets.datastructures import Headers
+        from sophon_live import gateway
+        # an outside caller that claims to be local through a header: the peer decides, so it is refused
+        self.assertIsNone(gateway._health_body("detail=1", ("203.0.113.9", 1), Headers([("X-Forwarded-For", "127.0.0.1")])))
+        self.assertIsNone(gateway._health_body("detail=1", ("203.0.113.9", 1), Headers([("X-Real-IP", "127.0.0.1")])))
+        # a local reverse proxy forwards outside callers: the proxy header's presence means "not this machine"
+        for h in ("X-Forwarded-For", "x-real-ip", "Forwarded", "Via", "X-Forwarded-Host", "CF-Connecting-IP"):
+            self.assertIsNone(gateway._health_body("detail=1", self.LOCAL, Headers([(h, "198.51.100.4")])), h)
+        self.assertIsNotNone(gateway._health_body("detail=1", self.LOCAL, Headers([("User-Agent", "curl/8")])))
+
+    def test_the_route_answers_403_to_a_remote_detail_request_and_plain_ok_to_plain_liveness(self) -> None:
+        import json
+        from types import SimpleNamespace as NS
+        from websockets.datastructures import Headers
+        from sophon_live import gateway
+
+        class Conn:
+            def __init__(self, peer):
+                self.remote_address = peer
+
+            def respond(self, status, text):
+                return (status, text)
+
+        def ask(path, peer, headers=()):
+            return gateway._health_response(Conn(peer), NS(path=path, headers=Headers(list(headers))))
+        self.assertEqual(ask("/health", ("203.0.113.9", 1)), (200, "ok\n"))                                  # liveness is for everyone
+        self.assertEqual(ask("/health?detail=1", ("203.0.113.9", 1))[0], 403)
+        self.assertEqual(ask("/health?detail=1", ("203.0.113.9", 1), [("X-Forwarded-For", "127.0.0.1")])[0], 403)
+        self.assertEqual(ask("/health?detail=1", self.LOCAL, [("X-Forwarded-For", "203.0.113.9")])[0], 403)
+        r = ask("/health?detail=1", self.LOCAL)
+        self.assertEqual(r.status_code if hasattr(r, "status_code") else r[0], 200)
+        self.assertEqual(json.loads(r.body)["gateway"], "ok")
+
+    def test_orch_budget_default_is_120_s_and_both_env_overrides_still_win(self) -> None:
+        """R-A': the default stays 120 s (the final value is set from the unfreeze-window distribution); the two defaults agree and both env vars override."""
         from sophon_live.assistant_tools import orchestrator as orch
-        self.assertEqual(orch._DEFAULT_TIMEOUT, 30.0)
+        self.assertEqual(orch._DEFAULT_TIMEOUT, 120.0)
+        self.assertEqual(mc.budget("orch"), 120.0)
+        with mock.patch.dict("os.environ", {"SOPHON_LIVE_TIMEOUT_ORCH": "7"}):
+            self.assertEqual(mc.budget("orch"), 7.0)
+        with mock.patch.dict("os.environ", {"SOPHON_LIVE_ORCH_TIMEOUT": "9"}):         # the one the orchestrator actually reads
+            self.assertEqual(orch._cfg()[4], 9.0)
+        with mock.patch.dict("os.environ", {}, clear=False):
+            import os
+            os.environ.pop("SOPHON_LIVE_ORCH_TIMEOUT", None)
+            self.assertEqual(orch._cfg()[4], 120.0)
 
 
 class GatewayDefaultHostTests(unittest.TestCase):

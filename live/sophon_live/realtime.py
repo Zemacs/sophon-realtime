@@ -25,6 +25,7 @@ import websockets
 
 from .adapters import VllmOmniAdapter
 from . import grounding
+from .coordinator import span_judge
 from . import backend
 
 log = logging.getLogger("sophon_live.realtime")
@@ -32,6 +33,8 @@ log = logging.getLogger("sophon_live.realtime")
 # speech_started / stopped drive client-side truncation (OpenAI Realtime clients cut our playback on speech_started),
 # so false starts from background noise mute the agent. Use Silero (robust to steady noise and bursts) when available.
 SILERO_PATH = os.environ.get("SOPHON_LIVE_SILERO", os.path.join(os.path.dirname(os.path.abspath(__file__)), "silero_vad.onnx"))
+GUARD_SESSION_MAX_REJECTIONS = 12  # rejections per session over ALL argument variants; beyond it every refused call gets the give-up needs_input (R-5)
+GUARD_MAX_REJECTIONS = 2          # identical ungrounded calls rejected with the usual message; from the next one on the answer is needs_input (Round 4j / I-24)
 GROUND = os.environ.get("SOPHON_LIVE_GROUND", "1") != "0"          # tool-argument grounding guard (see grounding.py)
 VAD_KIND = os.environ.get("SOPHON_LIVE_VAD", "energy")              # energy | silero (silero misses band-limited telephony speech)
 VAD_RMS = float(os.environ.get("SOPHON_LIVE_VAD_RMS", "0.015"))       # energy VAD: minimum frame RMS threshold
@@ -184,11 +187,17 @@ class RealtimeSession:
         self.tasks: list = []
         self.lang = "en"
         self.resp: dict | None = None          # current response {id, item_id, text, done, calls:[...], audio_s}
-        self.pending_outputs: list = []        # (call_id, output) from conversation.item.create(function_call_output)
+        self.pending_outputs: list = []        # (call_id, output, failed) from conversation.item.create(function_call_output); failed = grounding.output_failed(item)
         self.heard: list = []                  # ASR text of each caller turn (always transcribed, for the grounding guard)
-        self.seen: list = []                   # tool outputs (+ instructions / tool schema) the agent has seen
+        self.seen: list = []                   # tool outputs the agent has seen
         self.asr_tasks: list = []
-        self.guard_counts: dict = {}
+        self.guard_counts: dict = {}           # (tool name + exact arguments) -> rejections; cleared when the session closes
+        self.guard_total = 0                   # rejections in this session across all argument variants (R-5 cap)
+        self.audit: list = []                  # grounding decisions: literal / model_span / read_back_confirmed / degraded (also logged)
+        self.rejected: dict = {}               # argument name -> values the guard refused in this session (a read-back may only confirm one of these)
+        self.judge = None                      # independent (span, value) judge; None = coordinator.span_judge.judge (tests inject a stub)
+        self.spoken: list = []                 # (text the assistant said aloud, len(self.heard) at that moment): the read-back provenance
+        self.degraded_warned = False
         self.calls: dict = {}                  # call_id -> response id
         self.in_ms = 0.0                       # input audio received (ms)
         self.vad_on = False; self.vad_voiced = 0; self.vad_silence = 0.0; self.speech_t0 = 0.0
@@ -241,6 +250,8 @@ class RealtimeSession:
             tools = []
         if self.bo is not None and (tools or backend.ALL):
             tools = [backend.DELEGATE_TOOL]                     # the front only delegates; the back office holds the real tools
+        elif GROUND and self.asr is not None:
+            tools = grounding.with_evidence_field(tools)        # the model says where each argument comes from (grounding_evidence); the guard verifies the span
         if self.engine is None:
             self.engine = VllmOmniAdapter(self.args.engine, self.args.bridge)
             try:
@@ -264,6 +275,8 @@ class RealtimeSession:
             rule += backend.FRONT_RULES_ALL_EN
         elif tools and self.cfg.get("tool_choice") != "none" and os.environ.get("SOPHON_LIVE_TOOL_RULES", "1") != "0":
             rule += TOOL_RULES_ZH if self.lang == "zh" else TOOL_RULES_EN
+            if GROUND and self.asr is not None:
+                rule += grounding.EVIDENCE_RULES_ZH if self.lang == "zh" else grounding.EVIDENCE_RULES_EN
         return (self.cfg.get("instructions") or "") + rule
 
     # ------------------------------------------------------------ client events
@@ -289,9 +302,9 @@ class RealtimeSession:
             if item.get("type") == "function_call_output":
                 fut = self.bk_wait.pop(item.get("call_id"), None)
                 if fut is not None:
-                    if not fut.done(): fut.set_result(str(item.get("output", "")))
+                    if not fut.done(): fut.set_result(grounding.tool_text(item))
                 else:
-                    self.pending_outputs.append((item.get("call_id"), str(item.get("output", ""))))
+                    self.pending_outputs.append((item.get("call_id"), str(item.get("output", "")), grounding.output_failed(item)))
                 item = dict(item, id=item.get("id") or _id("item"), object="realtime.item", status="completed")
                 await self.send({"type": "conversation.item.added", "previous_item_id": ev.get("previous_item_id"), "item": item})
                 await self.send({"type": "conversation.item.done", "previous_item_id": ev.get("previous_item_id"), "item": item})
@@ -309,9 +322,9 @@ class RealtimeSession:
             r["empty_timer"] = asyncio.get_running_loop().call_later(12.0, lambda: asyncio.ensure_future(self._finish_if_empty(r)))
             if self.pending_outputs:
                 outs, self.pending_outputs = self.pending_outputs, []
-                for i, (cid, out) in enumerate(outs):
+                for i, (cid, out, failed) in enumerate(outs):
                     self.seen.append(out)
-                    if GROUND: out = out + grounding.failure_hint(out, self.heard)
+                    if GROUND: out = out + grounding.failure_hint(failed, self.heard)
                     await self.engine.tool_result(cid, out, speak=(i == len(outs) - 1))
                 log.info("realtime %s: %d tool result(s) -> follow-up", self.id, len(outs))
             # otherwise the engine answers on its own turn detection; nothing to force
@@ -465,6 +478,7 @@ class RealtimeSession:
         if r["done"]:
             return
         r["done"] = True
+        if r.get("text"): self.spoken.append((r["text"], len(self.heard)))
         if self.bo is not None and r.get("text"): self.bo.add("front", r["text"])
         output = []
         if r["audio"]:
@@ -490,6 +504,11 @@ class RealtimeSession:
         if not r["done"] and not r["audio"] and not r["calls"]:
             await self._finish(r)
 
+    def _audit(self, rec: dict) -> None:
+        """Keep a grounding decision in memory AND write it to the structured log now: the table is cleared when the session closes (N-8)."""
+        self.audit.append(rec)
+        log.info("realtime %s: grounding audit %s", self.id, json.dumps(rec, ensure_ascii=False, default=str)[:500])
+
     async def _guard(self, e: dict) -> bool:
         """True = call rejected and sent back to the model (not shown to the client)."""
         if os.environ.get("SOPHON_LIVE_UNKNOWN_TOOL", "1") != "0":
@@ -505,24 +524,58 @@ class RealtimeSession:
                            "step by step and tell you what they see. Do not call a tool for it.")
                     await self.engine.tool_result(e.get("call_id"), msg, speak=True)
                     return True
-        if not GROUND or self.asr is None:
+        args = e.get("arguments") or {}
+        if isinstance(args, str):
+            try: args = json.loads(args)
+            except Exception: args = {}  # noqa: E722
+        raw_ev = None
+        if isinstance(args, dict) and grounding.EVIDENCE_KEY in args:
+            args = dict(args); raw_ev = args.pop(grounding.EVIDENCE_KEY)
+            e["arguments"] = args                                 # the client's tool never sees the reserved argument
+        if not GROUND or self.asr is None:                        # no transcript to prove anything with: an explicit, labelled degraded path, never silent
+            reason = "grounding_off" if not GROUND else "no_asr_transcript"
+            if not self.degraded_warned:
+                self.degraded_warned = True
+                log.warning("realtime %s: GROUNDING UNAVAILABLE (%s): tool calls are passed on UNCHECKED for this session", self.id, reason)
+            self._audit({"call": e.get("name"), "grounding": "unavailable", "reason": reason})
+            log.info("realtime %s: grounding degraded (%s): %s passed unchecked", self.id, reason, e.get("name"))
             return False
         pend = [t for t in self.asr_tasks if not t.done()]
         if pend:
             await asyncio.wait(pend, timeout=2.5)
         self.asr_tasks = [t for t in self.asr_tasks if not t.done()]
-        args = e.get("arguments") or {}
-        if isinstance(args, str):
-            try: args = json.loads(args)
-            except Exception: args = {}  # noqa: E722
-        ctx = [self.cfg.get("instructions") or "", json.dumps(self.cfg.get("tools") or [])] + self.seen
-        bad = grounding.check(e.get("name", ""), args, self.heard, ctx)
+        decisions: list = []
+
+        def _verdict(p: dict, ans) -> None:
+            log.info("realtime %s: independent check %s %s=%r span=%r -> %s", self.id, p["kind"], p["argument"], p["value"], p["span"], ans)
+        bad = await grounding.check_async(e.get("name", ""), args, self.heard, self.seen, evidence=raw_ev, spoken=self.spoken, audit=decisions,
+                                          judge=getattr(self, "judge", None) or span_judge.judge,
+                                          schema=grounding.tool_parameters(self.cfg.get("tools"), e.get("name", "")),
+                                          rejected=getattr(self, "rejected", {}), on_verdict=_verdict)
+        for d in decisions:
+            if d.get("how") != "literal":                         # the model-judged acceptances are the ones to audit
+                log.info("realtime %s: grounding accepted %s=%r on the model's evidence: %s", self.id, d["argument"], d["value"], json.dumps(d, ensure_ascii=False)[:300])
+                self._audit(dict(d, call=e.get("name")))
         if not bad:
+            self.guard_total = 0                                  # the session cap counts rejections IN A ROW since the last call the guard let through (N-6)
             return False
+        rej = getattr(self, "rejected", None)
+        if rej is not None:
+            for k_, v_, _ in bad:
+                if len(rej) < 64:
+                    rej.setdefault(k_, set()).add(v_)
         key = e.get("name", "") + json.dumps(args, sort_keys=True)
-        self.guard_counts[key] = self.guard_counts.get(key, 0) + 1
-        if self.guard_counts[key] > 2:                          # the model insists: let it through rather than loop forever
-            log.info("realtime %s: grounding guard let through after 2 rejections: %s", self.id, key[:160]); return False
+        self.guard_total += 1
+        capped = self.guard_total > GUARD_SESSION_MAX_REJECTIONS
+        if not capped:
+            self.guard_counts[key] = self.guard_counts.get(key, 0) + 1
+        n = self.guard_counts.get(key, GUARD_MAX_REJECTIONS + 1)
+        if capped or n > GUARD_MAX_REJECTIONS:                  # never released: the caller has to give or confirm the value
+            log.info("realtime %s: grounding guard needs_input (%s, %d session rejections, not released): %s", self.id,
+                     "session cap" if capped else f"{n} identical", self.guard_total, key[:160])
+            self._audit({"call": e.get("name"), "grounding": "needs_input", "capped": capped})
+            await self.engine.tool_result(e.get("call_id"), json.dumps({"ok": False, "status": "needs_input", "message": grounding.needs_input_message(bad, give_up=capped)}), speak=True)
+            return True
         msg = grounding.guard_message(bad, self.heard)
         log.info("realtime %s: grounding guard rejected %s(%s): %s", self.id, e.get("name"), json.dumps(args)[:160], [b[:2] for b in bad])
         log.info("realtime %s: heard so far: %s", self.id, " || ".join(self.heard[-4:])[-600:])
@@ -567,7 +620,7 @@ class RealtimeSession:
             try:
                 out = await asyncio.wait_for(fut, 90)
             except asyncio.TimeoutError:
-                self.bk_wait.pop(cid, None); out = "Error: no result from the system"
+                self.bk_wait.pop(cid, None); out = json.dumps({"ok": False, "error": "no_result_from_system"})
             self.seen.append(out)
             return out
         try:
@@ -641,7 +694,7 @@ class RealtimeSession:
                     await self._finish(self.resp, "cancelled")
             elif t == "error":
                 log.warning("realtime %s engine: %s", self.id, e.get("message"))
-                if "closed" in (e.get("message") or ""):
+                if e.get("fatal") is True:                      # a typed flag from the adapter (connection gone), not a guess from the message text
                     await self.error("engine connection lost", "server_error"); await self.close(); return
 
     async def close(self) -> None:
@@ -652,4 +705,5 @@ class RealtimeSession:
             t.cancel()
         if self.engine is not None:
             await self.engine.close()
-        log.info("realtime %s closed", self.id)
+        log.info("realtime %s closed (grounding: %d rejections, %d audit records)", self.id, self.guard_total, len(self.audit))
+        self.guard_counts.clear(); self.audit.clear(); self.spoken.clear(); getattr(self, "rejected", {}).clear()

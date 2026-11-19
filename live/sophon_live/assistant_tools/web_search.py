@@ -20,6 +20,10 @@ import urllib.request
 from html import unescape
 from typing import Any
 
+from .. import failcodes
+from . import toolmeta
+from . import inflight as _inflight_mod
+
 _INSTANT_URL = "https://api.duckduckgo.com/"
 _LITE_URL = "https://lite.duckduckgo.com/lite/"
 _UA = "sophon-live-assistant/1.0"
@@ -59,22 +63,13 @@ def _no_results(query: str, *, zh: bool) -> str:
 
 
 # urllib cannot be interrupted: a cancelled hedge leaves its thread running until its own socket timeout (<= the attempt's remaining
-# budget, <= 5.5 s). So the number of such threads in flight is capped (Critic S-9): beyond it an attempt fails at once instead
-# of piling up sockets and starving the shared thread pool when searches arrive faster than the stragglers finish.
-_INFLIGHT_MAX = int(os.environ.get("SOPHON_SEARCH_MAX_INFLIGHT", "12"))
-_inflight = threading.BoundedSemaphore(_INFLIGHT_MAX)
+# budget, <= 5.5 s). The number of such threads in flight is capped (Critic S-9), and the cap is shared with the news tool
+# (assistant_tools/inflight.py, S-14): beyond it an attempt fails at once instead of piling up sockets or queueing (S-19).
+_INFLIGHT_MAX = _inflight_mod.MAX_INFLIGHT
+_inflight = _inflight_mod.SHARED
 
 
-def _urlopen(url: str, timeout: float = 20.0) -> bytes:
-    if not _inflight.acquire(blocking=False):
-        raise OSError("too many web-search requests in flight")
-    try:
-        return _urlopen_unbounded(url, timeout)
-    finally:
-        _inflight.release()
-
-
-def _urlopen_unbounded(url: str, timeout: float) -> bytes:
+def _urlopen_unbounded(url: str, timeout: float = 20.0) -> bytes:
     bing = "bing.com" in url
     headers = {"User-Agent": _BROWSER_UA, "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.5", "Accept-Encoding": "gzip"} if bing else {"User-Agent": _UA}
     req = urllib.request.Request(url, headers=headers)
@@ -87,7 +82,7 @@ def _urlopen_unbounded(url: str, timeout: float) -> bytes:
 
 async def _fetch_bytes(url: str, timeout: float = 5.5) -> bytes:
     """One attempt bounded by ``timeout`` (the socket timeout in the thread and the awaiting side)."""
-    return await asyncio.wait_for(asyncio.to_thread(_urlopen, url, timeout), timeout + 0.5)
+    return await asyncio.wait_for(_inflight_mod.run(_urlopen_unbounded, url, timeout, sem=_inflight), timeout + 0.5)
 
 
 def _snippets_from_instant(data: dict[str, Any]) -> list[str]:
@@ -133,7 +128,6 @@ def _snippets_from_lite(html: str, limit: int) -> list[str]:
 
 
 _TAG = re.compile(r"<[^>]+>")
-_AGE = re.compile(r"^\s*\d+\s*(小时|分钟|天|周|个月|年)(之)?前\s*[·・]\s*")
 
 
 def _text(fragment: str) -> str:
@@ -149,7 +143,7 @@ def _snippets_from_bing(html: str, limit: int) -> list[str]:
         p = re.search(r'<p[^>]*class="[^"]*b_lineclamp[^"]*"[^>]*>([\s\S]*?)</p>', block) or re.search(
             r'<div class="b_caption"[^>]*>[\s\S]*?<p[^>]*>([\s\S]*?)</p>', block
         )
-        snippet = _AGE.sub("", _text(p.group(1))) if p else ""
+        snippet = _text(p.group(1)) if p else ""
         if not title:
             continue
         out.append(f"{title} — {snippet[:140]}" if snippet else title)
@@ -238,6 +232,7 @@ async def run(args: dict[str, Any] | None = None) -> str:
     max_results = _clamp_max(args.get("max_results"), 3)
     zh = _is_zh(query) or args.get("lang") == "zh"
 
+    busy = _inflight_mod.track_busy()
     budget = _budget_s()
     t_end = time.monotonic() + budget
     per_source = max(0.5, budget - 0.5)
@@ -273,7 +268,12 @@ async def run(args: dict[str, Any] | None = None) -> str:
 
     if not snippets:
         if empty:
+            toolmeta.note(failure=failcodes.NO_RESULTS)
             return _no_results(query, zh=zh)
+        if busy:
+            toolmeta.note(failure=failcodes.BUSY)
+            return _inflight_mod.BUSY_ZH if zh else _inflight_mod.BUSY_EN       # S-24: our own cap refused, not a network fault
+        toolmeta.note(failure=failcodes.NETWORK)
         return _network_error(zh)
 
     snippets = snippets[:max_results]

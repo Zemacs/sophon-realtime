@@ -16,7 +16,7 @@ cd sophon-realtime/tag && GPU=0 PORT=8000 bash start.sh
 cd ../live && BUILD=tag PORT=8000 LIVE_PORT=8780 bash start_live.sh
 ```
 
-GPT-Live 客户端连 `ws://HOST:8780/v1/live/sessions` 即可；浏览器打开 `http://HOST:8780/` 是测试页（麦克风对话、委派卡片、演示后端、协议事件日志）。停止：`LIVE_PORT=8780 bash stop_live.sh`。
+GPT-Live 客户端连 `ws://HOST:8780/v1/live/sessions` 即可；浏览器打开 `http://HOST:8780/` 是测试页（麦克风对话、委派卡片、手动回答框、协议事件日志）。停止：`LIVE_PORT=8780 bash stop_live.sh`。
 
 网关会加载一个小的语音识别模型做用户转写（`Qwen/Qwen3-ASR-0.6B-hf`，约 2 GB 显存）。国内建议先从魔搭下载：`modelscope download --model Qwen/Qwen3-ASR-0.6B-hf --local_dir ./asr`，再 `SOPHON_LIVE_ASR=./asr bash start_live.sh`。
 

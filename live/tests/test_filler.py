@@ -14,20 +14,28 @@ from sophon_live.gateway import DELEGATE
 
 
 class PadForTests(unittest.TestCase):
+    """The filler follows the tool the ROUTER MODEL chose (an option key we offered), never the user's words.
+    (Replaces the r4 tests that fed sentences to ``intent.pad_for``; the same four kinds of expectation, now keyed by the model's option.)"""
+
     def test_lookups_say_let_me_check(self) -> None:
-        for t in ("明天上海会下雨吗", "今天有什么科技新闻", "用搜索查一下今天美元兑人民币大概多少"):
-            self.assertEqual(intent.pad_for(t), "我帮你查一下。", t)
+        for tool in ("get_weather", "get_news", "web_search"):
+            self.assertEqual(intent.pad_for_tools([tool]), "我帮你查一下。", tool)
 
     def test_device_control_says_ok_right_away(self) -> None:
-        for t in ("关掉客厅的灯", "把客厅灯打开"):
-            self.assertEqual(intent.pad_for(t), "好的，马上。", t)
+        self.assertEqual(intent.pad_for_tools(["device_control"]), "好的，马上。")
 
-    def test_time_jokes_and_chitchat_get_no_filler(self) -> None:
-        for t in ("现在几点了", "讲个笑话", "讲一个不一样的笑话", "你好"):
-            self.assertEqual(intent.pad_for(t), "", t)
+    def test_time_jokes_chitchat_and_unknown_get_no_filler(self) -> None:
+        for tools in (["get_datetime"], [], None):
+            self.assertEqual(intent.pad_for_tools(tools), "", tools)
 
     def test_memory_recall_is_a_lookup(self) -> None:
-        self.assertEqual(intent.pad_for("用户上次说喜欢吃什么"), "我帮你查一下。")
+        self.assertEqual(intent.pad_for_tools(["memory_note"]), "我帮你查一下。")
+
+    def test_the_model_answer_maps_to_tools_by_option_key_only(self) -> None:
+        self.assertEqual(intent.tools_from_answer("web_search"), ["web_search"])
+        self.assertEqual(intent.tools_from_answer("NONE"), [])
+        self.assertIsNone(intent.tools_from_answer(None))
+        self.assertIsNone(intent.tools_from_answer("无关紧要"))        # a non-option answer is "unknown", never guessed
 
 
 class FrontInstructionTests(unittest.TestCase):

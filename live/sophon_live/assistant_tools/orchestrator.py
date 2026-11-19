@@ -16,9 +16,10 @@ from typing import Any
 
 import aiohttp
 
-from ..coordinator import slots
+from .. import model_client
 from ..coordinator.clarify import clarify_for_slots
-from ..coordinator.schemas import NO_TOOL_ANSWER, WorkerJob, WorkerResult, tool_succeeded
+from .. import failcodes
+from ..coordinator.schemas import NO_TOOL_ANSWER, WorkerJob, WorkerResult, appears_in_words, tool_succeeded
 from . import toolmeta
 from .registry import TOOL_SCHEMAS
 from .runner import run_tool
@@ -29,15 +30,17 @@ _DEFAULT_URL = "http://127.0.0.1:8101/v1/chat/completions"
 _DEFAULT_MODEL = "qwen3.8-27b-bo"
 _DEFAULT_KEY = "local"
 _DEFAULT_STEPS = 6
-_DEFAULT_TIMEOUT = 120.0
+_DEFAULT_TIMEOUT = 120.0  # unchanged default; the final value comes from the unfreeze-window latency / truncation data (see model_client); env: SOPHON_LIVE_ORCH_TIMEOUT
 
 SYS = (
     "You are the tool-executing worker behind a voice assistant. "
     "You receive ONE job objective that the coordinator already routed and refined; "
     "you never decide whether to ask, cancel, refine or remember anything. "
     "Do exactly the objective with the tools you are given.\n"
-    "- Pick the tool that fits the objective (time/date: get_datetime; weather: get_weather; news: get_news; "
-    "search: web_search; device: device_control).\n"
+    "- Pick the tool that fits the objective (time/date: get_datetime; weather: get_weather; news headlines: get_news; "
+    "search or news about a specific person, company or event: web_search; device: device_control).\n"
+    "- get_news takes ``topic`` from its closed list (tech / finance / world / general): you choose the category from the objective; "
+    "set ``lang`` to the language the caller speaks.\n"
     "- If a required tool parameter is not in the objective, call the tool WITHOUT that parameter. "
     "Never guess it and never ask the caller; the coordinator asks.\n"
     "- If the objective says the caller changed their mind or added detail, the newest wording wins.\n"
@@ -117,19 +120,28 @@ def _history_block(history: list[dict[str, str]] | None) -> str:
 
 
 def _missing_required(name: str, args: dict) -> list[str]:
-    """Required tool parameters the model left out (schema-driven, no keywords)."""
+    """Required tool parameters the model left out, or filled with a value outside the schema's closed enum (schema-driven, no keywords)."""
     for t in TOOL_SCHEMAS:
         if t["name"] == name:
-            req = (t.get("parameters") or {}).get("required") or []
-            return [k for k in req if not str(args.get(k) or "").strip()]
+            params = t.get("parameters") or {}
+            req = params.get("required") or []
+            props = params.get("properties") or {}
+            out = []
+            for k in req:
+                v = str(args.get(k) or "").strip()
+                enum = (props.get(k) or {}).get("enum")
+                if not v or (enum and v not in enum):
+                    out.append(k)
+            return out
     return []
 
 
 def _ungrounded_city(name: str, args: dict, msgs: list[dict[str, Any]]) -> bool:
-    """True when the model made up a weather city: not in what the user said, the recent turns, or a tool result.
+    """True when the weather city the model passed is not in what the user said, the recent turns, or a tool result.
 
-    "明天天气怎么样" must not become 上海 because the model likes Shanghai. Lenient on purpose: if any known city is
-    mentioned anywhere (the model may translate 北京 to Beijing), the argument is treated as grounded."""
+    "明天天气怎么样" must not become 上海 because the model likes Shanghai. Provenance only (B-4): the value must occur, as a whole word, in
+    those messages (or be the same known place spelled the other way, 北京 <-> Beijing). Whether the words name a city at all is the model's
+    call, not a list's: a value that is nowhere in the words is asked about (needs_input) instead of looked up."""
     if name != "get_weather":
         return False
     city = str(args.get("city") or "").strip()
@@ -137,15 +149,32 @@ def _ungrounded_city(name: str, args: dict, msgs: list[dict[str, Any]]) -> bool:
         return False
     seen = "\n".join(str(m.get("content") or "") for m in msgs if m.get("role") in ("user", "tool"))
     bare = city.rstrip("市")
-    if city in seen or (bare and bare in seen):
-        return False
-    return not any(c in seen for c in slots.CITY_NAMES)
+    return not any(appears_in_words(v, seen, translate=True) for v in (city, bare) if v)
 
 
 def _evidence_has_required(job: WorkerJob, evidence: list[dict]) -> bool:
     """True when the job needs no tool, or at least one of its required tools was called AND succeeded (``ok``)."""
     req = [t for t in (job.require_tools or []) if _in_scope(job, t)]
     return not req or any(ev.get("tool") in req and tool_succeeded(ev) for ev in evidence)
+
+
+def _tool_failure_code(out: str, tool_meta: dict[str, Any]) -> str | None:
+    """Structured failure signal of one tool call, or None when the tool reported none.
+
+    Two structured channels, nothing else: the tool's own failure code (``toolmeta`` key ``failure``, see ``failcodes``), and a JSON result
+    with ``"ok": false`` (the runner's error envelope: unknown tool, handler exception, scope refusal). The spoken text is not read."""
+    code = (tool_meta or {}).get("failure")
+    if code:
+        return str(code)
+    t = (out or "").strip()
+    if t.startswith("{"):
+        try:
+            obj = json.loads(t)
+        except ValueError:
+            return None
+        if isinstance(obj, dict) and obj.get("ok") is False:
+            return "error"
+    return None
 
 
 def _tool_failure_text(out: str) -> str:
@@ -227,7 +256,7 @@ async def run_job(
                 body["tool_choice"] = choice          # the Coordinator says this answer needs its tool: do not let the model skip it
             # Prefer non-thinking for low-latency spoken answers when the server supports it.
             body["chat_template_kwargs"] = {"enable_thinking": False}
-            try:
+            async def _step(body=body) -> tuple[int, Any]:
                 async with cs.post(url, json=body, headers=headers) as r:
                     status = r.status
                     try:
@@ -235,29 +264,38 @@ async def run_job(
                     except Exception as e:  # noqa: BLE001
                         raw = await r.text()
                         log.warning("orch LLM bad JSON HTTP %s: %r body=%s", status, e, raw[:300])
-                        return _result(job, "failed", unavailable, evidence)
-                if status >= 400:
-                    # retry once without chat_template_kwargs / tool_choice if rejected (the guard below still applies)
-                    if status == 400 and ("chat_template_kwargs" in body or "tool_choice" in body):
-                        body.pop("chat_template_kwargs", None)
-                        body.pop("tool_choice", None)
-                        async with cs.post(url, json=body, headers=headers) as r2:
-                            status = r2.status
-                            j = await r2.json(content_type=None)
-                        if status >= 400:
-                            log.warning("orch LLM HTTP %s: %s", status, str(j)[:300])
-                            return _result(job, "failed", unavailable, evidence)
-                    else:
-                        log.warning("orch LLM HTTP %s: %s", status, str(j)[:300])
-                        return _result(job, "failed", unavailable, evidence)
-                choices = j.get("choices") if isinstance(j, dict) else None
-                if not choices:
-                    log.warning("orch LLM empty choices: %s", str(j)[:300])
-                    return _result(job, "failed", unavailable, evidence)
-                m = choices[0].get("message") or {}
+                        if status >= 500:
+                            raise model_client.HttpStatusError(status) from e       # a sick service with a non-JSON body: the status is the whole story
+                        raise RuntimeError("orch bad json") from e
+                if status == 400 and ("chat_template_kwargs" in body or "tool_choice" in body):
+                    # ``body`` is OUR request. This checks whether OUR request carried either of these two optional keys (it reads nothing the server sent
+                    # back); if so a 400 is retried ONCE without them. The retry drops ``tool_choice`` too, so a forced tool call is given up and
+                    # ``_evidence_has_required`` below is what still enforces it.
+                    body.pop("chat_template_kwargs", None)
+                    body.pop("tool_choice", None)
+                    async with cs.post(url, json=body, headers=headers) as r2:
+                        status = r2.status
+                        j = await r2.json(content_type=None)
+                if status >= 500:
+                    raise model_client.HttpStatusError(status)      # the service is sick: counts against the breaker (status only: no body in the exception)
+                return status, j
+
+            try:
+                status, j = await model_client.call("orch", _step, retries=1, total_s=timeout)
+            except model_client.ModelUnavailable as e:
+                log.warning("orch LLM unavailable (%s): %s", e.reason, e)
+                return _result(job, "failed", "后台模型连接失败，请稍后再试。" if e.reason == "connection" else unavailable, evidence)
             except Exception as e:  # noqa: BLE001
                 log.warning("orch LLM call failed: %r", e)
                 return _result(job, "failed", "后台模型连接失败，请稍后再试。", evidence)
+            if status >= 400:
+                log.warning("orch LLM HTTP %s: %s", status, str(j)[:300])
+                return _result(job, "failed", unavailable, evidence)
+            choices = j.get("choices") if isinstance(j, dict) else None
+            if not choices:
+                log.warning("orch LLM empty choices: %s", str(j)[:300])
+                return _result(job, "failed", unavailable, evidence)
+            m = choices[0].get("message") or {}
             tcs = m.get("tool_calls") or []
             if not tcs:
                 if not _evidence_has_required(job, evidence):
@@ -290,6 +328,8 @@ async def run_job(
                     log.info("orch step=%d tool=%s missing=%s -> needs_input", step, name, missing)
                     evidence.append({"tool": name, "args": args, "ok": False, "missing": missing})
                     return _result(job, "needs_input", "", evidence, missing)
+                if name == "get_news" and args.get("lang") not in ("zh", "en") and job.language in ("zh", "en"):
+                    args["lang"] = job.language          # structural default: the job's language (the model normally sets it)
                 t_tool = time.monotonic()
                 toolmeta.take()
                 out = await run_tool(name, args)
@@ -303,19 +343,11 @@ async def run_job(
                     out[:160],
                 )
                 msgs.append({"role": "tool", "tool_call_id": tc.get("id") or name, "content": out})
-                failed = (
-                    '"ok": false' in out
-                    or "暂时连不上" in out
-                    or "暂时查不到" in out
-                    or "暂时没有" in out
-                    or "unreachable" in out.lower()
-                    or "unavailable" in out.lower()
-                    or "不可用" in out
-                    # "searched, found nothing" is not usable evidence for a factual answer (Critic S-11): the user hears the
-                    # tool's own 没搜到 sentence, the model does not get to improvise one from its head
-                    or (name == "web_search" and ("没有搜到" in out or "couldn't find useful snippets" in out))
-                )
-                evidence.append({"tool": name, "args": args, "ok": not failed, "ms": tool_ms, **tool_meta})
+                # B-3: failure is what the TOOL reported in structure (a failure code in toolmeta, or an {"ok": false} JSON result), never a
+                # reading of its spoken text for words
+                fail_code = _tool_failure_code(out, tool_meta)
+                failed = fail_code is not None
+                evidence.append({"tool": name, "args": args, "ok": not failed, "ms": tool_ms, **tool_meta, **({"failure": fail_code} if failed else {})})
                 if failed and name in required:
                     # A tool-backed job whose tool failed: say so plainly. The model never gets to word it, it could
                     # "recover" with numbers of its own (Critic B-1).
@@ -323,9 +355,9 @@ async def run_job(
                     text = _tool_failure_text(out)
                     evidence[-1]["failure_text"] = text      # the Coordinator may speak exactly this sentence for the failed job
                     return _result(job, "failed", text, evidence)
-                news_ok = name == "get_news" and ("第1条" in out or "Headlines on" in out) and not failed
-                weather_ok = name == "get_weather" and ("度" in out or "°" in out or "°C" in out) and not failed
-                if news_ok or weather_ok:
+                # I-18: the "speak now" nudge reads the tool's structured success report (toolmeta ``success`` + its fields), not its text
+                succeeded = not failed and tool_meta.get(failcodes.SUCCESS_KEY) is True
+                if succeeded and name in ("get_news", "get_weather"):
                     msgs.append({
                         "role": "user",
                         "content": "Tool succeeded. Speak one or two short oral sentences from this result now. Do NOT call the same tool again.",

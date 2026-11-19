@@ -13,9 +13,11 @@ _LIVE_ROOT = Path(__file__).resolve().parents[1]
 if str(_LIVE_ROOT) not in sys.path:
     sys.path.insert(0, str(_LIVE_ROOT))
 
+from sophon_live import failcodes
 from sophon_live.assistant_tools import orchestrator as orch
 from sophon_live.assistant_tools import web_search
 from sophon_live.coordinator import Ledger, WorkerJob, finish_job
+from tests._tool_fakes import failing_tool
 from tests.test_orch_worker import _tool_call
 from tests.test_orchestrator import _FakeResp, _FakeSession
 from tests.test_web_search_fallback import BING_HTML
@@ -66,11 +68,11 @@ class CaptchaDoesNotEndTheHedge(unittest.IsolatedAsyncioTestCase):
 class NoResultsIsNotEvidence(unittest.IsolatedAsyncioTestCase):
     NOTHING = "没有搜到关于「美元兑人民币」的可靠摘要。"
 
-    async def _run(self, tool_out: str, model_after: str = "今天美元兑人民币大约七点二。"):
+    async def _run(self, tool_out: str, model_after: str = "今天美元兑人民币大约七点二。", *, code: str | None = failcodes.NO_RESULTS):
         job = WorkerJob(task_id="t1", version=1, objective="今天美元兑人民币是多少", require_tools=["web_search"])
         sess = _FakeSession([_FakeResp(200, _tool_call("web_search", '{"query":"美元兑人民币"}')),
                              _FakeResp(200, {"choices": [{"message": {"role": "assistant", "content": model_after}}]})])
-        with mock.patch.object(orch.aiohttp, "ClientSession", return_value=sess), mock.patch.object(orch, "run_tool", new=mock.AsyncMock(return_value=tool_out)):
+        with mock.patch.object(orch.aiohttp, "ClientSession", return_value=sess), mock.patch.object(orch, "run_tool", new=failing_tool(tool_out, code) if code else mock.AsyncMock(return_value=tool_out)):
             return await orch.run_job(job)
 
     async def test_nothing_found_is_a_failed_job_with_the_tools_own_sentence(self) -> None:
@@ -93,12 +95,12 @@ class NoResultsIsNotEvidence(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(out.text, self.NOTHING)
 
     async def test_real_snippets_are_still_a_success(self) -> None:
-        res = await self._run("关于「美元兑人民币」，中国银行外汇牌价：美元 713.20。")
+        res = await self._run("关于「美元兑人民币」，中国银行外汇牌价：美元 713.20。", code=None)
         self.assertTrue(res.evidence[0]["ok"])
 
 
-class InflightCap(unittest.TestCase):
-    def test_requests_beyond_the_cap_fail_at_once_and_release_on_finish(self) -> None:
+class InflightCap(unittest.IsolatedAsyncioTestCase):
+    async def test_requests_beyond_the_cap_fail_at_once_and_release_on_finish(self) -> None:
         gate = threading.Event()
         started = threading.Semaphore(0)
 
@@ -108,17 +110,15 @@ class InflightCap(unittest.TestCase):
             return b"ok"
 
         with mock.patch.object(web_search, "_inflight", threading.BoundedSemaphore(2)), mock.patch.object(web_search, "_urlopen_unbounded", slow):
-            ts = [threading.Thread(target=web_search._urlopen, args=("https://x", 1.0)) for _ in range(2)]
-            for t in ts:
-                t.start()
+            ts = [asyncio.ensure_future(web_search._fetch_bytes("https://x", 3.0)) for _ in range(2)]
             for _ in range(2):
-                self.assertTrue(started.acquire(timeout=2))
+                self.assertTrue(await asyncio.to_thread(started.acquire, True, 2))
             with self.assertRaises(OSError):
-                web_search._urlopen("https://x", 1.0)           # the third does not even start a socket
+                await web_search._fetch_bytes("https://x", 1.0)           # the third does not even start a socket
             gate.set()
-            for t in ts:
-                t.join(2)
-            self.assertEqual(web_search._urlopen("https://x", 1.0), b"ok")      # slots were released
+            self.assertEqual(await asyncio.gather(*ts), [b"ok", b"ok"])
+            await asyncio.sleep(0.05)
+            self.assertEqual(await web_search._fetch_bytes("https://x", 1.0), b"ok")      # slots were released
 
 
 if __name__ == "__main__":

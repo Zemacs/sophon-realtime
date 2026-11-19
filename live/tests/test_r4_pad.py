@@ -60,7 +60,7 @@ def _worker(delay: float, answer: str = "北京明天多云，1到8度。"):
     async def run(job, instructions="", history=None):  # noqa: ANN001
         await asyncio.sleep(delay)
         return WorkerResult(task_id=job.task_id, version=job.version, status="completed", spoken_answer=answer,
-                            evidence=[{"tool": "get_weather", "ok": True}], freshness_token=job.freshness_token)
+                            evidence=[{"tool": "get_weather", "ok": True, "out": answer}], freshness_token=job.freshness_token)
 
     return run
 

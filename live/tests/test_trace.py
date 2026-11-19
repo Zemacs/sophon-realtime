@@ -131,14 +131,14 @@ class GatewayTraceTests(unittest.IsolatedAsyncioTestCase):
         session._trace().start("d1").set(task="北京明天天气")
         _arm(session, "d1", "北京明天天气")
         with self.assertLogs("sophon_live.trace", "INFO") as cm, \
-                mock.patch.object(api, "USE_JEV", False), mock.patch.object(tools, "run_worker_job", worker):
+                mock.patch.object(api, "USE_JEV", True), mock.patch.object(tools, "run_worker_job", worker):
             await session._coord_resolve("d1", "北京明天天气")
             session._delivery_armed("d1")              # what _post_update does once the engine took the result
             session._trace().response_started("r1")
             session._trace().response_played("r1")
         (t,) = _lines(cm)
         self.assertEqual(list(t["stages"]), ["deleg", "route", "worker_start", "worker_done", "say", "posted", "speech_start", "speech_end"])
-        self.assertEqual((t["route"], t["decision"], t["via"], t["worker"]), ("WORKER", "NEW", "heuristic", "completed"))
+        self.assertEqual((t["route"], t["decision"], t["via"], t["worker"]), ("WORKER", "NEW", "jev", "completed"))
         self.assertEqual(t["tools"], [{"tool": "get_weather", "ms": 812, "ok": True, "source": "sojson"}])
         self.assertEqual(t["say_chars"], len("北京明天晴。"))
 
@@ -146,7 +146,7 @@ class GatewayTraceTests(unittest.IsolatedAsyncioTestCase):
         session = _session()
         session._trace().start("f")
         _arm(session, "f", "谢谢")
-        with self.assertLogs("sophon_live.trace", "INFO") as cm, mock.patch.object(api, "USE_JEV", False):
+        with self.assertLogs("sophon_live.trace", "INFO") as cm, mock.patch.object(api, "USE_JEV", True):
             await session._coord_resolve("f", "谢谢")
         (t,) = _lines(cm)
         self.assertIn("silent", t["stages"])

@@ -150,6 +150,52 @@ def split_pieces(text: str) -> list[str]:
     return [p for p in out if p]
 
 
+def _health_detail() -> bytes:
+    """/health?detail=1: breaker state of every downstream model (Tag / orch / JEV) as seen by this gateway process."""
+    from . import model_client
+    from .coordinator import api as _coord_api
+    return json.dumps({"gateway": "ok", "downstream": model_client.snapshot(), "router_invalid_answers": dict(_coord_api.JUDGE_STATS)},
+                      ensure_ascii=False).encode()
+
+
+_PROXY_HEADERS = ("x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "x-real-ip", "forwarded", "via", "x-original-forwarded-for", "cf-connecting-ip")
+
+
+def _is_local_peer(peer, headers=None) -> bool:
+    """True only when the TCP peer of this request is the machine itself (loopback, incl. an IPv4-mapped ::ffff:127.x) AND the request carries no proxy
+    header. Proxy headers are never trusted as an address: their mere presence means the request was forwarded, so a local reverse proxy does not turn an
+    outside caller into a "local" one (R-A' / Critic I-5). ``peer`` is the ``(host, port, ...)`` tuple of ``conn.remote_address``."""
+    import ipaddress
+    if headers is not None and any(hdr in headers for hdr in _PROXY_HEADERS):
+        return False
+    try:
+        ip = ipaddress.ip_address(str(peer[0]).split("%")[0])
+    except (TypeError, ValueError, IndexError):
+        return False
+    return (getattr(ip, "ipv4_mapped", None) or ip).is_loopback
+
+
+def _health_body(query: str, peer=None, headers=None) -> "bytes | None":
+    """The JSON body for ``/health?<query>`` when the query asks for ``detail=1`` AND the request comes from this machine; None otherwise.
+    Use ``_wants_detail`` to tell "plain liveness" from "detail refused"."""
+    return _health_detail() if _wants_detail(query) and _is_local_peer(peer, headers) else None
+
+
+def _wants_detail(query: str) -> bool:
+    return "detail=1" in query.split("&")
+
+
+def _health_response(conn, req):
+    """``/health``: plain liveness for everyone (``ok``); ``?detail=1`` only for this machine (403 for anyone else; X-Forwarded-For is never trusted)."""
+    query = req.path.partition("?")[2]
+    detail = _health_body(query, getattr(conn, "remote_address", None), req.headers)
+    if detail is not None:
+        return Response(200, "OK", Headers([("Content-Type", "application/json")]), detail)
+    if _wants_detail(query):
+        return conn.respond(403, "Forbidden: /health?detail=1 answers only requests from this machine\n")
+    return conn.respond(200, "ok\n")
+
+
 class ASR:
     """Input transcript (GPT-Live sends session.input_transcript.delta; duplex clients build the delegated task from it)."""
 
@@ -591,7 +637,7 @@ class LiveSession:
                 asyncio.create_task(self._delegate(e))           # never block the audio path while the transcript finishes
             elif t == "error":
                 log.warning("session %s engine: %s", self.id, e.get("message"))
-                if "closed" in (e.get("message") or ""):
+                if e.get("fatal") is True:                      # a typed flag from the adapter (connection gone), not a guess from the message text
                     await self.error("server_error", "engine connection lost"); await self.close("server_error"); return
 
     async def _delegate(self, e: dict) -> None:
@@ -608,7 +654,6 @@ class LiveSession:
         tr.set(task=(what or "")[:40], asr_ago_ms=round((time.monotonic() - self.last_user[1]) * 1000) if getattr(self, "last_user", None) else None)
         use_coord = os.environ.get("SOPHON_LIVE_COORD", "").strip().lower() in ("1", "true", "yes", "on")
         use_orch = (not use_coord) and os.environ.get("SOPHON_LIVE_ORCH", "").strip().lower() in ("1", "true", "yes", "on")
-        use_builtin = (not use_coord) and (not use_orch) and os.environ.get("SOPHON_LIVE_BUILTIN_TOOLS", "").strip().lower() in ("1", "true", "yes", "on")
         # Orch/coord returns one final spoken result; skip the 7s empty idle nudge (it races long tools).
         if DELEG_MODE == "model" and not use_orch and not use_coord:
             self.deleg[did]["idle_timer"] = asyncio.get_running_loop().call_later(IDLE_UPDATE_S, lambda: asyncio.ensure_future(self._idle_update(did)))
@@ -617,19 +662,15 @@ class LiveSession:
             deleg_body["backend"] = "coord"
         elif use_orch:
             deleg_body["backend"] = "orch"
-        elif use_builtin:
-            deleg_body["backend"] = "builtin"
         await self.send({"type": "session.delegation.created", "offset_ms": self.timeline_ms, "delegation": deleg_body})
         log.info(
-            "session %s delegation %s task=%r coord=%s orch=%s builtin=%s",
-            self.id, did, what, use_coord, use_orch, use_builtin,
+            "session %s delegation %s task=%r coord=%s orch=%s",
+            self.id, did, what, use_coord, use_orch,
         )
         if use_coord:
             asyncio.create_task(self._coord_resolve(did, what))
         elif use_orch:
             asyncio.create_task(self._orch_resolve(did, what))
-        elif use_builtin:
-            asyncio.create_task(self._builtin_resolve(did, what))
 
     async def _ack_delegation(self, did: str, note: str) -> None:
         """Close a delegation without speaking: the model gets a result, but is told to stay silent."""
@@ -751,7 +792,8 @@ class LiveSession:
         if tr is not None:
             tr.mark("route")
             tr.set(route=result.route, decision=result.control.op if result.control else ("NEW" if result.job else result.route),
-                   via=result.via, jev_ms=None if result.jev_ms is None else round(result.jev_ms))
+                   via=result.via, jev_ms=None if result.jev_ms is None else round(result.jev_ms),
+                   **({"judge_invalid": ",".join(result.judge_invalid)} if result.judge_invalid else {}))
         # CANCEL / REFINE: the old (task_id, version) must stop now; its result is never spoken.
         stale = getattr(result, "stale_task", None)
         if stale is not None:
@@ -780,7 +822,7 @@ class LiveSession:
             # FAST (thanks / ok): nothing to run, nothing to say. Close the delegation silently.
             await self._ack_delegation(did, "这句话不需要后台办事，不用再说什么。")
             return
-        with bind_task(TaskContext(task_id=job.task_id, version=job.version, utterance=job.objective, ledger=ledger)):
+        with bind_task(TaskContext(task_id=job.task_id, version=job.version, utterance=job.objective, ledger=ledger, explicit_save=job.explicit_save)):
             # the worker task copies this context: its memory writes go through memory_gate, its tool args become task slots
             worker = asyncio.ensure_future(
                 run_worker_job(job, instructions=self.instructions or "", history=getattr(self, "orch_history", None) or [])
@@ -817,8 +859,8 @@ class LiveSession:
                             orig_source=ev.get("orig_source"), age_s=ev.get("age_s"),
                             city=ev.get("city"), tmin=ev.get("tmin"), tmax=ev.get("tmax"), now=ev.get("now"))
         outcome = finish_job(ledger, job, result)    # the Coordinator decides what gets said; stale results are dropped
-        if tr is not None and job.require_tools:
-            tr.set(require=",".join(job.require_tools), **({"guard": outcome.rejected} if outcome.rejected else {}))
+        if tr is not None and (job.require_tools or outcome.rejected or job.tool_judgment != "model"):
+            tr.set(require=",".join(job.require_tools), judged=job.tool_judgment, **({"guard": outcome.rejected} if outcome.rejected else {}))
         if outcome.kind == "stale":                  # cancelled or superseded while running
             await self._ack_delegation(did, "这个任务已被取消或改口，不用再说什么。")
             return
@@ -853,26 +895,6 @@ class LiveSession:
             return
         await self.send({"type": "session.commentary.appended", "start_ms": self.timeline_ms, "end_ms": self.timeline_ms,
                          "client_event_id": "orch"})
-        d["chunks"].append(("commentary", text))
-        if d.get("timer"):
-            d["timer"].cancel()
-        await self._flush_deleg(did)
-    async def _builtin_resolve(self, did: str, what: str | None) -> None:
-        """Legacy heuristic tool pack (demo). Prefer SOPHON_LIVE_ORCH for production Path-1."""
-        try:
-            from .assistant_tools import run_task
-            text = await run_task(what or "")
-        except Exception as e:  # noqa: BLE001
-            log.warning("session %s builtin tools error: %s", self.id, e)
-            return
-        if not text:
-            log.info("session %s builtin tools: no match for %r", self.id, what)
-            return
-        d = self.deleg.get(did)
-        if d is None:
-            return
-        await self.send({"type": "session.commentary.appended", "start_ms": self.timeline_ms, "end_ms": self.timeline_ms,
-                         "client_event_id": "builtin"})
         d["chunks"].append(("commentary", text))
         if d.get("timer"):
             d["timer"].cancel()
@@ -983,15 +1005,46 @@ def runtime_banner(env=None) -> tuple[str, bool]:  # noqa: ANN001
             f"Set SOPHON_LIVE_COORD=1 (see docs/runbook-path1-coord.md); ORCH={int(orch)}"), False
 
 
-def main() -> None:
+def _default_host() -> str:
+    """Bind address when --host is not given (Critic S-25): loopback. The gateway has no auth of its own, so exposing it is an explicit
+    decision: ``--host 0.0.0.0`` or ``SOPHON_LIVE_HOST=0.0.0.0`` (docs/runbook-path1-coord.md §4). Everything in this repo reaches it through
+    127.0.0.1 (SSH tunnel from the web client, or on-box scripts)."""
+    return os.environ.get("SOPHON_LIVE_HOST", "").strip() or "127.0.0.1"
+
+
+def _build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--host", default="0.0.0.0"); ap.add_argument("--port", type=int, default=8780)
+    ap.add_argument("--host", default=_default_host()); ap.add_argument("--port", type=int, default=8780)
     ap.add_argument("--engine", default="ws://127.0.0.1:8000/v1/realtime")
     ap.add_argument("--bridge", default="http://127.0.0.1:8700")
     ap.add_argument("--asr", default=os.environ.get("SOPHON_LIVE_ASR", "Qwen/Qwen3-ASR-0.6B-hf"))
     ap.add_argument("--path", default="/v1/live/sessions")
-    args = ap.parse_args()
+    return ap
+
+
+def _exposure_note(host: str) -> str:
+    """Startup line about who can connect: loopback is quiet, anything wider says so (the gateway has no authentication)."""
+    if host in ("127.0.0.1", "localhost", "::1"):
+        return f"gateway bound to loopback {host} (reach it through an SSH tunnel / on-box clients)"
+    return f"gateway bound to {host}: reachable from every network this machine is on; the gateway has NO authentication, rely on the firewall"
+
+
+RETIRED_ENV_VARS = ("SOPHON_LIVE_GROUND_MODE",)      # retired settings: set-ness is checked, the value is never read or logged
+
+
+def warn_retired_env() -> list[str]:
+    """One WARN per retired env var that is still set, so a stale config does not stop working silently. Returns the names warned about."""
+    hit = [n for n in RETIRED_ENV_VARS if n in os.environ]
+    for n in hit:
+        log.warning("%s is set but is no longer used and has no effect (retired in Round 4h); remove it from the environment", n)
+    return hit
+
+
+def main() -> None:
+    args = _build_parser().parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    warn_retired_env()
+    (log.info if args.host in ("127.0.0.1", "localhost", "::1") else log.warning)("%s", _exposure_note(args.host))
     asr = ASR(args.asr) if args.asr else None
     if asr is not None:
         asr(np.zeros(16000, np.float32))                         # warm up
@@ -1012,7 +1065,7 @@ def main() -> None:
             return Response(200, "OK", Headers([("Content-Type", "text/html; charset=utf-8"), ("Content-Length", str(len(body))),
                                                 ("Cache-Control", "no-cache")]), body)
         if path == "/health":
-            return conn.respond(200, "ok\n")
+            return _health_response(conn, req)                      # plain liveness of this gateway, unchanged
         if path not in (args.path, "/v1/realtime"):
             return conn.respond(404, "Not Found\n")
         if path == "/v1/realtime" and realtime_keys:              # keyed access for external evaluators (e.g. Artificial Analysis)

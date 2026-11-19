@@ -46,7 +46,7 @@ def _req(text: str, *, uid: str) -> AdmitRequest:
 
 class InvariantTests(unittest.IsolatedAsyncioTestCase):
     async def test_stale_result_dropped_and_cancel_is_versioned(self) -> None:
-        with mock.patch.object(api, "USE_JEV", False):
+        with mock.patch.object(api, "USE_JEV", True):
             led = Ledger()
             first = await admit(_req("现在几点了", uid="t1"), led)
         self.assertIsNotNone(first.job)
@@ -75,6 +75,7 @@ class InvariantTests(unittest.IsolatedAsyncioTestCase):
         before = Path(log_path).read_text(encoding="utf-8") if log_path and Path(log_path).exists() else ""
         with (
             mock.patch.object(api, "USE_JEV", True),
+            mock.patch.object(jev_client, "system_one", __import__("tests.jev_stub", fromlist=["x"]).real_system_one),
             mock.patch.object(jev_client.aiohttp, "ClientSession", BoomSession),
         ):
             led = Ledger()
@@ -97,7 +98,7 @@ class InvariantTests(unittest.IsolatedAsyncioTestCase):
 
 class ControlStatusTargetTests(unittest.IsolatedAsyncioTestCase):
     async def test_cancel_keeps_one_task_and_does_not_start_worker(self) -> None:
-        with mock.patch.object(api, "USE_JEV", False):
+        with mock.patch.object(api, "USE_JEV", True):
             led = Ledger()
             started = await admit(_req("北京明天天气", uid="w"), led)
             self.assertEqual(started.route, "WORKER")
@@ -117,7 +118,7 @@ class ControlStatusTargetTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(actual["statuses"], ["CANCELLED"])
 
     async def test_status_answers_from_existing_result_without_new_task(self) -> None:
-        with mock.patch.object(api, "USE_JEV", False):
+        with mock.patch.object(api, "USE_JEV", True):
             led = Ledger()
             started = await admit(_req("北京明天天气", uid="w"), led)
             assert started.job is not None
@@ -241,7 +242,7 @@ class GatewayBoundaryTests(unittest.IsolatedAsyncioTestCase):
         _arm(left, "a", "现在几点了")
         _arm(right, "b", "科技新闻")
         with (
-            mock.patch.object(api, "USE_JEV", False),
+            mock.patch.object(api, "USE_JEV", True),
             mock.patch.object(tools, "run_worker_job", as_worker(fake_orch)),
         ):
             await left._coord_resolve("a", "现在几点了")

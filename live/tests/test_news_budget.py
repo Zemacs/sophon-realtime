@@ -27,7 +27,7 @@ class NewsBudgetTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.dict(os.environ, {"SOPHON_NEWS_BUDGET": "2"}), mock.patch.object(news, "_fetch_rss", stall), \
                 mock.patch.object(news, "_PER_FEED_S", 0.6):
             t0 = time.monotonic()
-            out = await news.run({"topic": "科技", "lang": "zh"})
+            out = await news.run({"topic": "tech", "lang": "zh"})
         self.assertLess(time.monotonic() - t0, 3.0)
         self.assertIn("连不上", out)
 
@@ -42,7 +42,7 @@ class NewsBudgetTests(unittest.IsolatedAsyncioTestCase):
 
         with mock.patch.dict(os.environ, {"SOPHON_NEWS_BUDGET": "5"}), mock.patch.object(news, "_fetch_rss", fetch), \
                 mock.patch.object(news, "_PER_FEED_S", 0.5):
-            out = await news.run({"topic": "科技", "lang": "zh"})
+            out = await news.run({"topic": "tech", "lang": "zh"})
         self.assertIn("新芯片", out)
         self.assertGreaterEqual(len(calls), 2)
 

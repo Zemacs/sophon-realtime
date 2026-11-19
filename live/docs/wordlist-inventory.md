@@ -23,28 +23,28 @@ Method: `grep` for `CITY_NAMES`/`CITIES` references, then for module-level tuple
 | `coordinator/schemas.py:142,147` `_city_aliases` | translates 北京 ⇄ Beijing so provenance can be checked | KEPT-provenance (reads the weather tool's own `CITIES`; a test pins that it is the only reader in `schemas.py`) |
 | `assistant_tools/weather.py:28,146,351` `CITIES` | the weather tool's geocoding / canonical-name table | KEPT-data |
 | ~~`assistant_tools/runner.py:65`~~ | `_route_task` picked a city by scanning the task for table names | **REMOVED in Round 4g** (whole legacy `run_task` path deleted, see §2b) |
-| `coordinator/slots.py:12` `CITY_NAMES` | city words for "same request, one slot changed" | FROZEN → stage 3/4 |
-| `coordinator/slots.py:43` `skeleton()` | strips `CITY_NAMES + DAY_WORDS` before comparing requests | FROZEN → stage 3/4 |
-| `coordinator/route.py:173` `slot_edit()` | REFINE guard: finds old/new city (and day) words | FROZEN → stage 3/4 |
-| `coordinator/route.py:56,138` `_CITIES` | second, shorter city list (7 entries) inside `heuristic_route` | FROZEN → stage 3/4 (dies with `heuristic_route`) |
-| `tests/test_refine_guard.py:99` | asserts `slots.CITY_NAMES == weather.CITIES` keys (keeps the frozen copy in sync) | goes with `slots.py` in stage 3/4 |
+| ~~`coordinator/slots.py:12` `CITY_NAMES`~~ | city words for "same request, one slot changed" | **REMOVED in Round A (M-1)**: the router model judges "same request, one slot changed" through the `control` question; `slots.py` is deleted |
+| ~~`coordinator/slots.py:43` `skeleton()`~~ | strips `CITY_NAMES + DAY_WORDS` before comparing requests | **REMOVED in Round A (M-1)**: the router model judges "same request, one slot changed" through the `control` question; `slots.py` is deleted |
+| ~~`coordinator/route.py:173` `slot_edit()`~~ | REFINE guard: finds old/new city (and day) words | **REMOVED in Round A (M-1)**: the router model judges "same request, one slot changed" through the `control` question; `slots.py` is deleted |
+| ~~`coordinator/route.py:56,138` `_CITIES`~~ | second, shorter city list (7 entries) inside `heuristic_route` | **REMOVED in Round A (M-1)**: the router model judges "same request, one slot changed" through the `control` question; `slots.py` is deleted |
+| ~~`tests/test_refine_guard.py:99`~~ | asserts `slots.CITY_NAMES == weather.CITIES` keys (keeps the frozen copy in sync) | **REMOVED in Round A (M-1)**: the router model judges "same request, one slot changed" through the `control` question; `slots.py` is deleted |
 | `tests/test_r4d_s23_s24.py`, `tests/test_r4e_b4_i18.py` | AST / patch tests that prove the removed rules stay removed | permanent guards |
 
-After this round `CITY_NAMES` has **no reader outside the intent/routing layer** (`slots.py`, `route.py`), apart from the sync test.
+After Round A `CITY_NAMES` has no reader anywhere in `sophon_live/` (`slots.py` is deleted; `tests/test_no_semantic_rules.py` pins that).
 
 ## 2. Other word lists and keyword rules
 
-### 2a. Intent / routing (FROZEN → stage 3/4; no new entries)
+### 2a. Intent / routing (REMOVED in Round A / Critic M-1; rows kept as a record, see `docs/intent-r4-vs-rc3.md`)
 
 | File:line | Construct | Decides |
 |---|---|---|
-| `coordinator/intent.py:21-88` | `_TIME`, `_ASSET`, `_QTY`, `_PRICE_NOUN`, `_CHARTS`, `_SPORT*`, `_OUTCOME_NOW`, `_EVENT`, `_TRANSPORT`, `_OFFICE`, `_FRESH`, `_EN*`, `_STRONG_VETO`, `_UNIT_CONVERT`, `_MONEYISH`, `_WEAK_VETO`, `_NOW*`, `_ENTITY*`, `_QUESTION`, `_QTY_*`, `_PERSONAL`, `_STABLE`, `_ARITH`, `_COUNT_WEAK` | `is_realtime_fact()` (`:91-122`): must a factual question be looked up |
-| `coordinator/intent.py:123-130` `_PATTERNS` | one regex per tool (天气 / 新闻 / 几点 / 打开 灯 / 搜索 / 记住) | `required_tools()` (`:133`), `is_tool_scoped()` (`:147`): which tool a request needs |
-| `coordinator/route.py:55-94` | `_CLARIFY_HINTS`, `_WORKER_HINTS`, `_NEW_REQUEST_HINTS`, `_CANCEL_HINTS`, `_STATUS_HINTS`, `_REFINE_HINTS`, `_SWAP_RE`, `_ACK_WORDS` | `heuristic_control()` (`:105`), `heuristic_route()` (`:134`): cancel / status / refine / worker vs fast. Callers: `api.py:93,99,101,136` (stage 0 of the decision-ownership work, deplux PR #28, replaces the `heuristic_route` calls with the degraded path; the functions themselves are removed in stage 3/4) |
-| `coordinator/route.py:147` | `_EDIT_CUES` | `slot_edit()` (`:160`): is this an edit of the last task |
-| `coordinator/slots.py:16,18-20` | `DAY_WORDS`, `_PUNCT`, `_FILLER`, `_SLOT_PREFIX` | `skeleton()` / `similarity()` for `slot_edit` |
-| `coordinator/clarify.py:22` | `"天气" in text` → missing slot `city` | `missing_slots_for_text()`, used by `api.py:35` |
-| `coordinator/memory_gate.py:24,33` | `EXPLICIT_SAVE_HINTS` | `has_explicit_save_intent()`: may a preference be saved long-term |
+|~~`coordinator/intent.py:21-88`~~|~~`_TIME`, `_ASSET`, `_QTY`, `_PRICE_NOUN`, `_CHARTS`, `_SPORT*`, `_OUTCOME_NOW`, `_EVENT`, `_TRANSPORT`, `_OFFICE`, `_FRESH`, `_EN*`, `_STRONG_VETO`, `_UNIT_CONVERT`, `_MONEYISH`, `_WEAK_VETO`, `_NOW*`, `_ENTITY*`, `_QUESTION`, `_QTY_*`, `_PERSONAL`, `_STABLE`, `_ARITH`, `_COUNT_WEAK`~~|~~`is_realtime_fact()` (`:91-122`): must a factual question be looked up~~ **REMOVED in Round A**: the model answers the closed `tool` question (`intent.TOOL_CRITERIA`) |
+|~~`coordinator/intent.py:123-130` `_PATTERNS`~~|~~one regex per tool (天气 / 新闻 / 几点 / 打开 灯 / 搜索 / 记住)~~|~~`required_tools()` (`:133`), `is_tool_scoped()` (`:147`): which tool a request needs~~ **REMOVED in Round A**: the model answers the closed `tool` question; code maps the option to the tool (`intent.tools_from_answer`) |
+|~~`coordinator/route.py:55-94`~~|~~`_CLARIFY_HINTS`, `_WORKER_HINTS`, `_NEW_REQUEST_HINTS`, `_CANCEL_HINTS`, `_STATUS_HINTS`, `_REFINE_HINTS`, `_SWAP_RE`, `_ACK_WORDS`~~|~~`heuristic_control()` (`:105`), `heuristic_route()` (`:134`): cancel / status / refine / worker vs fast. Callers: `api.py:93,99,101,136` (stage 0 of the decision-ownership work, deplux PR #28, replaces the `heuristic_route` calls with the degraded path; the functions themselves are removed in stage 3/4)~~ **REMOVED in Round A**: the model answers `route` / `control`; no model -> `api._degrade` (fixed clarify or a new task) |
+|~~`coordinator/route.py:147`~~|~~`_EDIT_CUES`~~|~~`slot_edit()` (`:160`): is this an edit of the last task~~ **REMOVED in Round A**: the model answers `control` (REFINE option) |
+| ~~`coordinator/slots.py:16,18-20`~~ | `DAY_WORDS`, `_PUNCT`, `_FILLER`, `_SLOT_PREFIX` | **REMOVED in Round A (M-1)**: the router model judges "same request, one slot changed" through the `control` question; `slots.py` is deleted |
+|~~`coordinator/clarify.py:22`~~|~~`"天气" in text` → missing slot `city`~~|~~`missing_slots_for_text()`, used by `api.py:35`~~ **REMOVED in Round A**: the model answers the `missing_slot` question |
+|~~`coordinator/memory_gate.py:24,33`~~|~~`EXPLICIT_SAVE_HINTS`~~|~~`has_explicit_save_intent()`: may a preference be saved long-term~~ **REMOVED in Round A**: the model answers the `tool` question (`memory_save`); `memory_gate` only enforces it |
 | `coordinator/memory_gate.py:27-28` | `TASK_SLOT_KEYS`, `PREFERENCE_PREFIXES` | which *tool-argument key names* are task-scoped: schema keys, not user words; KEPT-benign |
 
 ### 2b. Tool side

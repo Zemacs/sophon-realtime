@@ -11,7 +11,6 @@ ROOT = "."
 PY = sys.executable
 T_S19 = ["tests.test_r4_s19_inflight", "tests.test_r4_search_evidence", "tests.test_r4_news_evidence"]
 T_S18 = ["tests.test_r4_s18_s21", "tests.test_no_fabrication", "tests.test_r4_review_b1"]
-T_INT = ["tests.test_r4_intent_i10", "tests.test_r4_intent_gate"]
 T_D = ["tests.test_r4d_s23_s24", "tests.test_r4_news_evidence"]
 T_E = ["tests.test_r4d_s23_s24", "tests.test_r4_s18_s21", "tests.test_no_fabrication", "tests.test_r4_review_b1", "tests.test_r4_search_evidence", "tests.test_r4_news_evidence"]
 ORCH = "sophon_live/assistant_tools/orchestrator.py"
@@ -27,7 +26,8 @@ BK = "sophon_live/backend.py"; AD = "sophon_live/adapters.py"; WS_ = "sophon_liv
 FA = "failed = fail_code is not None"
 T_F = ["tests.test_r4e_b4_i18", "tests.test_orch_worker", "tests.test_orchestrator"]
 NEWS = "sophon_live/assistant_tools/news.py"; WS = "sophon_live/assistant_tools/web_search.py"; WX = "sophon_live/assistant_tools/weather.py"
-INF = "sophon_live/assistant_tools/inflight.py"; SCH = "sophon_live/coordinator/schemas.py"; INT = "sophon_live/coordinator/intent.py"
+T_R1 = ["tests.test_model_client"]
+INF = "sophon_live/assistant_tools/inflight.py"; SCH = "sophon_live/coordinator/schemas.py"
 CB = "    fut.add_done_callback(lambda _f: s.release())\n    return await asyncio.wrap_future(fut)"
 M = [
  ("run: no release after the work RAISES", INF, "fut.add_done_callback(lambda _f: s.release())", "fut.add_done_callback(lambda f: s.release() if (not f.cancelled() and f.exception() is None) else None)", T_S19),
@@ -42,8 +42,6 @@ M = [
  ("echo: no word boundary", SCH, "    if re.match(r\"[a-z0-9]\", e[0]):\n        pat = r\"(?<![a-z0-9])\" + pat\n    if re.match(r\"[a-z0-9]\", e[-1]):\n        pat += r\"(?![a-z0-9])\"\n", "", T_S18),
  ("echo: checked against Worker args", SCH, "_echo_ok(m.group(1), objective, city=tool == \"get_weather\")", "_echo_ok(m.group(1), str((ev or {}).get('args')) + ' ' + objective, city=tool == \"get_weather\")", T_S18),
  ("templates not bound to the tool", SCH, "TOOL_FAILURE_TEMPLATES.get(tool, ())", "[p for v in TOOL_FAILURE_TEMPLATES.values() for p in v]", T_S18),
- ("intent: unit-conversion veto removed", INT, "    if _UNIT_CONVERT.search(t) and not _MONEYISH.search(t):\n        return False                                    # unit conversion is arithmetic, never a lookup", "    if False:\n        return False", T_INT),
- ("intent: 黄金/白银 back in _MONEYISH", INT, "|USDT|多少钱|价格", "|USDT|黄金|白银|多少钱|价格", T_INT),
  # Round 4e (B-3 / I-17): the removed rules must not come back, and the structured signals must be what drives the outcome
  ("I-17: weather slot accepts any token again", SCH, '"|".join(SOURCE_ERROR_CODES)', 'r"[A-Za-z][A-Za-z0-9_]{2,40}"', T_E),
  ("I-17: weather notes carry the exception class name", WX, "err = _error_code(e)", "err = type(e).__name__", T_E),
@@ -58,7 +56,7 @@ M = [
  ("B-3: weather does not report 'busy'", WX, '            meta["failure"] = failcodes.BUSY\n', "", T_E),
  # Round 4f (B-4 / I-18)
  ("B-4: _ungrounded_city consults the city list again", ORCH, '    return not any(appears_in_words(v, seen, translate=True) for v in (city, bare) if v)',
-  '    from sophon_live.coordinator.slots import CITY_NAMES\n    return not any(appears_in_words(v, seen, translate=True) for v in (city, bare) if v) and not any(c in seen for c in CITY_NAMES)', T_F),
+  '    return not any(appears_in_words(v, seen, translate=True) for v in (city, bare) if v) and not any(c in seen for c in ("北京", "上海", "广州", "深圳"))', T_F),
  ("B-4: _ungrounded_city never fires", ORCH, '    return not any(appears_in_words(v, seen, translate=True) for v in (city, bare) if v)', "    return False", T_F),
  ("B-4: _ungrounded_city drops the alias translation", ORCH, "appears_in_words(v, seen, translate=True)", "appears_in_words(v, seen)", T_F),
  ("I-18: the speak-now nudge reads the tool text again", ORCH, "succeeded = not failed and tool_meta.get(failcodes.SUCCESS_KEY) is True",
@@ -216,6 +214,23 @@ M = [
  ("N-8: a keyword regex is added to grounding.py (the old allowlist waved it through)", GR, "def norm_text(s: str) -> str:", 'WEATHER = re.compile("天气|气温|下雨")\n\n\ndef norm_text(s: str) -> str:', T_KS),
  ("N-8: a word is added to the spoken-form currency table", GR, '"dollar": "usd", ', '"dollar": "usd", "bitcoin": "btc", ', T_KS),
  ("N-9: the harness is not retried after a timeout (and a second timeout is not an error)", "tests/test_r4j_page_behaviour.py", "    for attempt in (1, 2):", "    for attempt in (1,):", T_KL),
+ ('R1 model_client: a timeout inside the call is classified as an application error', "sophon_live/model_client.py", '            except (asyncio.TimeoutError, TimeoutError):\n                br.failure("timeout")', '            except (KeyError,):\n                br.failure("timeout")', T_R1),
+ ('R1 model_client: a timeout counts as a retryable connection error', "sophon_live/model_client.py", '    if isinstance(e, (asyncio.TimeoutError, TimeoutError)):\n        return False\n    try:', '    if isinstance(e, (asyncio.TimeoutError, TimeoutError)):\n        return True\n    try:', T_R1),
+ ('R1 model_client (RC2-3): a cancelled half-open probe is not released', "sophon_live/model_client.py", '            br.release_probe()\n', '            pass\n', T_R1),
+ ('R1 model_client: the breaker never opens', "sophon_live/model_client.py", '        if self.state == "half_open" or self.fails >= self.threshold:', '        if False:', T_R1),
+ ('R1 model_client: half-open lets every caller probe', "sophon_live/model_client.py", '            if self.probing:                       # one probe at a time; everyone else fails fast', '            if False:', T_R1),
+ ('R1 model_client: application errors are retried like connection errors', "sophon_live/model_client.py", '                if is_connection_error(e) and attempt < retries:', '                if attempt < retries:', T_R1),
+ ('R1 model_client: the JEV budget default is 8 s again', "sophon_live/model_client.py", 'DEFAULT_BUDGET_S = {"jev": 1.5,', 'DEFAULT_BUDGET_S = {"jev": 8.0,', T_R1),
+ ('R1 jev_client: bypasses the model client (no budget / breaker)', "sophon_live/coordinator/jev_client.py", '    return await model_client.call("jev", _once, retries=1, total_s=DEFAULT_TIMEOUT)', '    return await _once()', T_R1),
+ ('R1 orchestrator: the LLM step bypasses the breaker', ORCH, 'await model_client.call("orch", _step, retries=1, total_s=timeout)', 'await _step()', T_R1),
+ ('R1 orchestrator: a 5xx is not counted against the breaker', ORCH, '                if status >= 500:', '                if False:', T_R1),
+ ('R1 orchestrator: a 400 is not retried without the optional fields', ORCH, '                if status == 400 and ("chat_template_kwargs" in body or "tool_choice" in body):', '                if False:', T_R1),
+ ('R1 orchestrator: the worker budget default is 120 s again', ORCH, '_DEFAULT_TIMEOUT = 30.0', '_DEFAULT_TIMEOUT = 120.0', T_R1),
+ ('R1 adapters: the Tag connect is reported under another breaker name', AD, 'model_client.call("tag",', 'model_client.call("jev",', T_R1),
+ ('R1 gateway: /health?detail=1 never returns the detail', GW, '    return _health_detail() if "detail=1" in query.split("&") else None', '    return None', T_R1),
+ ('R1 gateway: any query returns the detail', GW, '    return _health_detail() if "detail=1" in query.split("&") else None', '    return _health_detail()', T_R1),
+ ('R1 gateway: the downstream snapshot is left out of the detail', GW, '"downstream": model_client.snapshot(),', '"downstream": {},', T_R1),
+ ('R1 gateway: the bind address defaults to all interfaces', GW, 'or "127.0.0.1"\n', 'or "0.0.0.0"\n', T_R1),
 ]
 def run_group(tests, env):
     """-> (returncode, passed, failed, errors, failed_names, output). Uses pytest; module names are mapped to files."""

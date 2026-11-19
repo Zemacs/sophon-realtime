@@ -16,7 +16,6 @@ if str(_LIVE_ROOT) not in sys.path:
 from sophon_live.coordinator import AdmitRequest, AdmitResult, Ledger, SpeakPlan, WorkerJob, admit
 from sophon_live.coordinator import api, jev_client
 from sophon_live.coordinator.api import complete_job
-from sophon_live.coordinator.route import heuristic_control, heuristic_route
 from sophon_live.coordinator.schemas import TaskStatus
 
 
@@ -93,61 +92,9 @@ class LedgerStateTests(unittest.TestCase):
         self.assertEqual(led.pending_input().task_id, a.task_id)  # type: ignore[union-attr]
 
 
-class HeuristicControlTests(unittest.TestCase):
-    def _led(self, objective: str, status: TaskStatus, answer: str = "") -> tuple[Ledger, str]:
-        led = Ledger()
-        rec = led.create(objective)
-        rec.status = status
-        rec.spoken_answer = answer
-        return led, rec.task_id
-
-    def test_cancel_words(self) -> None:
-        for text in ("取消刚才那个", "别查了", "算了不用了"):
-            led, tid = self._led("北京明天天气", TaskStatus.RUNNING)
-            d = heuristic_control(text, led)
-            self.assertIsNotNone(d, text)
-            assert d is not None
-            self.assertEqual((d.op, d.task_id, d.version), ("CANCEL", tid, 1), text)
-
-    def test_status_words(self) -> None:
-        for text in ("刚才查得怎么样", "查到了吗", "结果呢", "再说一遍刚才的结果"):
-            led, tid = self._led("北京明天天气", TaskStatus.COMPLETED, "晴")
-            d = heuristic_control(text, led)
-            self.assertIsNotNone(d, text)
-            assert d is not None
-            self.assertEqual(d.op, "STATUS", text)
-
-    def test_refine_words(self) -> None:
-        for text in ("改成上海的", "换成广州", "不对，是上海的", "再讲一个不一样的", "换一个"):
-            led, tid = self._led("北京明天天气", TaskStatus.COMPLETED, "晴")
-            d = heuristic_control(text, led)
-            self.assertIsNotNone(d, text)
-            assert d is not None
-            self.assertEqual(d.op, "REFINE", text)
-
-    def test_short_answer_fills_pending_slot(self) -> None:
-        led, tid = self._led("明天天气怎么样", TaskStatus.NEEDS_INPUT)
-        d = heuristic_control("北京的", led)
-        assert d is not None
-        self.assertEqual((d.op, d.task_id), ("REFINE", tid))
-
-    def test_no_task_means_no_control(self) -> None:
-        self.assertIsNone(heuristic_control("取消刚才那个", Ledger()))
-        self.assertIsNone(heuristic_control("刚才查得怎么样", Ledger()))
-
-    def test_fresh_requests_are_not_control(self) -> None:
-        led, _ = self._led("北京明天天气", TaskStatus.COMPLETED, "晴")
-        for text in ("现在几点了", "科技新闻", "明天天气怎么样", "把客厅灯打开"):
-            self.assertIsNone(heuristic_control(text, led), text)
-
-    def test_heuristic_route_reports_control(self) -> None:
-        led, _ = self._led("北京明天天气", TaskStatus.RUNNING)
-        self.assertEqual(heuristic_route("取消刚才那个", led), "CONTROL")
-
-
 class AdmitControlTests(unittest.IsolatedAsyncioTestCase):
     async def test_cancel_marks_task_and_starts_no_worker(self) -> None:
-        with mock.patch.object(api, "USE_JEV", False):
+        with mock.patch.object(api, "USE_JEV", True):
             led = Ledger()
             started = await admit(_req("北京明天天气", uid="w"), led)
             res = await admit(_req("取消刚才那个", uid="c"), led)
@@ -159,7 +106,7 @@ class AdmitControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(led.tasks), 1)
 
     async def test_cancel_of_finished_task_says_so(self) -> None:
-        with mock.patch.object(api, "USE_JEV", False):
+        with mock.patch.object(api, "USE_JEV", True):
             led = Ledger()
             started = await admit(_req("现在几点了"), led)
             complete_job(led, started.job, "三点整")  # type: ignore[arg-type]
@@ -169,7 +116,7 @@ class AdmitControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(led.tasks[started.job.task_id].status, TaskStatus.COMPLETED)  # type: ignore[union-attr]
 
     async def test_status_returns_stored_answer(self) -> None:
-        with mock.patch.object(api, "USE_JEV", False):
+        with mock.patch.object(api, "USE_JEV", True):
             led = Ledger()
             started = await admit(_req("北京明天天气"), led)
             complete_job(led, started.job, "北京明天晴，12到18度。")  # type: ignore[arg-type]
@@ -180,7 +127,7 @@ class AdmitControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(led.tasks), 1)
 
     async def test_status_while_running_says_still_working(self) -> None:
-        with mock.patch.object(api, "USE_JEV", False):
+        with mock.patch.object(api, "USE_JEV", True):
             led = Ledger()
             await admit(_req("北京明天天气"), led)
             res = await admit(_req("查到了吗"), led)
@@ -188,7 +135,7 @@ class AdmitControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("还在", res.speak.text)
 
     async def test_refine_city_bumps_version_and_new_job_carries_both(self) -> None:
-        with mock.patch.object(api, "USE_JEV", False):
+        with mock.patch.object(api, "USE_JEV", True):
             led = Ledger()
             first = await admit(_req("上海明天天气"), led)
             complete_job(led, first.job, "上海明天多云。")  # type: ignore[arg-type]
@@ -205,7 +152,7 @@ class AdmitControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(complete_job(led, first.job, "上海明天多云。"))
 
     async def test_slot_fill_refines_the_needs_input_task(self) -> None:
-        with mock.patch.object(api, "USE_JEV", False):
+        with mock.patch.object(api, "USE_JEV", True):
             led = Ledger()
             clar = await admit(_req("明天天气怎么样"), led)
             self.assertEqual(clar.speak.kind, "clarify")
@@ -218,7 +165,7 @@ class AdmitControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(led.tasks), 1)
 
     async def test_joke_again_refines_same_task(self) -> None:
-        with mock.patch.object(api, "USE_JEV", False):
+        with mock.patch.object(api, "USE_JEV", True):
             led = Ledger()
             j1 = await admit(_req("讲个笑话"), led)
             complete_job(led, j1.job, "笑话一。")  # type: ignore[arg-type]
@@ -227,7 +174,7 @@ class AdmitControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(j2.job.version, 2)
 
     async def test_fresh_request_after_task_creates_new_task(self) -> None:
-        with mock.patch.object(api, "USE_JEV", False):
+        with mock.patch.object(api, "USE_JEV", True):
             led = Ledger()
             a = await admit(_req("现在几点了"), led)
             complete_job(led, a.job, "三点")  # type: ignore[arg-type]
@@ -246,7 +193,7 @@ class AdmitJevControlTests(unittest.IsolatedAsyncioTestCase):
 
         return fake
 
-    async def test_jev_control_without_key_falls_back_to_heuristic(self) -> None:
+    async def test_jev_control_without_a_usable_option_is_a_fixed_clarify_and_the_task_is_untouched(self) -> None:
         led = Ledger()
         rec = led.create("北京明天天气")
         led.mark_running(rec.task_id)
@@ -255,7 +202,8 @@ class AdmitJevControlTests(unittest.IsolatedAsyncioTestCase):
             mock.patch.object(jev_client, "system_one", self._jev("CONTROL", None)),
         ):
             res = await admit(_req("取消刚才那个"), led)
-        self.assertEqual(led.tasks[rec.task_id].status, TaskStatus.CANCELLED)
+        self.assertEqual(led.tasks[rec.task_id].status, TaskStatus.RUNNING, "no keyword guess: only the model can name the task to cancel")
+        self.assertEqual((res.speak.kind, res.speak.text), ("clarify", api.DEGRADED_CLARIFY))
         self.assertIsNone(res.job)
 
     async def test_jev_control_new_starts_new_task(self) -> None:

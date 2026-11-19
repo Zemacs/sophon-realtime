@@ -1,4 +1,6 @@
-"""Round 2 / B: a slot-only edit of the latest task is a REFINE even when JEV says NEW."""
+"""v0.1.1: "same task, changed slot, said as a full new sentence" is the MODEL's call (JEV ``control`` question, with the user's own
+words in the state). The code only enforces: the named task must exist and be live, the version must be current. No word lists.
+(Round 2's ``slot_edit`` keyword guard is gone; live control accuracy is measured by tests/eval_control_judgment.py.)"""
 from __future__ import annotations
 
 import asyncio
@@ -13,8 +15,8 @@ _LIVE_ROOT = Path(__file__).resolve().parents[1]
 if str(_LIVE_ROOT) not in sys.path:
     sys.path.insert(0, str(_LIVE_ROOT))
 
-from sophon_live.coordinator import AdmitRequest, Ledger, admit, api, slots
-from sophon_live.coordinator.route import current_ask, slot_edit
+from sophon_live.coordinator import AdmitRequest, Ledger, admit, api
+from sophon_live.coordinator.route import build_route_questions
 from sophon_live.coordinator.schemas import TaskStatus
 
 
@@ -32,112 +34,80 @@ def _ledger(objective: str = "明天上海会下雨吗", status: TaskStatus = Ta
     return led, rec
 
 
-def _jev(route: str, control: str | None):
+def _jev(route: str, control: str | None, tool: str | None = None, faithful: str | None = None):
+    """A scripted router: the test says what the MODEL answers (route / control / which tool / is the front's wording faithful)."""
     async def fake(state, questions, **kw):  # noqa: ANN001
         ans = {"route": {"type": "choice", "choice": route}}
         if control is not None:
             ans["control"] = {"type": "choice", "choice": control}
+        if tool is not None:
+            ans["tool"] = {"type": "choice", "choice": tool}
+        if faithful is not None:
+            ans["task_faithful"] = {"type": "choice", "choice": faithful}
         return {"answers": ans}
 
     return fake
 
 
-class SlotEditTests(unittest.TestCase):
-    def test_city_swap_on_a_running_task(self) -> None:
-        led, rec = _ledger()
-        d = slot_edit("明天北京会下雨吗", "改成北京的。", led)
-        self.assertEqual((d.op, d.task_id, d.version, d.via), ("REFINE", rec.task_id, 1, "guard"))
-
-    def test_city_swap_without_raw_words_needs_the_same_shape(self) -> None:
-        led, rec = _ledger()
-        self.assertIsNotNone(slot_edit("明天北京会下雨吗", "", led))
-
-    def test_works_on_completed_and_delivered_tasks(self) -> None:
-        for st in (TaskStatus.COMPLETED, TaskStatus.DELIVERED):
-            led, rec = _ledger(status=st)
-            self.assertEqual(slot_edit("明天北京会下雨吗", "", led).task_id, rec.task_id, st)
-
-    def test_day_swap(self) -> None:
-        led, rec = _ledger()
-        self.assertEqual(slot_edit("后天上海会下雨吗", "", led).op, "REFINE")
-
-    def test_explicit_edit_words_are_enough_when_the_front_rewrote_the_shape(self) -> None:
-        led, _ = _ledger()
-        self.assertIsNone(slot_edit("北京天气怎么样", "", led))  # a different shape, no cue: JEV decides
-        self.assertEqual(slot_edit("北京天气怎么样", "改成北京的", led).op, "REFINE")
-
-    def test_not_a_slot_edit(self) -> None:
-        led, _ = _ledger()
-        self.assertIsNone(slot_edit("明天上海会下雨吗", "", led), "same city, nothing changed")
-        self.assertIsNone(slot_edit("讲个笑话", "", led))
-        self.assertIsNone(slot_edit("上海和北京明天都会下雨吗", "", led), "two cities: ambiguous")
-        self.assertIsNone(slot_edit("今天北京有什么新闻", "", led), "different request that merely names a city")
-
-    def test_task_without_slots_or_dead_tasks_are_never_edited(self) -> None:
-        led, _ = _ledger("讲个笑话")
-        self.assertIsNone(slot_edit("明天北京会下雨吗", "改成北京的", led))
-        led, _ = _ledger(status=TaskStatus.CANCELLED)
-        self.assertIsNone(slot_edit("明天北京会下雨吗", "改成北京的", led))
-        self.assertIsNone(slot_edit("明天北京会下雨吗", "改成北京的", Ledger()))
-
-    def test_only_the_latest_task_qualifies(self) -> None:
-        led, _ = _ledger()
-        newer = led.create("今天有什么新闻")
-        led.mark_running(newer.task_id)
-        self.assertIsNone(slot_edit("明天北京会下雨吗", "", led))
-
-    def test_refined_objective_edits_the_newest_wording(self) -> None:
-        self.assertEqual(current_ask("明天上海会下雨吗。用户改口，以新说法为准：明天北京会下雨吗"), "明天北京会下雨吗")
-        led, rec = _ledger()
-        led.refine(rec.task_id, "明天上海会下雨吗。用户改口，以新说法为准：明天北京会下雨吗", version=1)
-        self.assertEqual(slot_edit("明天广州会下雨吗", "", led).version, 2)
-
-    def test_city_list_matches_the_weather_tool(self) -> None:
-        import importlib
-
-        w = importlib.import_module("sophon_live.assistant_tools.weather")      # (weather.py now imports its sibling inflight.py: a package import)
-        self.assertEqual(set(slots.CITY_NAMES), set(w.CITIES))
-
-
-class AdmitGuardTests(unittest.IsolatedAsyncioTestCase):
+class ModelDrivenRefineTests(unittest.IsolatedAsyncioTestCase):
     def _req(self, text: str, raw: str = "") -> AdmitRequest:
         return AdmitRequest(session_id="sess_t", utterance_id="u", text=text, delegate_task=text, raw_text=raw)
 
-    async def test_guard_beats_a_jev_that_says_new_and_never_calls_it(self) -> None:
+    async def test_a_rewritten_sentence_is_a_refine_when_the_model_says_so(self) -> None:
         led, rec = _ledger()
-        boom = mock.AsyncMock(side_effect=AssertionError("JEV must not be asked"))
-        with mock.patch.object(api, "USE_JEV", True), mock.patch.object(api, "REFINE_GUARD", True), \
-                mock.patch.object(api.jev_client, "system_one", boom):
+        with mock.patch.object(api, "USE_JEV", True), \
+                mock.patch.object(api.jev_client, "system_one", _jev("WORKER", f"REFINE:{rec.task_id}:1")):
             res = await admit(self._req("明天北京会下雨吗", "改成北京的。"), led)
-        self.assertEqual((res.route, res.via, res.control.op), ("CONTROL", "guard", "REFINE"))
-        self.assertEqual(res.job.task_id, rec.task_id)
-        self.assertEqual(res.job.version, 2)
-        self.assertIn("以新说法为准：明天北京会下雨吗", res.job.objective)
+        self.assertEqual((res.via, res.control.op), ("jev", "REFINE"))
+        self.assertEqual((res.job.task_id, res.job.version), (rec.task_id, 2))
         self.assertEqual(res.stale_task, (rec.task_id, 1))
-        self.assertEqual(len(led.order), 1)  # one task, now v2 — not a second task
+        self.assertEqual(len(led.order), 1)
 
-    async def test_without_the_guard_jev_new_leaves_two_tasks(self) -> None:
+    async def test_the_model_sees_the_users_own_words_and_the_live_tasks(self) -> None:
         led, rec = _ledger()
-        with mock.patch.object(api, "USE_JEV", True), mock.patch.object(api, "REFINE_GUARD", False), \
-                mock.patch.object(api.jev_client, "system_one", _jev("WORKER", "NEW")):
-            res = await admit(self._req("明天北京会下雨吗", "改成北京的。"), led)
-        self.assertEqual((res.via, res.control), ("jev", None))
-        self.assertEqual(len(led.order), 2)  # the old Shanghai task is still alive: the bug being fixed
+        seen: dict = {}
 
-    async def test_unrelated_utterance_still_goes_to_jev(self) -> None:
+        async def spy(state, questions, **kw):  # noqa: ANN001
+            seen["state"], seen["questions"] = state, questions
+            return {"answers": {"route": {"type": "choice", "choice": "WORKER"}, "control": {"type": "choice", "choice": "NEW"}}}
+
+        with mock.patch.object(api, "USE_JEV", True), mock.patch.object(api.jev_client, "system_one", spy):
+            await admit(self._req("明天北京会下雨吗", "改成北京的。"), led)
+        self.assertEqual(seen["state"]["user_said"], "改成北京的。")
+        self.assertEqual(seen["state"]["tasks"][0]["task_id"], rec.task_id)
+        self.assertIn(f"REFINE:{rec.task_id}:1", seen["questions"]["control"]["criteria"])
+
+    async def test_new_means_new_task_and_the_old_one_stays(self) -> None:
         led, _ = _ledger()
-        with mock.patch.object(api, "USE_JEV", True), mock.patch.object(api, "REFINE_GUARD", True), \
-                mock.patch.object(api.jev_client, "system_one", _jev("WORKER", "NEW")):
+        with mock.patch.object(api, "USE_JEV", True), mock.patch.object(api.jev_client, "system_one", _jev("WORKER", "NEW")):
             res = await admit(self._req("讲个笑话"), led)
-        self.assertEqual((res.via, res.route), ("jev", "WORKER"))
+        self.assertEqual((res.via, res.route, res.control), ("jev", "WORKER", None))
+        self.assertEqual(len(led.order), 2)
+
+    async def test_a_stale_version_from_the_model_is_rejected_by_the_state_machine(self) -> None:
+        led, rec = _ledger()
+        with mock.patch.object(api, "USE_JEV", True), \
+                mock.patch.object(api.jev_client, "system_one", _jev("CONTROL", f"REFINE:{rec.task_id}:7")):
+            res = await admit(self._req("明天北京会下雨吗", "改成北京的。"), led)
+        self.assertIsNone(res.job)
+        self.assertIn("改过了", res.speak.text)
+        self.assertEqual(led.tasks[rec.task_id].version, 1, "a version the ledger never had must not move the task")
+
+    async def test_control_with_no_usable_option_is_a_fixed_clarify_not_a_guess(self) -> None:
+        led, _ = _ledger()
+        with mock.patch.object(api, "USE_JEV", True), mock.patch.object(api.jev_client, "system_one", _jev("CONTROL", None)):
+            res = await admit(self._req("那个呢"), led)
+        self.assertEqual((res.route, res.speak.kind, res.speak.text), ("CLARIFY", "clarify", api.DEGRADED_CLARIFY))
+        self.assertEqual(len(led.order), 1)
 
     async def test_decision_log_line_is_machine_readable(self) -> None:
         led, rec = _ledger()
-        with mock.patch.object(api, "USE_JEV", False), self.assertLogs("sophon_live.coordinator", "INFO") as cm:
-            await admit(self._req("明天北京会下雨吗", "改成北京的。"), led)
+        with mock.patch.object(api, "USE_JEV", True), mock.patch.object(api.jev_client, "system_one", _jev("CONTROL", f"CANCEL:{rec.task_id}:1")), \
+                self.assertLogs("sophon_live.coordinator", "INFO") as cm:
+            await admit(self._req("别查了"), led)
         line = next(l for l in cm.output if "coord admit" in l)
         m = re.search(r"coord admit session=(\S+) .*?route=(\S+) .*?decision=(\S+) via=(\S+) admit_ms=(\d+) jev_ms=(\S+)", line)
-        self.assertEqual(m.group(1, 2, 3, 4), ("sess_t", "CONTROL", "REFINE", "guard"))
+        self.assertEqual(m.group(1, 2, 3, 4), ("sess_t", "CONTROL", "CANCEL", "jev"))
 
 
 class GatewayRawTextTests(unittest.TestCase):

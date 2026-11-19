@@ -1,6 +1,6 @@
 """体验版 v1 / 1: a tool-backed answer is never spoken without its tool result.
 
-- the Coordinator (coordinator.intent) decides which requests are tool-backed and stamps WorkerJob.require_tools,
+- the ROUTER MODEL says which tool a request needs (coordinator.intent frames the question); the Coordinator stamps WorkerJob.require_tools from its answer,
   including on REFINE (the job is re-run with the new slots and must call the tool again);
 - the Worker forces the first tool call and refuses to answer a tool-backed job without it;
 - finish_job rejects a completed answer that has no tool evidence (honest failure, ledger FAILED, never the made-up text).
@@ -21,86 +21,73 @@ from sophon_live.assistant_tools import orchestrator as orch
 from sophon_live.assistant_tools.registry import list_tool_names
 from sophon_live.coordinator import AdmitRequest, Ledger, WorkerJob, WorkerResult, admit, api, finish_job, intent
 from sophon_live.coordinator.schemas import FAILED_GENERIC, NO_TOOL_ANSWER, TaskStatus, is_tool_failure_sentence
-from tests.intent_cases import CRITIC_FREE, CRITIC_REALTIME, OFFICIAL_FREE, OFFICIAL_REALTIME
 from tests.test_orch_worker import _job, _say, _tool_call
 from tests.test_orchestrator import _FakeResp, _FakeSession
 from tests.test_refine_guard import _jev, _ledger
 
 
 class IntentTests(unittest.TestCase):
-    def test_tool_backed_requests(self) -> None:
-        cases = {
-            "明天上海会下雨吗": "get_weather", "北京明天天气": "get_weather", "明天天气。用户补充：北京": "get_weather",
-            "现在几点了": "get_datetime", "今天有什么科技新闻": "get_news", "关掉客厅的灯": "device_control",
-            "把客厅灯打开": "device_control", "用户上次说喜欢吃什么": "memory_note", "用搜索查一下今天美元兑人民币大概多少": "web_search",
-            "what's the weather in Paris": "get_weather",
-        }
-        for text, tool in cases.items():
-            self.assertEqual(intent.required_tools(text)[:1], [tool], text)
+    """rc2: no keyword judgement lives in intent.py; these tests cover the mapping from the model's answer and the enforcement."""
 
-    def test_chitchat_jokes_and_knowledge_need_no_tool(self) -> None:
-        for text in ("讲个笑话", "讲一个不一样的笑话", "你好", "谁发明了电灯", "北京是中国的首都吗", "灯为什么会亮", ""):
-            self.assertEqual(intent.required_tools(text), [], text)
-
-    # Critic I-8: realtime facts without the words 搜索 / 汇率 / 股价. Each one must be tool-backed (web_search), so the guard in
-    # finish_job applies: no successful tool evidence -> honest failure, never an answer from the model's head.
-    REALTIME_FACT_QUESTIONS = OFFICIAL_REALTIME + CRITIC_REALTIME      # 29 + 12, all must be web_search (labeled sets: tests/intent_cases.py)
-    NOT_REALTIME_FACTS = OFFICIAL_FREE + CRITIC_FREE                   # 19 + 15 (the 15 are Critic's I-9 over-trigger probes)
-
-    def test_realtime_fact_questions_are_tool_backed(self) -> None:
-        for text in self.REALTIME_FACT_QUESTIONS:
-            self.assertEqual(intent.required_tools(text)[:1], ["web_search"], text)
-            self.assertEqual(intent.pad_for(text), "我帮你查一下。", text)
-
-    def test_chitchat_and_stable_knowledge_stay_tool_free(self) -> None:
-        for text in self.NOT_REALTIME_FACTS:
-            self.assertEqual(intent.required_tools(text), [], text)
+    def test_every_option_names_a_registered_tool(self) -> None:
+        known = set(list_tool_names())
+        for name in intent.TOOL_CRITERIA:
+            if name != intent.NONE:
+                for tool in intent.tools_from_answer(name):
+                    self.assertIn(tool, known)
 
     def test_realtime_fact_without_the_tool_is_never_answered(self) -> None:
-        """End to end through admit + finish_job: 「今天美元兑人民币是多少」, the Worker answers a number with no tool call."""
+        """End to end through admit + finish_job: the (scripted) router says web_search, the Worker answers a number with no tool call."""
         async def go():
             led = Ledger()
-            with mock.patch.object(api, "USE_JEV", True), mock.patch.object(api.jev_client, "system_one", new=_jev("WORKER", None)):
+            with mock.patch.object(api, "USE_JEV", True), mock.patch.object(api.jev_client, "system_one", new=_jev("WORKER", None, tool="web_search")):
                 res = await admit(AdmitRequest(session_id="s", utterance_id="u", text="今天美元兑人民币是多少", delegate_task="今天美元兑人民币是多少"), led)
             self.assertEqual(res.job.require_tools, ["web_search"])
+            self.assertEqual(res.speak.text, "我帮你查一下。")
             led.mark_running(res.job.task_id)
             fake = WorkerResult(task_id=res.job.task_id, version=res.job.version, status="completed", spoken_answer="今天美元兑人民币大约七点二。", freshness_token=res.job.freshness_token)
             return finish_job(led, res.job, fake)
         out = asyncio.run(go())
         self.assertEqual((out.text, out.rejected), (NO_TOOL_ANSWER, "no_tool_result"))
 
-    def test_tool_names_exist(self) -> None:
-        known = set(list_tool_names())
-        for name, _ in intent._PATTERNS:
-            self.assertIn(name, known)
-
 
 class AdmitStampsRequireToolsTests(unittest.IsolatedAsyncioTestCase):
     async def test_new_weather_job_requires_the_tool(self) -> None:
         led = Ledger()
-        with mock.patch.object(api, "USE_JEV", True), mock.patch.object(api.jev_client, "system_one", new=_jev("WORKER", None)):
+        with mock.patch.object(api, "USE_JEV", True), mock.patch.object(api.jev_client, "system_one", new=_jev("WORKER", None, tool="get_weather")):
             res = await admit(AdmitRequest(session_id="s", utterance_id="u", text="明天上海会下雨吗", delegate_task="明天上海会下雨吗"), led)
         self.assertEqual(res.job.require_tools, ["get_weather"])
+        self.assertEqual(led.tasks[res.job.task_id].require_tools, ["get_weather"])
 
     async def test_joke_job_requires_nothing(self) -> None:
         led = Ledger()
-        with mock.patch.object(api, "USE_JEV", True), mock.patch.object(api.jev_client, "system_one", new=_jev("WORKER", None)):
+        with mock.patch.object(api, "USE_JEV", True), mock.patch.object(api.jev_client, "system_one", new=_jev("WORKER", None, tool="NONE")):
             res = await admit(AdmitRequest(session_id="s", utterance_id="u", text="讲个笑话", delegate_task="讲个笑话"), led)
-        self.assertEqual(res.job.require_tools, [])
+        self.assertEqual((res.job.require_tools, res.job.tool_judgment), ([], "model"))
+
+    async def test_no_model_answer_is_unknown_not_a_guess(self) -> None:
+        led = Ledger()
+        with mock.patch.object(api, "USE_JEV", True), mock.patch.object(api.jev_client, "system_one", new=_jev("WORKER", None, tool="不是选项")):
+            res = await admit(AdmitRequest(session_id="s", utterance_id="u", text="明天上海会下雨吗", delegate_task="明天上海会下雨吗"), led)
+        self.assertEqual((res.job.require_tools, res.job.tool_judgment), ([], "unknown"))
 
     async def test_refine_reruns_the_job_with_the_tool_required(self) -> None:
-        # "改成北京的" after a Shanghai weather task: REFINE (guard), the re-run job must call get_weather again
+        # the (scripted) model says "改成北京的" is a REFINE of the Shanghai weather task: the re-run job must call get_weather again
         for raw in ("改成北京的。", ""):
             led, rec = _ledger("明天上海会下雨吗")
-            res = await admit(AdmitRequest(session_id="s", utterance_id="u", text="明天北京会下雨吗", delegate_task="明天北京会下雨吗", raw_text=raw), led)
+            rec.require_tools = ["get_weather"]           # what the router said when the task was admitted
+            with mock.patch.object(api, "USE_JEV", True), \
+                    mock.patch.object(api.jev_client, "system_one", new=_jev("WORKER", f"REFINE:{rec.task_id}:1", tool="get_weather")):
+                res = await admit(AdmitRequest(session_id="s", utterance_id="u", text="明天北京会下雨吗", delegate_task="明天北京会下雨吗", raw_text=raw), led)
             self.assertEqual(res.control.op, "REFINE", raw)
-            self.assertEqual(res.via, "guard")
+            self.assertEqual(res.via, "jev")
             self.assertEqual(res.job.require_tools, ["get_weather"], raw)
             self.assertEqual(res.job.version, 2)
 
     async def test_refine_by_jev_with_a_bare_slot_still_requires_the_old_tool(self) -> None:
         led, rec = _ledger("明天上海会下雨吗")
-        with mock.patch.object(api, "REFINE_GUARD", False), mock.patch.object(api, "USE_JEV", True), \
+        rec.require_tools = ["get_weather"]
+        with mock.patch.object(api, "USE_JEV", True), \
                 mock.patch.object(api.jev_client, "system_one", new=_jev("CONTROL", f"REFINE:{rec.task_id}:1")):
             res = await admit(AdmitRequest(session_id="s", utterance_id="u", text="北京的", delegate_task="北京的"), led)
         self.assertEqual(res.control.op, "REFINE")

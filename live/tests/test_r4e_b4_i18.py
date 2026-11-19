@@ -14,7 +14,6 @@ from unittest import mock
 from sophon_live import failcodes
 from sophon_live.assistant_tools import news, toolmeta, weather
 from sophon_live.assistant_tools import orchestrator as orch
-from sophon_live.coordinator import slots
 from sophon_live.coordinator.schemas import WorkerJob
 from tests.test_orch_worker import _say, _tool_call
 from tests.test_orchestrator import _FakeResp, _FakeSession
@@ -70,8 +69,7 @@ class UngroundedCityIsProvenanceOnly(unittest.TestCase):
                  ("北京市", "北京天气"), ("Rome", "weather in Rome"), ("Urumqi", "明天天气怎么样"), ("天气", "明天天气怎么样"))
         real = [ungrounded(c, u) for c, u in cases]
         for table in ((), ("天气", "明天", "火星", "Rome", "乌鲁木齐")):
-            with mock.patch.object(slots, "CITY_NAMES", table):
-                self.assertEqual([ungrounded(c, u) for c, u in cases], real, table)
+            self.assertEqual([ungrounded(c, u) for c, u in cases], real, table)       # (v0.1.1: coordinator/slots.py is deleted; nothing left to patch)
 
     def test_the_orchestrator_no_longer_touches_the_city_list(self) -> None:
         src = Path(orch.__file__).read_text(encoding="utf-8")

@@ -1,8 +1,11 @@
 """Blind-test runner for Critic's I-10 routing test (one self-contained file; touches no production code).
 
-It feeds sentences, one per run, through the Coordinator (``coordinator.admit``: the JEV route decision, the guard, the heuristic
-fallback) and, for a job, through the Worker, and RECORDS what the system did. It never scores, never compares to an expected
-route, and contains no word list or regex about meaning.
+It feeds sentences, one per run, through the Coordinator (``coordinator.admit``: the JEV route / tool / control decision, or the model-free degraded
+path when the JEV cannot answer) and, for a job, through the Worker and ``finish_job``, and RECORDS what the
+system did. It never scores, never compares to an expected route, and contains no word list or regex about meaning.
+
+Adapted to the v0.1.0 production API (rc3 removed ``heuristic_route`` / ``slot_edit`` / ``required_tools`` / ``missing_slots_for_text`` /
+``has_explicit_save_intent``: the model decides, so there is no keyword function left to record, and ``via`` is ``jev`` or ``degraded``).
 
 Usage (from ``live/``)::
 
@@ -17,40 +20,27 @@ non-empty string; ``id`` and ``task`` are optional (``task`` = the front model's
 Output, one JSON object per sentence, written ONLY to OUT.jsonl (which must not exist yet, and must not be the input; created 0600)::
 
     {"id", "mode" (fake|real), "fidelity" (list of codes, see below),
-     "route"  (the Coordinator's route: WORKER|FAST|CLARIFY|CONTROL|STOP_SPEAKING), "route_via" (who decided the route, see below),
-     "decision" (NEW / REFINE / CANCEL / STATUS / the route), "jev_route", "jev_control" (what the JEV answered, even if a guard overrode it),
-     "via" (jev | guard | heuristic: the production label), "control_via" (who picked the CONTROL target, or null),
-     "degraded" (JEV was expected but something else decided), "degraded_reason", "degraded_exc" (class name of the JEV exception, else null),
+     "route"  (the Coordinator's route: WORKER|FAST|CLARIFY|CONTROL|STOP_SPEAKING),
+     "decision" (NEW / REFINE / CANCEL / STATUS / the route), "jev_route", "jev_control", "jev_tool" (what the JEV answered, even when the Coordinator
+     then degraded or overrode it; null = no usable answer),
+     "via" (jev | degraded: production's label; degraded = the JEV could not give a route and the model-free path ran), "control_via" (production's label
+     of the applied ControlDecision, or null),
+     "degraded" (JEV was expected but ``via`` is degraded), "degraded_reason" (production's own reason: breaker_open | timeout | connection | error |
+     non_option_answer; never derived here), "degraded_exc" (class name of the JEV exception, else null),
+     "judge_invalid" (the router answers that were not an offered option, production's own list, e.g. ``tool:missing``),
      "handled_by" (fast | clarify | control | worker | stop; the ADMIT stage's handler. It stays "worker" when the Worker's result is later turned into
                    a clarification or dropped as stale -- read "outcome_kind" (answer | clarify | stale) for what happened to the job),
-     "required_tools" (what ``intent.required_tools`` -- a regex table in production -- told the Worker it must call; null when no job),
-     "clarify_slots" (RETURN VALUES of ``clarify.missing_slots_for_text`` -- a keyword test in production -- one slot list per call, null if it was
-                      not called), "memory_gate_explicit" (return values of ``memory_gate.has_explicit_save_intent`` -- a keyword table -- one bool per
-                      call; only a REAL Worker's memory tool calls it, so it is null in fake mode),
+     "required_tools" (the tools the MODEL said the Worker must call; null when no job), "tool_judgment" (model | unknown: the router answered the tool
+                      question or could not), "explicit_save" (the model's judgment, true | false | null),
      "tools" / "tool_ok" (the tools the Worker really called and their ok flags; null in fake mode: nothing was called),
      "worker_status", "outcome_kind" (finish_job's answer | clarify | stale; null when no job), "outcome_rejected" (finish_job's ``rejected`` code,
-     e.g. no_tool_result / tool_failed, else null), "reply", "error" (exception class name only, else null), "error_stage" (admit | worker | finish)}
+     e.g. no_tool_result / tool_failed, else null), "reply", "error" (exception class name only, else null),
+     "error_stage" (admit | worker | finish)}
 
-The two keyword functions are wrapped for the duration of one sentence exactly like ``jev_client.system_one`` is: called unchanged, only their
-return values are kept (never their arguments), and restored afterwards.
+The JEV is wrapped for the duration of one sentence: called unchanged, only the choice answers it returns are kept (never its arguments), and it is
+restored afterwards.
 
 On an error every field obtained before the failure is kept; only ``error`` / ``error_stage`` are added.
-
-Who decided (all derived from structure, never from the sentence)
-  route_via     guard      the refine guard (``slot_edit``) answered before the JEV was asked (``jev_route`` is then null)
-                jev        the JEV answered one of the five route enums (the keys of ``route.ROUTE_CRITERIA``)
-                heuristic  the JEV failed or is switched off, or answered no route: ``heuristic_route`` (keyword tables) decided
-                jev_invalid  the JEV answered something that is not a route enum; production falls through to a WORKER job
-  control_via   jev | heuristic | guard (the production label of the applied ControlDecision); when the JEV said CONTROL but nothing was applied:
-                jev (it said NEW or named a task the Ledger does not have) or heuristic (``heuristic_control`` ran and found nothing)
-  degraded      the JEV was expected (SOPHON_LIVE_JEV on) and route_via is heuristic/jev_invalid, or control_via is heuristic, or via is heuristic.
-                A guard decision is NOT degraded (the JEV was never asked) -- read ``route_via``.
-  degraded_reason  the JEV call raised (chosen by exception CLASS and cause only, never the message; ``degraded_exc`` has the class name):
-                timeout | conn | http_status (aiohttp.ClientResponseError) | bad_json (RuntimeError with a cause: the unparsable body) |
-                runtime_error (a RuntimeError without a cause: jev_client's >=400 answer -- and any other plain RuntimeError, the class cannot
-                tell them apart) | jev_error (anything else). With the current production ``jev_client``: ``runtime_error`` is the JEV returning
-                >=400 (or any other plain RuntimeError); ``http_status`` NEVER occurs (jev_client does not use ``raise_for_status``, so no
-                ``ClientResponseError`` arises) -- it is kept only in case production starts raising it;  or, without an exception: no_usable_route | invalid_route | control_no_target | null
 
 Fidelity: what differs from the production path (every row lists the codes that apply to this run)
   fake_jev, fake_worker      nothing real was asked
@@ -66,8 +56,9 @@ Fidelity: what differs from the production path (every row lists the codes that 
   ledger_per_sentence / ledger_shared     a new Ledger for every sentence (the JEV sees no tasks, CONTROL cannot be tested) / one Ledger
 
 Modes
-  fake (default)  a constant fake JEV (``--fake-route``, default WORKER) and a fake Worker that "calls" the tools the Coordinator required
-                  and answers with a fixed string. No network, no model. This is what the tests use. ``tools``/``tool_ok`` are null.
+  fake (default)  a constant fake JEV (``--fake-route``, default WORKER; it answers the route question and nothing else, so the tool, control and
+                  review questions come back as "no usable answer" and are recorded as such) and a fake Worker that "calls" the tools the Coordinator
+                  required and answers with a fixed string. No network, no model. This is what the tests use. ``tools``/``tool_ok`` are null.
   real            the real JEV (``--jev-url``) and the real Worker/orchestrator (``--orch-url``/``--orch-model``). Refused unless the
                   environment has ``BLIND_RUNNER_ALLOW_REAL=1``. Real runs are for AFTER the server freeze is lifted; do not run them before.
   gateway URL     NOT available: the GPT-Live gateway and the Realtime face take speech only (text items are ignored), so there is no text
@@ -251,32 +242,14 @@ def quiet_and_sealed(real: bool, orch_url: str | None = None, orch_model: str | 
                 os.environ[k] = v
 
 
-def jev_error_kind(e: BaseException) -> str:
-    """Why a JEV call failed, by exception CLASS and cause only (the message may quote the sentence and is never read).
-    timeout | conn | http_status (aiohttp.ClientResponseError) | bad_json (a RuntimeError that has a cause: jev_client raises the unparsable-body
-    error ``from`` the parse error) | runtime_error (a RuntimeError without a cause: what jev_client raises for a >=400 answer, and also any other
-    plain RuntimeError -- the class cannot tell them apart) | jev_error (anything else)."""
-    import aiohttp
-    if isinstance(e, (TimeoutError, asyncio.TimeoutError)):
-        return "timeout"
-    if isinstance(e, (aiohttp.ClientConnectionError, OSError)):
-        return "conn"
-    if isinstance(e, aiohttp.ClientResponseError):
-        return "http_status"
-    if isinstance(e, RuntimeError):
-        return "bad_json" if e.__cause__ is not None else "runtime_error"
-    return "jev_error"
-
-
 class _Recorder:
     """Remembers what the JEV answered for the current sentence (the Coordinator may then override it) and why a JEV call failed."""
     def __init__(self) -> None:
         self.route: str | None = None
         self.control: str | None = None
+        self.tool: str | None = None             # the JEV's answer to the tool question (an option key or None)
         self.error_kind: str | None = None
         self.error_exc: str | None = None
-        self.slots: list[list[str]] | None = None        # return values of api.missing_slots_for_text, one per call
-        self.save_intent: list[bool] | None = None       # return values of memory_gate.has_explicit_save_intent, one per call
 
 
 async def _fake_jev(route: str):
@@ -306,30 +279,14 @@ def fidelity_codes(*, mode: str, has_task: bool, instructions: str, history_mode
 
 
 def _blank_row(sid: str, mode: str, fidelity: list[str]) -> dict[str, Any]:
-    return {"id": sid, "mode": mode, "fidelity": fidelity, "route": None, "route_via": None, "decision": None, "jev_route": None,
+    return {"id": sid, "mode": mode, "fidelity": fidelity, "route": None, "decision": None, "jev_route": None,
             "jev_control": None, "via": None, "control_via": None, "degraded": None, "degraded_reason": None, "degraded_exc": None, "handled_by": None,
-            "required_tools": None, "clarify_slots": None, "memory_gate_explicit": None, "tools": None, "tool_ok": None, "worker_status": None, "outcome_kind": None, "outcome_rejected": None, "reply": Opaque(""), "error": None, "error_stage": None}
+            "jev_tool": None, "judge_invalid": None, "required_tools": None, "tool_judgment": None, "explicit_save": None, "tools": None, "tool_ok": None, "worker_status": None, "outcome_kind": None, "outcome_rejected": None, "reply": Opaque(""), "error": None, "error_stage": None}
 
 
-def _route_via(res, jev_route: str | None, use_jev: bool, enums: set[str]) -> str:   # noqa: ANN001
-    if res.via == "guard":
-        return "guard"
-    if res.via == "heuristic" or not use_jev:
-        return "heuristic"
-    if not jev_route:
-        return "heuristic"                      # api: ``choice_answer(...) or heuristic_route(...)``
-    return "jev" if jev_route in enums else "jev_invalid"
-
-
-def _control_via(res, jev_route: str | None, jev_control: str | None) -> str | None:   # noqa: ANN001
-    from sophon_live.coordinator import api
-    if res.control is not None:
-        return res.control.via
-    if jev_route != "CONTROL" or res.via != "jev":
-        return None
-    if jev_control == "NEW" or api._parse_control_key(jev_control) is not None:
-        return "jev"                            # said NEW, or named a task the Ledger does not have: a new job, JEV's call
-    return "heuristic"                          # no usable target: heuristic_control ran and found nothing
+def _control_via(res) -> str | None:   # noqa: ANN001
+    """Who picked the CONTROL target that was applied (production's label), else None: a NEW job or a fixed clarify has no target."""
+    return res.control.via if res.control is not None else None
 
 
 def _admit_request(sid: str, text: Opaque, task: Opaque | None, language: str, playback_active: bool):
@@ -370,8 +327,7 @@ async def run_one(sid: str, text: Opaque, *, ledger, jev, worker, language: str 
                   fidelity: list[str] | None = None, history_sink: list[dict[str, Opaque]] | None = None) -> dict[str, Any]:
     """Run one sentence; ALWAYS returns a row (on an error the fields obtained so far are kept, plus ``error``/``error_stage``)."""
     from sophon_live import coordinator as C
-    from sophon_live.coordinator import api, jev_client, memory_gate
-    from sophon_live.coordinator.route import ROUTE_CRITERIA
+    from sophon_live.coordinator import api, intent, jev_client
     rec = _Recorder()
     row = _blank_row(sid, mode, fidelity if fidelity is not None else [])
     stage = "admit"
@@ -380,47 +336,28 @@ async def run_one(sid: str, text: Opaque, *, ledger, jev, worker, language: str 
         try:
             resp = await jev(state, questions, **kw)
         except Exception as e:   # noqa: BLE001   re-raised unchanged: production behaviour is not altered
-            rec.error_kind, rec.error_exc = jev_error_kind(e), type(e).__name__
+            rec.error_exc = type(e).__name__
             raise
-        rec.route = jev_client.choice_answer(resp, "route")
-        rec.control = jev_client.choice_answer(resp, "control")
+        rec.route = jev_client.choice_answer(resp, "route") or rec.route
+        rec.control = jev_client.choice_answer(resp, "control") or rec.control
+        rec.tool = jev_client.choice_answer(resp, intent.TOOL_KEY) or rec.tool
         return resp
 
-    def recording(fn, sink: str):   # noqa: ANN001   wraps a production keyword function: calls it unchanged, keeps ONLY its return value
-        def wrapper(*a, **k):   # noqa: ANN002, ANN003
-            r = fn(*a, **k)
-            if sink == "slots":
-                rec.slots = (rec.slots or []) + [list(r or [])]
-            else:
-                rec.save_intent = (rec.save_intent or []) + [bool(r)]
-            return r
-        return wrapper
-
-    patches = [(jev_client, "system_one", spy), (api, "missing_slots_for_text", recording(api.missing_slots_for_text, "slots")),
-               (memory_gate, "has_explicit_save_intent", recording(memory_gate.has_explicit_save_intent, "save"))]
+    patches = [(jev_client, "system_one", spy)]
     saved = [(o, n, getattr(o, n)) for o, n, _ in patches]
     for o, n, f in patches:
         setattr(o, n, f)
     try:
         res = await C.admit(_admit_request(sid, text, task, language, playback_active), ledger)
         use_jev = bool(api.USE_JEV)
-        row["jev_route"], row["jev_control"] = rec.route, rec.control
+        row["jev_route"], row["jev_control"], row["jev_tool"] = rec.route, rec.control, rec.tool
         row["route"], row["via"] = res.route, res.via
         row["decision"] = res.control.op if res.control is not None else ("NEW" if res.job is not None else res.route)
-        row["route_via"] = _route_via(res, rec.route, use_jev, set(ROUTE_CRITERIA))
-        row["control_via"] = _control_via(res, rec.route, rec.control)
-        reason = rec.error_kind
-        if reason is None and use_jev and res.via != "guard":
-            if row["route_via"] == "heuristic":
-                reason = "no_usable_route"
-            elif row["route_via"] == "jev_invalid":
-                reason = "invalid_route"
-            elif row["control_via"] == "heuristic":
-                reason = "control_no_target"
-        row["degraded_reason"], row["degraded_exc"] = reason, rec.error_exc
-        row["degraded"] = bool(use_jev and (row["route_via"] in ("heuristic", "jev_invalid") or row["control_via"] == "heuristic"
-                                            or res.via == "heuristic" or rec.error_kind is not None))
-        row["clarify_slots"] = rec.slots
+        row["control_via"] = _control_via(res)
+        row["degraded"] = bool(use_jev and res.via == "degraded")
+        row["degraded_reason"] = (res.degraded_reason or None) if row["degraded"] else None     # production's own reason, never derived here
+        row["degraded_exc"] = rec.error_exc if row["degraded"] else None
+        row["judge_invalid"] = list(res.judge_invalid)
         if res.job is None:
             row["handled_by"] = {"STOP_SPEAKING": "stop", "FAST": "fast", "CLARIFY": "clarify"}.get(res.route, "control" if res.control else res.route.lower())
             row["reply"] = Opaque(res.speak.text)        # read here, wrapped at once: production's text may quote the sentence
@@ -429,6 +366,7 @@ async def run_one(sid: str, text: Opaque, *, ledger, jev, worker, language: str 
         objective = Opaque(job.objective)                # read here, wrapped at once
         row["handled_by"] = "worker"
         row["required_tools"] = list(job.require_tools or [])
+        row["tool_judgment"], row["explicit_save"] = job.tool_judgment, job.explicit_save
         stage = "worker"
         with C.bind_task(_task_context(job, objective, ledger)):
             wr = await worker(job, instructions=instructions, history=_worker_history(history or []))
@@ -436,19 +374,16 @@ async def run_one(sid: str, text: Opaque, *, ledger, jev, worker, language: str 
         if mode != "fake":                       # a fake Worker calls nothing: its "evidence" is just the required tools echoed back
             row["tools"] = [str(e.get("tool")) for e in wr.evidence]
             row["tool_ok"] = [e.get("ok") for e in wr.evidence]
-        row["memory_gate_explicit"] = rec.save_intent
         stage = "finish"
         out = C.finish_job(ledger, job, wr)
         row["outcome_kind"], row["outcome_rejected"] = out.kind, out.rejected or None
         reply = Opaque(out.text)                         # read here, wrapped at once
         row["reply"] = reply
-        row["clarify_slots"] = rec.slots
         if history_sink is not None and out.kind == "answer":      # like gateway.py: a clarify question or a stale result never enters the history
             history_sink.append({"task": objective, "answer": reply})
             del history_sink[:-HISTORY_KEEP]
     except Exception as e:   # noqa: BLE001   class name only: a message may quote the sentence
         row["error"], row["error_stage"] = type(e).__name__, stage
-        row["clarify_slots"], row["memory_gate_explicit"] = rec.slots, rec.save_intent
     finally:
         for o, n, v in saved:
             setattr(o, n, v)

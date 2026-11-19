@@ -173,6 +173,11 @@ class WorkerJob:
     # Tool-backed request (weather / time / news / device / search / memory): the answer MUST come from a tool result.
     # Set by the Coordinator (coordinator.intent); the Worker forces the first call, finish_job rejects a tool-less answer.
     require_tools: list[str] = field(default_factory=list)
+    # Who decided ``require_tools``: "model" (the router answered; [] = it said no tool) or "unknown" (the router was unavailable or
+    # gave a non-option answer). With "unknown" nothing is forced (and it is traced as such).
+    tool_judgment: str = "model"
+    # The router model's judgment: did the user explicitly ask to keep this long-term? ``memory_gate`` writes long-term memory only on True.
+    explicit_save: bool | None = None
 
 
 @dataclass
@@ -216,4 +221,7 @@ class TaskRecord:
     spoken_answer: str = ""
     constraints: list[dict[str, Any]] = field(default_factory=list)
     slots: dict[str, str] = field(default_factory=dict)  # task-scoped slots (this task version only; never long-term)
+    require_tools: list[str] = field(default_factory=list)   # what the router said this task needs (a REFINE inherits it)
+    tool_judgment: str = "model"
+    explicit_save: bool | None = None
     interrupted: int = 0  # how many times playback of the answer was cut off (answer stays re-playable)

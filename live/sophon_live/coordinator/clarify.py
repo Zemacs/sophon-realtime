@@ -17,6 +17,20 @@ def clarify_for_slots(slots: list[str] | None) -> str:
     return _GENERIC
 
 
-def missing_slots_for_text(text: str) -> list[str]:
-    """Slots the C layer already knows are missing from the raw request (used by admit's CLARIFY route)."""
-    return ["city"] if "天气" in (text or "") else []
+# Which slot is missing is the ROUTER MODEL's judgment (one extra, rare question: only when the route is CLARIFY).
+MISSING_SLOT_KEY = "missing_slot"
+_MISSING_CRITERIA = {
+    "city": "缺城市或地点（比如问天气但没说哪里）",
+    "query": "缺要搜索或查询的具体内容",
+    "topic": "缺想听哪方面的新闻",
+    "other": "缺别的信息，或说不清缺什么",
+}
+
+
+def build_missing_slot_question() -> dict:
+    return {"type": "choice", "instructions": "这句话还缺哪一项关键信息，没有它就没法办？选最缺的一项。", "criteria": dict(_MISSING_CRITERIA)}
+
+
+def slots_from_answer(choice: str | None) -> list[str]:
+    """The model's enumerated answer -> slot names ([] = unknown / other -> the generic ask)."""
+    return [choice] if choice in _ASK else []

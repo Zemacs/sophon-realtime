@@ -4,19 +4,24 @@ from __future__ import annotations
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
+from .. import model_client
 from . import intent, jev_client
-from .clarify import clarify_for_slots, missing_slots_for_text
+from .clarify import MISSING_SLOT_KEY, build_missing_slot_question, clarify_for_slots, slots_from_answer
 from .ledger import Ledger
-from .route import build_route_questions, build_state, heuristic_control, heuristic_route, slot_edit
+from .route import build_route_questions, build_state
 from .schemas import AdmitRequest, ControlDecision, PlaybackReceipt, SpeakPlan, TaskStatus, WorkerJob, WorkerResult, freshness_token_for
 from .schemas import FAILED_GENERIC, FIXED_FAILURES, NO_TOOL_ANSWER, is_tool_failure_sentence, tool_succeeded
 
 log = logging.getLogger("sophon_live.coordinator")
 
 USE_JEV = os.environ.get("SOPHON_LIVE_JEV", "1").strip().lower() in ("1", "true", "yes", "on")
-REFINE_GUARD = os.environ.get("SOPHON_LIVE_REFINE_GUARD", "1").strip().lower() in ("1", "true", "yes", "on")
+
+
+_ROUTES = frozenset({"STOP_SPEAKING", "CLARIFY", "FAST", "CONTROL", "WORKER"})
+# Fixed, model-free sentence used when the router is unavailable and a task is already live: asking is safer than guessing.
+DEGRADED_CLARIFY = "我没完全听明白，你是想改刚才那件事，还是问一件新的事？"
 
 
 @dataclass
@@ -29,10 +34,24 @@ class AdmitResult:
     stale_task: tuple[str, int] | None = None  # (task_id, version) whose in-flight worker must stop
     via: str = "heuristic"  # who decided: guard | jev | heuristic
     jev_ms: float | None = None  # Karpo round trip, when JEV was asked
+    judge_invalid: list = field(default_factory=list)   # RC2-8: router answers that were not an offered option ("tool:invalid", "tool:missing")
+    degraded_reason: str = ""  # via=degraded: breaker_open | timeout | connection | error | non_option_answer | jev_disabled
 
 
-def _clarify_text(text: str) -> str:
-    return clarify_for_slots(missing_slots_for_text(text))
+async def _clarify_text(text: str, language: str | None = None) -> str:
+    """The question to ask for a CLARIFY route: the MODEL names the missing slot (clarify.MISSING_SLOT_KEY); unknown -> generic ask."""
+    slots: list[str] = []
+    try:
+        resp = await jev_client.system_one({"utterance": text, **({"language": language} if language else {})}, {MISSING_SLOT_KEY: build_missing_slot_question()})
+        slots = slots_from_answer(jev_client.choice_answer(resp, MISSING_SLOT_KEY))
+    except Exception as e:  # noqa: BLE001
+        log.warning("missing-slot judgment unavailable: %r", e)
+    return clarify_for_slots(slots)
+
+
+def _clarify_text_for_task(objective: str) -> str:
+    """Re-asking for a task that already waits for input: the Worker's own report named the slots; the generic ask is the safe repeat."""
+    return clarify_for_slots(None)
 
 
 def _parse_control_key(key: str | None) -> ControlDecision | None:
@@ -63,42 +82,70 @@ async def admit(req: AdmitRequest, ledger: Ledger) -> AdmitResult:
     res = await _admit(req, ledger, meta)
     res.via = meta["via"]
     res.jev_ms = meta["jev_ms"]
+    res.degraded_reason = meta.get("degraded_reason", "")
+    res.judge_invalid = list(meta.get("judge_invalid", []))
     log.info(
-        "coord admit session=%s utt=%r route=%s decision=%s via=%s admit_ms=%d jev_ms=%s",
-        req.session_id, (req.delegate_task or req.text or "")[:60], res.route, _decision_label(res), res.via,
+        "coord admit session=%s utt=%r route=%s decision=%s via=%s%s admit_ms=%d jev_ms=%s",
+        req.session_id, (req.delegate_task or req.text or "")[:60], res.route, _decision_label(res), res.via, (":" + res.degraded_reason) if res.degraded_reason else "",
         (time.monotonic() - t0) * 1000, "-" if meta["jev_ms"] is None else int(meta["jev_ms"]),
     )
     return res
 
 
+# RC2-8: how often the router model answers a question with something that is not an offered option (visible in /health via JUDGE_STATS
+# and per turn in the trace as ``judge_invalid``); the code never guesses a replacement.
+JUDGE_STATS: dict[str, int] = {}
+
+
+def _invalid(question: str, answer: object, meta: dict) -> None:
+    kind = "missing" if answer is None else "invalid"
+    JUDGE_STATS[f"{question}_{kind}"] = JUDGE_STATS.get(f"{question}_{kind}", 0) + 1
+    meta.setdefault("judge_invalid", []).append(f"{question}:{kind}")
+    log.warning("router gave a %s answer to the %r question (%r): treated as unknown, not guessed", kind, question, str(answer)[:40])
+
+
 async def _admit(req: AdmitRequest, ledger: Ledger, meta: dict) -> AdmitResult:
     text = (req.delegate_task or req.text or "").strip()
-    route = "WORKER"
+    # JEV decides the route. When it cannot (down, slow, breaker open, or an answer that is not one of the offered options)
+    # the Coordinator never guesses from keywords: it degrades to a model-free safe behaviour (see _degrade).
+    route: str | None = None
     control_key: str | None = None
-
-    if REFINE_GUARD:
-        edit = slot_edit(text, req.raw_text, ledger)
-        if edit is not None:
-            meta["via"] = "guard"
-            log.info("refine guard: %r edits %s v%s", text[:60], edit.task_id, edit.version)
-            return _apply_control(edit, text, req, ledger)
-
+    tools: list[str] | None = None            # None = the model gave no tool answer (unknown)
+    explicit_save: bool | None = None         # the model's judgment: did the user explicitly ask to remember it long-term? None = unknown
+    reason = "jev_disabled"
     if USE_JEV:
         try:
             state = build_state(text, ledger, playback_active=req.playback_active)
             questions = build_route_questions(ledger)
+            # the model, not a word list, says which tool the request needs (and whether the user explicitly asked to keep something long-term).
+            # It reads the user's own words (``user_said``) when the front rewrote the task; the tool question tells it to trust those.
+            if (req.raw_text or "").strip():
+                state["user_said"] = req.raw_text.strip()
+            questions[intent.TOOL_KEY] = intent.build_tool_question()
             t_jev = time.monotonic()
             resp = await jev_client.system_one(state, questions)
             meta["jev_ms"] = (time.monotonic() - t_jev) * 1000
-            route = jev_client.choice_answer(resp, "route") or heuristic_route(text, ledger)
-            control_key = jev_client.choice_answer(resp, "control")
-            meta["via"] = "jev"
-            log.info("jev route=%s control=%s utterance=%r", route, control_key, text[:80])
+            route = jev_client.choice_answer(resp, "route")
+            if route in _ROUTES:
+                control_key = jev_client.choice_answer(resp, "control")
+                tool_choice = jev_client.choice_answer(resp, intent.TOOL_KEY)
+                tools = intent.tools_from_answer(tool_choice)
+                explicit_save = intent.explicit_save_from_answer(tool_choice)
+                # RC2-8: an answer that is not one of the offered options is never guessed AND never silent: it is counted and traced
+                if tools is None:
+                    _invalid("tool", tool_choice, meta)
+                meta["via"] = "jev"
+                log.info("jev route=%s control=%s utterance=%r", route, control_key, text[:80])
+            else:
+                route, reason = None, "non_option_answer"
+        except model_client.ModelUnavailable as e:
+            reason = e.reason
+            log.warning("jev unavailable (%s): %s", e.reason, e)
         except Exception as e:  # noqa: BLE001
-            log.warning("jev unavailable, heuristic: %r", e)
-            route = heuristic_route(text, ledger)
-    else:
-        route = heuristic_route(text, ledger)
+            reason = "error"
+            log.warning("jev call failed: %r", e)
+    if route is None:
+        return _degrade(text, req, ledger, meta, reason)
 
     if route == "STOP_SPEAKING":
         return AdmitResult(
@@ -114,7 +161,7 @@ async def _admit(req: AdmitRequest, ledger: Ledger, meta: dict) -> AdmitResult:
         return AdmitResult(
             speak=SpeakPlan(
                 kind="clarify",
-                text=_clarify_text(text),
+                text=await _clarify_text(text, req.language),
                 task_id=rec.task_id,
                 version=rec.version,
             ),
@@ -129,26 +176,50 @@ async def _admit(req: AdmitRequest, ledger: Ledger, meta: dict) -> AdmitResult:
             ledger=ledger,
         )
 
-    if route == "CONTROL":
+    if route in ("CONTROL", "WORKER"):
+        # The model's ``control`` answer names which live task (if any) this utterance edits / cancels / asks about. A rewritten full
+        # sentence ("明天北京会下雨吗" after "…上海…") is the model's call too, so a REFINE option is honoured whichever of the two
+        # routes it came with; the code only enforces (task exists, version current, state machine) in _apply_control.
         decision = _parse_control_key(control_key)
-        # JEV said CONTROL but named no usable target (or NEW): the Ledger decides what exists.
-        if decision is None and control_key != "NEW":
-            decision = heuristic_control(text, ledger)
         if decision is not None:
-            return _apply_control(decision, text, req, ledger)
+            return _apply_control(decision, text, req, ledger, tools, explicit_save)
+    if route == "CONTROL":
+        if control_key != "NEW":
+            # JEV said CONTROL but named no usable target: only the router could tell what to do, so ask (model-free, fixed sentence).
+            log.warning("route=CONTROL without a usable control option (%r): fixed clarify", control_key)
+            return AdmitResult(speak=SpeakPlan(kind="clarify", text=DEGRADED_CLARIFY), route="CLARIFY", ledger=ledger)
 
     # WORKER or CONTROL→NEW or CONTROL with nothing to control
-    job = _new_job(ledger, text, language=req.language)
+    job = _new_job(ledger, text, language=req.language, tools=tools, explicit_save=explicit_save)
     return AdmitResult(
         speak=SpeakPlan(
             kind="pad",
-            text=intent.pad_for(text),
+            text=intent.pad_for_tools(tools),
             task_id=job.task_id,
             version=job.version,
         ),
         job=job,
         route="WORKER",
         ledger=ledger,
+    )
+
+
+def _degrade(text: str, req: AdmitRequest, ledger: Ledger, meta: dict, reason: str) -> AdmitResult:
+    """Router unavailable: model-free safe behaviour, no keyword semantics.
+
+    No live task -> the utterance is a new task for the orchestrator (a model reads it). A live task -> one fixed
+    clarify sentence, because only the router could tell a refinement/cancel from a new request.
+    """
+    meta["via"] = "degraded"
+    meta["degraded_reason"] = reason
+    if ledger.active():
+        log.warning("coord degraded (%s): live task -> fixed clarify", reason)
+        return AdmitResult(speak=SpeakPlan(kind="clarify", text=DEGRADED_CLARIFY), route="CLARIFY", ledger=ledger)
+    log.warning("coord degraded (%s): no live task -> new task for orch", reason)
+    job = _new_job(ledger, text, language=req.language, tools=None)      # router down: nothing is forced and the judgment is recorded as unknown
+    return AdmitResult(
+        speak=SpeakPlan(kind="pad", text="", task_id=job.task_id, version=job.version),
+        job=job, route="WORKER", ledger=ledger,
     )
 
 
@@ -161,13 +232,13 @@ def _answer(text: str, ledger: Ledger, decision: ControlDecision, *, version: in
     )
 
 
-def _apply_control(decision: ControlDecision, text: str, req: AdmitRequest, ledger: Ledger) -> AdmitResult:
+def _apply_control(decision: ControlDecision, text: str, req: AdmitRequest, ledger: Ledger, tools: list[str] | None = None, explicit_save: bool | None = None) -> AdmitResult:
     rec = ledger.tasks.get(decision.task_id)
     if rec is None:
         # unknown id (e.g. a hallucinated option): nothing to control, treat as a new request
-        job = _new_job(ledger, text, language=req.language)
+        job = _new_job(ledger, text, language=req.language, tools=tools, explicit_save=explicit_save)
         return AdmitResult(
-            speak=SpeakPlan(kind="pad", text=intent.pad_for(text), task_id=job.task_id, version=job.version),
+            speak=SpeakPlan(kind="pad", text=intent.pad_for_tools(tools), task_id=job.task_id, version=job.version),
             job=job,
             route="WORKER",
             ledger=ledger,
@@ -190,7 +261,7 @@ def _apply_control(decision: ControlDecision, text: str, req: AdmitRequest, ledg
         if rec.status in (TaskStatus.QUEUED, TaskStatus.RUNNING):
             return _answer("还在查，请稍等一下。", ledger, decision, version=rec.version)
         if rec.status == TaskStatus.NEEDS_INPUT:
-            return _answer(_clarify_text(rec.objective), ledger, decision, version=rec.version)
+            return _answer(_clarify_text_for_task(rec.objective), ledger, decision, version=rec.version)
         if rec.status == TaskStatus.FAILED and rec.spoken_answer:
             return _answer(rec.spoken_answer, ledger, decision, version=rec.version)
         return _answer("这个任务已经取消了，没有结果。", ledger, decision, version=rec.version)
@@ -201,7 +272,7 @@ def _apply_control(decision: ControlDecision, text: str, req: AdmitRequest, ledg
     objective = _refined_objective(rec.objective, text, slot_fill=rec.status == TaskStatus.NEEDS_INPUT)
     new = ledger.refine(decision.task_id, objective, version=decision.version)
     if new is None:
-        job = _new_job(ledger, text, language=req.language)
+        job = _new_job(ledger, text, language=req.language, tools=tools, explicit_save=explicit_save)
         return AdmitResult(
             speak=SpeakPlan(kind="answer", text="原任务已经失效，我按新请求来办。", task_id=job.task_id, version=job.version),
             job=job,
@@ -209,6 +280,10 @@ def _apply_control(decision: ControlDecision, text: str, req: AdmitRequest, ledg
             ledger=ledger,
             control=decision,
         )
+    if tools:
+        new.require_tools, new.tool_judgment = list(tools), "model"
+        if explicit_save is not None:
+            new.explicit_save = explicit_save
     ledger.mark_running(new.task_id)
     return AdmitResult(
         speak=SpeakPlan(kind="pad", text="好的，按你改的来。", task_id=new.task_id, version=new.version),
@@ -218,8 +293,10 @@ def _apply_control(decision: ControlDecision, text: str, req: AdmitRequest, ledg
             objective=new.objective,
             language=req.language,
             freshness_token=freshness_token_for(new.task_id, new.version),
-            # a REFINE re-runs the job with the new slots: what the new words ask for, else what the old task needed
-            require_tools=intent.required_tools(text) or intent.required_tools(rec.objective),
+            # a REFINE re-runs the job with the new slots: what the router said for the new words, else what it said for the old task
+            require_tools=tools or list(rec.require_tools),
+            tool_judgment="model" if tools is not None else rec.tool_judgment,
+            explicit_save=new.explicit_save,
         ),
         route="CONTROL",
         ledger=ledger,
@@ -235,9 +312,10 @@ def _refined_objective(old: str, utterance: str, *, slot_fill: bool) -> str:
     return f"{old}。用户改口，以新说法为准：{utterance}"
 
 
-def _new_job(ledger: Ledger, objective: str, *, language: str = "zh") -> WorkerJob:
+def _new_job(ledger: Ledger, objective: str, *, language: str = "zh", tools: list[str] | None = None, explicit_save: bool | None = None) -> WorkerJob:
     ledger.supersede_pending_input()  # a fresh request replaces any open clarification
-    rec = ledger.create(objective)
+    judgment = "unknown" if tools is None else "model"
+    rec = ledger.create(objective, require_tools=tools or [], tool_judgment=judgment, explicit_save=explicit_save)
     ledger.mark_running(rec.task_id)
     return WorkerJob(
         task_id=rec.task_id,
@@ -245,7 +323,9 @@ def _new_job(ledger: Ledger, objective: str, *, language: str = "zh") -> WorkerJ
         objective=objective,
         language=language,
         freshness_token=freshness_token_for(rec.task_id, rec.version),
-        require_tools=intent.required_tools(objective),
+        require_tools=list(tools or []),
+        tool_judgment=judgment,
+        explicit_save=explicit_save,
     )
 
 

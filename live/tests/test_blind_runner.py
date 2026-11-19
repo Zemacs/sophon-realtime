@@ -47,15 +47,15 @@ def _rows(path: str) -> list[dict]:
     return [json.loads(l) for l in open(path, encoding="utf-8") if l.strip()]
 
 
-def _jev_answering(route: str | None, control: str | None = None, *, raw: dict | None = None):
+def _jev_answering(route: str | None, control: str | None = None, *, raw: dict | None = None, tool: str | None = None, **others):
+    """A scripted JEV: it answers by question KEY (route / control / tool / any other key given as a keyword), never by reading the state."""
     async def system_one(state, questions, **kw):   # noqa: ANN001
         if raw is not None:
             return raw
         ans: dict = {}
-        if route is not None:
-            ans["route"] = {"type": "choice", "choice": route}
-        if control is not None:
-            ans["control"] = {"type": "choice", "choice": control}
+        for key, val in (("route", route), ("control", control), ("tool", tool), *others.items()):
+            if val is not None and key in questions:
+                ans[key] = {"type": "choice", "choice": val}
         return {"answers": ans}
     return system_one
 
@@ -104,20 +104,28 @@ class Behaviour(_Base):
             self.assertEqual(br.main([_write(d, lines), out]), 0)
             rows = _rows(out)
         self.assertEqual([r["id"] for r in rows], ["s0001", "s0002", "s0003", "s0004"])          # numbers the sentences, not the file lines
-        keys = ("id", "mode", "fidelity", "route", "route_via", "decision", "jev_route", "jev_control", "via", "control_via", "degraded",
-                "degraded_reason", "degraded_exc", "handled_by", "required_tools", "clarify_slots", "memory_gate_explicit", "tools", "tool_ok",
-                "worker_status", "outcome_kind", "outcome_rejected", "reply", "error", "error_stage")
+        keys = ("id", "mode", "fidelity", "route", "decision", "jev_route", "jev_control", "jev_tool", "via", "control_via", "degraded",
+                "degraded_reason", "degraded_exc", "judge_invalid", "handled_by", "required_tools", "tool_judgment", "explicit_save",
+                "tools", "tool_ok", "worker_status", "outcome_kind", "outcome_rejected", "reply", "error", "error_stage")
         for r in rows:
             self.assertEqual(sorted(r), sorted(keys))
-            self.assertEqual((r["mode"], r["route"], r["route_via"], r["via"], r["degraded"], r["jev_route"], r["error"]),
-                             ("fake", "WORKER", "jev", "jev", False, "WORKER", None))
+            self.assertEqual((r["mode"], r["route"], r["via"], r["degraded"], r["jev_route"], r["error"]), ("fake", "WORKER", "jev", False, "WORKER", None))
             self.assertEqual((r["reply"], r["outcome_kind"], r["outcome_rejected"]), (br.FAKE_REPLY, "answer", None))
-            self.assertIsNone(r["memory_gate_explicit"])                 # only a real Worker's memory tool reaches has_explicit_save_intent
             # B-R6: nothing was really called in fake mode, so the columns that say "what was called" are null, not a copy of required_tools
             self.assertIsNone(r["tools"]); self.assertIsNone(r["tool_ok"])
-            self.assertIsInstance(r["required_tools"], list)
+            # the fake JEV answers the route question only: the tool question has no usable answer, production counts it and records the judgment as unknown
+            self.assertEqual((r["required_tools"], r["tool_judgment"], r["jev_tool"], r["judge_invalid"]), ([], "unknown", None, ["tool:missing"]))
             self.assertIn("fake_worker", r["fidelity"]); self.assertIn("fake_jev", r["fidelity"])
-        self.assertEqual(rows[0]["required_tools"], ["get_weather"])         # B-R5: the regex-derived requirement has its own column
+
+    def test_the_model_s_tool_answer_is_recorded_not_derived(self) -> None:
+        row = self.run_one("今天天气", jev=_jev_answering("WORKER", tool="get_weather"))
+        self.assertEqual((row["jev_tool"], row["required_tools"], row["tool_judgment"], row["judge_invalid"], row["explicit_save"]), ("get_weather", ["get_weather"], "model", [], False))
+        row = self.run_one("今天天气", jev=_jev_answering("WORKER", tool="NONE"))
+        self.assertEqual((row["required_tools"], row["tool_judgment"]), ([], "model"))
+        row = self.run_one("今天天气", jev=_jev_answering("WORKER", tool="not an option"))               # never guessed: unknown + counted
+        self.assertEqual((row["jev_tool"], row["required_tools"], row["tool_judgment"], row["judge_invalid"]), ("not an option", [], "unknown", ["tool:invalid"]))
+        row = self.run_one("记一下", jev=_jev_answering("WORKER", tool="memory_save"))
+        self.assertEqual((row["required_tools"], row["explicit_save"]), (["memory_note"], True))
 
     def test_jsonl_keeps_opaque_ids_and_a_constant_fake_route_is_recorded_not_judged(self) -> None:
         with tempfile.TemporaryDirectory() as d:
@@ -137,47 +145,41 @@ class Behaviour(_Base):
             self.assertNotIn(m, blob)
 
     # ---- B-R1 / B-R7: who decided, and why it is degraded -------------------------------------------------------------------------
-    def test_a_jev_failure_is_recorded_as_degraded_heuristic_with_its_kind_chosen_by_class_and_cause_only(self) -> None:
-        import aiohttp
-        try:
-            try:
-                raise ValueError("not json")
-            except ValueError as v:
-                raise RuntimeError("jev bad json: ...") from v
-        except RuntimeError as bad_json:
-            chained = bad_json
-        status = aiohttp.ClientResponseError(None, (), status=502, message="x")
-        cases = ((RuntimeError("jev HTTP 500: body"), "runtime_error"), (chained, "bad_json"), (status, "http_status"), (asyncio.TimeoutError(), "timeout"),
-                 (TimeoutError(), "timeout"), (ConnectionRefusedError(), "conn"), (aiohttp.ClientConnectionError(), "conn"), (KeyError("k"), "jev_error"))
-        for exc, kind in cases:
+    def test_a_jev_failure_is_recorded_as_degraded_with_production_s_own_reason(self) -> None:
+        """The reason is production's (``AdmitResult.degraded_reason``: ModelUnavailable carries it, any other exception is ``error``); the runner
+        derives nothing from the exception, it records the CLASS NAME only."""
+        from sophon_live.model_client import ModelUnavailable
+        cases = ((ModelUnavailable("jev", "timeout"), "timeout"), (ModelUnavailable("jev", "connection"), "connection"),
+                 (ModelUnavailable("jev", "breaker_open"), "breaker_open"), (ModelUnavailable("jev", "error"), "error"),
+                 (RuntimeError("jev HTTP 500: body"), "error"), (TimeoutError(), "error"), (KeyError("k"), "error"))
+        for exc, reason in cases:
             row = self.run_one("现在几点了", jev=_jev_raising(exc))
-            self.assertEqual((row["via"], row["route_via"], row["degraded"], row["degraded_reason"], row["degraded_exc"], row["jev_route"], row["error"]),
-                             ("heuristic", "heuristic", True, kind, type(exc).__name__, None, None), exc)
+            self.assertEqual((row["via"], row["degraded"], row["degraded_reason"], row["degraded_exc"], row["jev_route"], row["error"]),
+                             ("degraded", True, reason, type(exc).__name__, None, None), exc)
 
-    def test_the_degraded_kind_does_not_depend_on_the_message(self) -> None:
+    def test_the_degraded_reason_does_not_depend_on_the_message(self) -> None:
         a = self.run_one("现在几点了", jev=_jev_raising(RuntimeError("timeout")))
         b = self.run_one("现在几点了", jev=_jev_raising(RuntimeError("jev bad json: x")))
-        self.assertEqual((a["degraded_reason"], b["degraded_reason"]), ("runtime_error", "runtime_error"))
+        self.assertEqual((a["degraded_reason"], b["degraded_reason"]), ("error", "error"))
 
     def test_the_jev_error_message_is_never_read_or_recorded(self) -> None:
         row = self.run_one("现在几点了", jev=_jev_raising(RuntimeError("echo ZQXV7731")))
         self.assertNotIn("ZQXV7731", json.dumps(row, ensure_ascii=False))
 
-    def test_a_jev_answer_without_a_usable_route_is_not_recorded_as_a_jev_decision(self) -> None:      # api.py:93 ``or heuristic_route``
+    def test_a_jev_answer_without_a_usable_route_is_not_recorded_as_a_jev_decision(self) -> None:
         row = self.run_one("现在几点了", jev=_jev_answering(None))
-        self.assertEqual((row["via"], row["route_via"], row["jev_route"], row["degraded"], row["degraded_reason"]), ("jev", "heuristic", None, True, "no_usable_route"))
+        self.assertEqual((row["via"], row["jev_route"], row["degraded"], row["degraded_reason"]), ("degraded", None, True, "non_option_answer"))
         row = self.run_one("现在几点了", jev=_jev_answering(None, raw={"answers": {}}))
-        self.assertEqual((row["route_via"], row["degraded"]), ("heuristic", True))
+        self.assertEqual((row["via"], row["degraded"]), ("degraded", True))
 
     def test_a_jev_answer_that_is_not_a_route_enum_is_invalid_not_a_jev_decision(self) -> None:
         row = self.run_one("好的谢谢", jev=_jev_answering("BOGUS"))
-        self.assertEqual((row["via"], row["route_via"], row["jev_route"], row["route"], row["degraded"], row["degraded_reason"]),
-                         ("jev", "jev_invalid", "BOGUS", "WORKER", True, "invalid_route"))
+        self.assertEqual((row["via"], row["jev_route"], row["route"], row["degraded"], row["degraded_reason"]), ("degraded", "BOGUS", "WORKER", True, "non_option_answer"))
 
     def test_a_valid_jev_route_is_a_jev_decision_and_not_degraded(self) -> None:
         for r in ("WORKER", "FAST", "CLARIFY", "STOP_SPEAKING"):
             row = self.run_one("今天天气", jev=_jev_answering(r))
-            self.assertEqual((row["route_via"], row["degraded"], row["degraded_reason"], row["control_via"]), ("jev", False, None, None), r)
+            self.assertEqual((row["via"], row["degraded"], row["degraded_reason"], row["control_via"], row["jev_route"]), ("jev", False, None, None, r), r)
 
     def _ledger_with_a_finished_task(self):
         from sophon_live import coordinator as C
@@ -186,45 +188,63 @@ class Behaviour(_Base):
         self.assertEqual(first["worker_status"], "completed")
         return ledger
 
-    def test_control_without_a_target_is_decided_by_the_heuristic_and_says_so(self) -> None:           # api.py:136
+    def test_control_without_a_target_with_a_live_task_is_still_not_guessed(self) -> None:
         ledger = self._ledger_with_a_finished_task()
         row = self.run_one("取消吧", jev=_jev_answering("CONTROL"), ledger=ledger)
-        self.assertEqual((row["route_via"], row["control_via"], row["degraded"], row["degraded_reason"], row["via"]), ("jev", "heuristic", True, "control_no_target", "jev"))
-        self.assertEqual(row["decision"], "CANCEL")
+        self.assertEqual((row["route"], row["control_via"], row["via"], row["degraded"], row["handled_by"]), ("CLARIFY", None, "jev", False, "clarify"))
+        self.assertNotEqual(row["decision"], "CANCEL")
 
-    def test_control_where_the_heuristic_finds_nothing_is_still_marked_heuristic(self) -> None:
-        row = self.run_one("嗯", jev=_jev_answering("CONTROL"))                    # empty ledger: heuristic_control ran, found nothing, a new job follows
-        self.assertEqual((row["decision"], row["control_via"], row["degraded"], row["degraded_reason"]), ("NEW", "heuristic", True, "control_no_target"))
+    def test_control_without_a_usable_target_is_a_fixed_clarify_decided_by_the_model_s_route(self) -> None:
+        row = self.run_one("嗯", jev=_jev_answering("CONTROL"))                    # no target, no ledger task: production asks (fixed sentence), it does not guess
+        self.assertEqual((row["route"], row["decision"], row["control_via"], row["via"], row["degraded"], row["handled_by"]), ("CLARIFY", "CLARIFY", None, "jev", False, "clarify"))
+
+    def test_control_via_is_the_applied_decisions_own_label_not_a_constant(self) -> None:
+        """The runner records production's label for the applied ControlDecision verbatim. Production now only builds ``via="jev"`` controls, so a stand-in
+        with another label proves the runner passes it through rather than writing "jev" itself (mutant R1d)."""
+        from types import SimpleNamespace as NS
+        self.assertEqual(br._control_via(NS(control=NS(via="a-label-production-may-add"))), "a-label-production-may-add")
+        self.assertEqual(br._control_via(NS(control=NS(via="jev"))), "jev")
+        self.assertIsNone(br._control_via(NS(control=None)))
 
     def test_control_with_a_jev_named_target_or_new_is_a_jev_decision(self) -> None:
         ledger = self._ledger_with_a_finished_task()
         latest = ledger.latest()
         row = self.run_one("进度", jev=_jev_answering("CONTROL", f"STATUS:{latest.task_id}:{latest.version}"), ledger=ledger)
         self.assertEqual((row["decision"], row["control_via"], row["degraded"], row["jev_control"]), ("STATUS", "jev", False, f"STATUS:{latest.task_id}:{latest.version}"))
+        # NEW, or a task the Ledger does not have: a new job. No ControlDecision is applied, so control_via is null (production labels only an applied
+        # decision; before rc3 the runner derived "jev" here from the heuristic fall-through, which no longer exists)
         row = self.run_one("另一件事", jev=_jev_answering("CONTROL", "NEW"), ledger=ledger)
-        self.assertEqual((row["decision"], row["control_via"], row["degraded"]), ("NEW", "jev", False))
-        row = self.run_one("另一件事", jev=_jev_answering("CONTROL", "CANCEL:nope:1"), ledger=ledger)          # a task the Ledger does not have
-        self.assertEqual((row["decision"], row["control_via"], row["degraded"]), ("NEW", "jev", False))
+        self.assertEqual((row["decision"], row["control_via"], row["degraded"], row["via"], row["jev_control"]), ("NEW", None, False, "jev", "NEW"))
+        row = self.run_one("另一件事", jev=_jev_answering("CONTROL", "CANCEL:nope:1"), ledger=ledger)
+        self.assertEqual((row["decision"], row["control_via"], row["degraded"], row["via"]), ("NEW", None, False, "jev"))
 
-    def test_the_refine_guard_is_recorded_as_a_guard_decision_and_the_jev_is_not_asked(self) -> None:
+    def test_there_is_no_guard_any_more_the_model_is_always_asked_and_a_refine_is_its_call(self) -> None:
+        """rc3 removed ``slot_edit`` (a keyword guard that answered before the JEV): the JEV is asked even when a task is live, and a REFINE option it
+        names is applied by the Coordinator (code only checks the task exists and the version is current)."""
         ledger = self._ledger_with_a_finished_task()
-        row = self.run_one("明天北京天气怎么样", jev=_jev_raising(AssertionError("must not be asked")), ledger=ledger)
-        self.assertEqual((row["via"], row["route_via"], row["control_via"], row["jev_route"], row["degraded"], row["error"]), ("guard", "guard", "guard", None, False, None))
+        latest = ledger.latest()
+        asked: list = []
+        async def jev(state, questions, **kw):   # noqa: ANN001
+            asked.append(sorted(questions))
+            return {"answers": {"route": {"type": "choice", "choice": "WORKER"}, "control": {"type": "choice", "choice": f"REFINE:{latest.task_id}:{latest.version}"}}}
+        row = self.run_one("明天北京天气怎么样", jev=jev, ledger=ledger)
+        self.assertTrue(asked)
+        self.assertEqual((row["via"], row["jev_route"], row["decision"], row["control_via"], row["degraded"], row["error"]), ("jev", "WORKER", "REFINE", "jev", False, None))
 
-    def test_jev_switched_off_is_not_degraded_but_route_via_says_heuristic(self) -> None:
+    def test_jev_switched_off_is_not_degraded_and_says_so(self) -> None:
         row = self.run_one("现在几点了", jev=_jev_answering("FAST"), use_jev=False)
-        self.assertEqual((row["via"], row["route_via"], row["degraded"], row["degraded_reason"]), ("heuristic", "heuristic", False, None))
+        self.assertEqual((row["via"], row["degraded"], row["degraded_reason"]), ("degraded", False, None))      # production: via degraded / reason jev_disabled; not an outage
 
     def test_an_error_keeps_what_was_already_recorded(self) -> None:
         async def bad_worker(job, **kw):   # noqa: ANN001
             raise ValueError("secret ZQXV7731 text")
-        row = self.run_one("现在几点了", jev=_jev_answering("WORKER"), worker=bad_worker)
-        self.assertEqual((row["error"], row["error_stage"], row["route"], row["route_via"], row["jev_route"], row["via"], row["handled_by"], row["degraded"]),
-                         ("ValueError", "worker", "WORKER", "jev", "WORKER", "jev", "worker", False))
-        self.assertIsInstance(row["required_tools"], list)
+        row = self.run_one("现在几点了", jev=_jev_answering("WORKER", tool="get_datetime"), worker=bad_worker)
+        self.assertEqual((row["error"], row["error_stage"], row["route"], row["jev_route"], row["via"], row["handled_by"], row["degraded"], row["required_tools"]),
+                         ("ValueError", "worker", "WORKER", "WORKER", "jev", "worker", False, ["get_datetime"]))
         self.assertNotIn("ZQXV7731", json.dumps(row, ensure_ascii=False))
-        row = self.run_one("现在几点了", jev=_jev_raising(TimeoutError()), worker=bad_worker)             # the degraded reason survives the later crash
-        self.assertEqual((row["error"], row["via"], row["degraded"], row["degraded_reason"]), ("ValueError", "heuristic", True, "timeout"))
+        from sophon_live.model_client import ModelUnavailable
+        row = self.run_one("现在几点了", jev=_jev_raising(ModelUnavailable("jev", "timeout")), worker=bad_worker)             # the degraded reason survives the later crash
+        self.assertEqual((row["error"], row["via"], row["degraded"], row["degraded_reason"]), ("ValueError", "degraded", True, "timeout"))
 
     def test_a_crash_in_the_run_is_recorded_as_a_class_name_only(self) -> None:
         async def bad_worker(job, **kw):   # noqa: ANN001
@@ -234,7 +254,7 @@ class Behaviour(_Base):
             with mock.patch.object(br, "_fake_worker", bad_worker):
                 br.main([_write(d, [SENTENCES[0]]), out])
             (r,) = _rows(out)
-            self.assertEqual((r["id"], r["error"], r["error_stage"], r["route"], r["route_via"], r["jev_route"], r["via"]), ("s0001", "ValueError", "worker", "WORKER", "jev", "WORKER", "jev"))
+            self.assertEqual((r["id"], r["error"], r["error_stage"], r["route"], r["jev_route"], r["via"]), ("s0001", "ValueError", "worker", "WORKER", "WORKER", "jev"))
             self.assertNotIn("ZQXV7731", json.dumps(r, ensure_ascii=False))
             self.assertEqual(json.load(open(out + ".done")), {"n": 1, "errors": 1, "mode": "fake", "complete": True})
 
@@ -254,15 +274,14 @@ class Behaviour(_Base):
         self.assertIn("instructions_from_file", row["fidelity"]); self.assertIn("history_static", row["fidelity"])
 
     def test_the_raw_text_stays_the_sentence_when_a_rewrite_is_supplied(self) -> None:
-        got: list = []
-        from sophon_live.coordinator import api
-        orig = api.slot_edit
-        def spy(text, raw, ledger):   # noqa: ANN001
-            got.append((text, raw))
-            return orig(text, raw, ledger)
-        with mock.patch.object(api, "slot_edit", spy):
-            self.run_one("原话ZQXV", jev=_jev_answering("WORKER"), task="改写后的任务")
-        self.assertEqual(got, [("改写后的任务", "原话ZQXV")])
+        """Was: ``slot_edit`` received (rewritten task, raw words). ``slot_edit`` is gone; the same fact is now what the JEV is shown."""
+        seen: list = []
+        async def jev(state, questions, **kw):   # noqa: ANN001
+            seen.append((state.get("user_said"), state.get("utterance")))
+            return {"answers": {"route": {"type": "choice", "choice": "WORKER"}, "tool": {"type": "choice", "choice": "NONE"}}}
+        row = self.run_one("原话ZQXV", jev=jev, task="改写后的任务")
+        self.assertEqual(seen[0], ("原话ZQXV", "改写后的任务"))      # the JEV is shown the user's own words next to the front's rewrite
+        self.assertEqual(row["judge_invalid"], [])
 
     def test_playback_active_and_language_are_parameters_and_always_listed_as_fixed(self) -> None:
         got: list = []
@@ -334,8 +353,8 @@ class Behaviour(_Base):
     def test_a_rejected_answer_records_why_finish_job_refused_it(self) -> None:
         from sophon_live.coordinator.schemas import WorkerResult
         async def w(job, **kw):   # noqa: ANN001
-            return WorkerResult(task_id=job.task_id, version=job.version, status="completed", spoken_answer="北京今天二十度", evidence=[], freshness_token=job.freshness_token)
-        row = self.run_one("今天北京天气怎么样", jev=_jev_answering("WORKER"), worker=w)
+            return WorkerResult(task_id=job.task_id, version=job.version, status="completed", spoken_answer="北京今天20度", evidence=[], freshness_token=job.freshness_token)
+        row = self.run_one("今天北京天气怎么样", jev=_jev_answering("WORKER", tool="get_weather"), worker=w)           # the model said weather, no tool was called
         self.assertEqual((row["outcome_kind"], row["outcome_rejected"]), ("answer", "no_tool_result"))
 
     def test_a_needs_input_text_never_reaches_a_later_workers_history_but_an_answer_does(self) -> None:
@@ -386,39 +405,31 @@ class Behaviour(_Base):
         self.assertEqual(peek(sink[-1]["answer"]), br.FAKE_REPLY)
 
     # ---- I-2: the keyword functions' conclusions are recorded, nothing else, and everything is restored -----------------------------
-    def test_the_keyword_functions_return_values_are_recorded_and_the_functions_restored(self) -> None:
-        from sophon_live.coordinator import api, clarify, memory_gate
-        orig_slots, orig_mem = api.missing_slots_for_text, memory_gate.has_explicit_save_intent
-        sent = "今天天气怎么样"
-        row = self.run_one(sent, jev=_jev_answering("CLARIFY"))
-        self.assertEqual(row["clarify_slots"], [clarify.missing_slots_for_text(sent)])
-        self.assertEqual(row["handled_by"], "clarify")
-        self.assertIsNone(self.run_one("好的", jev=_jev_answering("FAST"))["clarify_slots"])                   # not called: null, not []
-        async def mem_worker(job, **kw):   # noqa: ANN001
-            memory_gate.has_explicit_save_intent(job.objective); memory_gate.has_explicit_save_intent("")
-            return await br._fake_worker(job)
-        for sent in ("记住我喜欢咖啡", "随便聊聊"):
-            row = self.run_one(sent, jev=_jev_answering("WORKER"), worker=mem_worker)
-            self.assertEqual(row["memory_gate_explicit"], [orig_mem(sent), False])             # the production function's own answers, as returned
-        self.assertIs(api.missing_slots_for_text, orig_slots); self.assertIs(memory_gate.has_explicit_save_intent, orig_mem)
+    def test_the_jev_is_restored_after_every_run(self) -> None:
+        from sophon_live.coordinator import api, jev_client
+        before = jev_client.system_one
+        row = self.run_one("今天比特币多少钱", jev=_jev_answering("WORKER", tool="NONE"))
+        self.assertEqual((row["jev_tool"], row["required_tools"], row["tool_judgment"]), ("NONE", [], "model"))
+        self.assertIs(jev_client.system_one, before)
 
-    def test_the_wrappers_are_restored_even_when_the_run_crashes(self) -> None:
-        from sophon_live.coordinator import api, jev_client, memory_gate
-        before = (api.missing_slots_for_text, memory_gate.has_explicit_save_intent, jev_client.system_one)
+    def test_the_jev_is_restored_even_when_the_run_crashes(self) -> None:
+        from sophon_live.coordinator import jev_client
+        before = jev_client.system_one
         async def bad(job, **kw):   # noqa: ANN001
             raise ValueError("x")
         row = self.run_one("今天", jev=_jev_answering("WORKER"), worker=bad)
         self.assertEqual(row["error"], "ValueError")
-        self.assertEqual((api.missing_slots_for_text, memory_gate.has_explicit_save_intent, jev_client.system_one), before)
+        self.assertIs(jev_client.system_one, before)
 
-    def test_the_wrapped_functions_pass_everything_through_unchanged(self) -> None:
-        from sophon_live.coordinator import api, memory_gate
-        calls: list = []
-        async def w(job, **kw):   # noqa: ANN001
-            calls.append((api.missing_slots_for_text("天气"), memory_gate.has_explicit_save_intent("记住"), memory_gate.has_explicit_save_intent(None)))
-            return await br._fake_worker(job)
-        self.run_one("x", jev=_jev_answering("WORKER"), worker=w)
-        self.assertEqual(calls, [(["city"], True, False)])
+    def test_the_spy_passes_the_request_and_the_answer_through_unchanged(self) -> None:
+        seen: list = []
+        async def jev(state, questions, **kw):   # noqa: ANN001
+            seen.append((dict(state), sorted(questions), dict(kw)))
+            return {"answers": {"route": {"type": "choice", "choice": "FAST"}}}
+        row = self.run_one("x", jev=jev, task="任务")
+        self.assertEqual(row["jev_route"], "FAST")
+        (state, keys, kw), = seen
+        self.assertEqual((state["user_said"], "route" in keys, "tool" in keys, kw), ("x", True, True, {}))
 
     # ---- gates, exit codes ----------------------------------------------------------------------------------------------------
     def test_real_mode_is_refused_without_the_env_gate_and_gateway_mode_is_unavailable(self) -> None:
@@ -547,10 +558,9 @@ class Behaviour(_Base):
     def test_every_single_character_and_every_corpus_sentence_is_treated_exactly_like_a_neutral_sentence(self) -> None:
         """The runner must not fork on WHAT the sentence says. Every single character of the character set (so any 'contains X' / 'starts with X' /
         'ends with X' fork on a one-character X fires), and every sentence of the repo's labelled corpus (so forks on a word the corpus has fire), gets a
-        row that equals the row of a neutral sentence in every column except ``reply``, ``required_tools`` and ``clarify_slots`` -- the three that
-        legitimately carry the production keyword functions' answers. ``required_tools`` must equal ``intent.required_tools`` of the same sentence,
-        and a fake Worker's reply is constant. A fork on a multi-character word the corpus does not contain is NOT found; code review remains the backstop."""
-        from sophon_live.coordinator import intent
+        row that equals the row of a neutral sentence in EVERY column except ``id``. (Before rc3 ``required_tools`` and ``clarify_slots`` were exempt:
+        they carried the answers of production's keyword functions. Those functions are gone: with a constant fake JEV no column may depend on the
+        sentence, not even the tool judgment.) A fork on a multi-character word the corpus does not contain is NOT found; code review remains the backstop."""
         from sophon_live.coordinator.route import ROUTE_CRITERIA
         corpus = self._corpus_sentences()
         self.assertGreater(len(corpus), 150)
@@ -562,8 +572,7 @@ class Behaviour(_Base):
             for sent, r in zip(sents, rows):
                 if route == "WORKER":
                     self.assertEqual(r["reply"], br.FAKE_REPLY, sent)
-                    self.assertEqual(r["required_tools"], intent.required_tools(sent), sent)
-                for key in set(r) - {"id", "reply", "required_tools", "clarify_slots"}:
+                for key in set(r) - {"id"}:
                     self.assertEqual(r[key], base[key], f"{route} {key} differs for {sent!r}")
 
     def test_the_metamorphic_test_can_see_a_character_fork(self) -> None:
@@ -829,9 +838,9 @@ class Privacy(_Base):
 
     def test_a_jev_that_crashes_with_the_sentence_in_the_message_leaks_nothing_either(self) -> None:   # admit swallows it into a log line
         async def jev(state, questions, **kw):   # noqa: ANN001
-            raise RuntimeError(f"jev HTTP 500: {state['utterance']}")
+            raise RuntimeError(f"jev HTTP 500: {state}")
         rows = self.sealed_run(jev=jev)
-        self.assertTrue(all(r["via"] == "heuristic" and r["degraded_reason"] == "runtime_error" and r["degraded_exc"] == "RuntimeError" for r in rows))
+        self.assertTrue(all(r["via"] == "degraded" and r["degraded_reason"] == "error" and r["degraded_exc"] == "RuntimeError" for r in rows))
 
     def test_error_and_critical_level_log_calls_with_the_sentence_are_swallowed(self) -> None:
         real_fake = br._fake_worker
@@ -841,17 +850,6 @@ class Privacy(_Base):
             return await real_fake(job)
         rows = self.sealed_run(worker=noisy_worker)
         self.assertEqual([r["error"] for r in rows], [None] * len(SENTENCES))
-
-    def test_the_keyword_function_wrappers_keep_arguments_out_of_every_observer(self) -> None:
-        from sophon_live.coordinator import memory_gate
-        real_fake = br._fake_worker
-        async def w(job, **kw):   # noqa: ANN001
-            memory_gate.has_explicit_save_intent(job.objective)
-            return await real_fake(job)
-        rows = self.sealed_run(worker=w)
-        self.assertEqual([r["error"] for r in rows], [None] * len(SENTENCES))
-        self.assertTrue(all(r["memory_gate_explicit"] in ([True], [False]) for r in rows))
-        self.assertFalse([m for m in MARKERS if m in json.dumps(rows, ensure_ascii=False)])
 
     def test_a_real_device_call_inside_the_run_does_not_reach_a_configured_hook(self) -> None:
         from sophon_live.assistant_tools import device
@@ -1089,20 +1087,20 @@ def exit_violations(fn: ast.AST, spec: dict) -> list[str]:
 
 _SPY_NODES = (ast.Try, ast.ExceptHandler, ast.Await, ast.Call, ast.keyword, ast.Name, ast.Attribute, ast.Tuple, ast.Assign, ast.Raise, ast.Return, ast.Constant,
               ast.If, ast.Compare, ast.Eq, ast.Starred, ast.Load, ast.Store, ast.BoolOp, ast.Or, ast.BinOp, ast.Add, ast.List, ast.Expr)
-_SPY_ATTRS = {("rec", a) for a in ("route", "control", "error_kind", "error_exc", "slots", "save_intent")} | {("jev_client", "choice_answer")}
-_SPY_CALLS = {"jev", "jev_error_kind", "type", "fn", "list", "bool", "choice_answer"}
+_SPY_ATTRS = ({("rec", a) for a in ("route", "control", "tool", "error_exc")} | {("jev_client", "choice_answer")}
+              | {("intent", "TOOL_KEY")})
+_SPY_CALLS = {"jev", "type", "choice_answer"}
 
 
 def watcher_violations(fn: ast.AST, tree: ast.AST) -> list[str]:
-    """The spy and the recorder see production's state (the JEV request, a keyword function's arguments and result). They may only forward their
-    arguments to the function they wrap and keep its answer: no comparison but their own ``sink == "..."``, no indexing, no other call."""
+    """The spy sees production's state (the JEV request and its answers). It may only forward its arguments to the JEV it wraps and keep the
+    option keys of the answers: no comparison, no indexing, no other call, no use of ``state`` / ``questions`` except by being forwarded."""
     v: list[str] = []
     pm = _parents(tree)
     for n in _body_nodes(fn):
         if not isinstance(n, _SPY_NODES):
             v.append(f"{fn.name}: node {type(n).__name__} is not allowed")
-        if isinstance(n, ast.Compare) and not (isinstance(n.left, ast.Name) and n.left.id == "sink" and all(isinstance(o, ast.Eq) for o in n.ops)
-                                               and all(isinstance(c, ast.Constant) for c in n.comparators)):
+        if isinstance(n, ast.Compare):
             v.append(f"{fn.name}: comparison")
         if isinstance(n, ast.Call):
             if isinstance(n.func, ast.Name) and n.func.id not in _SPY_CALLS:
@@ -1112,23 +1110,22 @@ def watcher_violations(fn: ast.AST, tree: ast.AST) -> list[str]:
         if isinstance(n, ast.Attribute) and not ((isinstance(n.value, ast.Name) and (n.value.id, n.attr) in _SPY_ATTRS)
                                                   or (n.attr == "__name__" and isinstance(n.value, ast.Call) and _call_name(n.value) == "type")):
             v.append(f"{fn.name}: attribute {n.attr}")
-        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id in {"state", "questions", "kw", "a", "k", "resp", "r", "e"}:
+        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id in {"state", "questions", "kw", "resp", "e"}:
             p = pm[n]
             while isinstance(p, (ast.Starred, ast.keyword, ast.BoolOp)):
                 p = pm[p]
-            allowed = {"state": {"jev"}, "questions": {"jev"}, "kw": {"jev"}, "a": {"fn"}, "k": {"fn"}, "resp": {"choice_answer"},
-                       "r": {"list", "bool"}, "e": {"jev_error_kind", "type"}}[n.id]
-            if not ((isinstance(p, ast.Call) and _call_name(p) in allowed) or (n.id in ("resp", "r") and isinstance(p, ast.Return))
-                    or (n.id == "r" and isinstance(p, ast.Assign))):
+            allowed = {"state": {"jev"}, "questions": {"jev"}, "kw": {"jev"}, "resp": {"choice_answer"}, "e": {"type"}}[n.id]
+            if not ((isinstance(p, ast.Call) and _call_name(p) in allowed) or (n.id == "resp" and isinstance(p, ast.Return))):
                 v.append(f"{fn.name}: {n.id} is used other than by being forwarded")
     return v
 
 
 _PRODUCTION_TEXT_ATTRS = {"objective", "text", "spoken_answer"}
 _PRODUCTION_OBJECTS = {"res", "job", "out", "wr", "speak"}
-_PRODUCTION_PATHS = {"job.objective", "job.require_tools", "out.kind", "out.rejected", "out.text", "res.control", "res.control.op", "res.job", "res.route",
+_PRODUCTION_PATHS = {"job.objective", "job.require_tools", "job.tool_judgment", "job.explicit_save",
+                     "res.degraded_reason", "res.judge_invalid", "out.kind", "out.rejected", "out.text", "res.control", "res.control.op", "res.job", "res.route",
                      "res.route.lower", "res.speak.text", "res.via", "wr.evidence", "wr.status"}
-_PRODUCTION_CALLEES = {"worker", "_task_context", "_route_via", "_control_via", "finish_job", "admit", "_admit_request"}
+_PRODUCTION_CALLEES = {"worker", "_task_context", "_control_via", "finish_job", "admit", "_admit_request"}
 
 
 def production_text_violations(run_one: ast.AST, tree: ast.AST) -> list[str]:
@@ -1377,8 +1374,8 @@ class StructureWhitelists(unittest.TestCase):
 
     def test_the_spy_and_the_recorder_only_forward_what_they_watch(self) -> None:
         fns = _funcs(self.TREE)
-        for name in ("spy", "wrapper"):
-            self.assertEqual(watcher_violations(fns[name], self.TREE), [], name)
+        self.assertEqual(watcher_violations(fns["spy"], self.TREE), [], "spy")
+        self.assertNotIn("wrapper", fns)             # the recorder of the removed keyword functions is gone: nothing wraps production code but the JEV
 
     def test_run_one_wraps_every_production_text_where_it_reads_it(self) -> None:
         run_one = _funcs(self.TREE)["run_one"]
@@ -1413,9 +1410,10 @@ class StructureWhitelists(unittest.TestCase):
             ("exit", "    return C.TaskContext(", "    _y = reveal(objective).startswith('q')\n    return C.TaskContext(", "_task_context"),
             ("exit", 'return json.dumps({**row, "reply": reveal(row["reply"])}, ensure_ascii=False)',
              'return json.dumps({**row, "reply": reveal(row["reply"]), "n": len(row)}, ensure_ascii=False)', "_dump_row"),
-            ("watch", '        rec.route = jev_client.choice_answer(resp, "route")\n',
-             "        if 'qzxw' in state['utterance']:\n            rec.route = 'x'\n" + '        rec.route = jev_client.choice_answer(resp, "route")\n', "spy"),
-            ("watch", "            r = fn(*a, **k)\n", "            r = fn(*a, **k)\n            _t = str(a)\n", "wrapper"),
+            ("watch", '        rec.route = jev_client.choice_answer(resp, "route") or rec.route\n',
+             "        if 'qzxw' in state['utterance']:\n            rec.route = 'x'\n" + '        rec.route = jev_client.choice_answer(resp, "route") or rec.route\n', "spy"),
+            ("watch", "            rec.error_exc = type(e).__name__\n", "            rec.error_exc = type(e).__name__ + str(e)\n", "spy"),
+            ("watch", "        return resp\n", "        _n = len(state)\n        return resp\n", "spy"),
             ("prod", "        job = res.job\n", "        job = res.job\n        if 'qzxw' in job.objective:\n            row['handled_by'] = 'fast'\n"),
             ("prod", "        reply = Opaque(out.text)", "        reply = Opaque(out.text)\n        if 'qzxw' in out.text:\n            pass\n"),
             ("prod", "        if res.job is None:\n", "        if 'qzxw' in str(res.speak):\n            row['handled_by'] = 'fast'\n        if res.job is None:\n"),

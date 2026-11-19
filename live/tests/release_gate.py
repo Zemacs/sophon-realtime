@@ -5,7 +5,8 @@ Fails (exit 1) unless ALL of these hold (exit 2 = a script problem such as a har
   * the page behaviour tests ran and none was skipped,
   * the whole suite passes with every ``SOPHON_LIVE_*`` variable removed from the environment,
   * the mutation script exits 0 (every mutant killed),
-  * the blind-runner mutation script (tests/mutation_check_blind_runner.py) exits 0 (every runner mutant killed).
+  * the blind-runner mutation script (tests/mutation_check_blind_runner.py) exits 0 (every runner mutant killed),
+  * the coordinator mutation script (tests/mutation_coordinator.py) exits 0 (every router-enforcement mutant killed).
 There is no CI in this repo: run this wherever a release or deploy is decided (deplux release check / deploy script)."""
 import os
 import re
@@ -51,6 +52,10 @@ def main() -> None:
     print((r.stdout.strip().splitlines() or [""])[-1])
     if r.returncode != 0:
         fail("the blind-runner mutation script did not exit 0 (survivor or script error):\n" + r.stdout[-2000:])
+    r = subprocess.run([sys.executable, "tests/mutation_coordinator.py"], cwd=ROOT, capture_output=True, text=True, env=clean_env(), timeout=1800)
+    print((r.stdout.strip().splitlines() or [""])[-1])
+    if r.returncode != 0:
+        fail("the coordinator mutation script did not exit 0 (survivor or script error):\n" + r.stdout[-2000:])
     print("RELEASE GATE OK")
 
 

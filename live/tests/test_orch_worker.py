@@ -70,6 +70,24 @@ class RunJobTests(unittest.IsolatedAsyncioTestCase):
         # the job objective is the only task text the model sees
         self.assertIn("北京明天天气", sess.posts[0]["json"]["messages"][1]["content"])
 
+    async def test_the_real_weather_tool_success_counts_as_evidence_for_a_required_tool(self) -> None:
+        """Live regression (rc3 :8790): weather.run noted ok=None in toolmeta, which overwrote the evidence's ok -> the required tool never
+        counted as satisfied -> the worker kept forcing get_weather until its step budget ran out ("我还在查")."""
+        from sophon_live.assistant_tools import weather
+
+        async def fake_detailed(args):
+            return "上海明天多云，气温5到12度。", {"city": "上海", "tmin": "5", "tmax": "12", "now": "7.3", "source": "sojson"}
+
+        sess = _FakeSession([
+            _FakeResp(200, _tool_call("get_weather", '{"city":"上海","when":"tomorrow"}')),
+            _FakeResp(200, _say("上海明天多云，气温5到12度。")),
+        ])
+        with mock.patch.object(orch.aiohttp, "ClientSession", return_value=sess), mock.patch.object(weather, "run_detailed", fake_detailed):
+            res = await orch.run_job(_job("明天上海会下雨吗", require_tools=["get_weather"]))
+        self.assertEqual(res.status, "completed", res.spoken_answer)
+        self.assertTrue(res.evidence[0]["ok"])
+        self.assertEqual(len(sess.posts), 2)
+
     async def test_missing_required_slot_is_reported_not_asked(self) -> None:
         sess = _FakeSession([_FakeResp(200, _tool_call("get_weather", '{"when":"tomorrow"}'))])
         rt = mock.AsyncMock(return_value="should not run")
@@ -176,7 +194,8 @@ class GatewayWorkerTests(unittest.IsolatedAsyncioTestCase):
 
         session = _session()
         seen: list[str] = []
-        real_route = api.heuristic_route
+        from tests import jev_stub
+        real_route = jev_stub.heuristic_route
 
         async def worker(job, instructions="", history=None):
             seen.append(job.objective)
@@ -187,8 +206,8 @@ class GatewayWorkerTests(unittest.IsolatedAsyncioTestCase):
         _arm(session, "d1", "明天天气怎么样")
         _arm(session, "d2", "北京的")
         # 「明天天气怎么样」 already gets a C-layer CLARIFY from admit; force the Worker path instead
-        with mock.patch.object(api, "USE_JEV", False), mock.patch.object(tools, "run_worker_job", worker), \
-                mock.patch.object(api, "heuristic_route", lambda text, led: "WORKER" if text == "明天天气怎么样" else real_route(text, led)):
+        with mock.patch.object(api, "USE_JEV", True), mock.patch.object(tools, "run_worker_job", worker), \
+                mock.patch.object(jev_stub, "heuristic_route", lambda text, led: "WORKER" if text == "明天天气怎么样" else real_route(text, led)):
             await session._coord_resolve("d1", "明天天气怎么样")
             tid = session.coord_ledger.order[0]
             self.assertEqual(session.coord_ledger.tasks[tid].status, TaskStatus.NEEDS_INPUT)

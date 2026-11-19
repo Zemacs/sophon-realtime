@@ -150,6 +150,19 @@ def split_pieces(text: str) -> list[str]:
     return [p for p in out if p]
 
 
+def _health_detail() -> bytes:
+    """/health?detail=1: breaker state of every downstream model (Tag / orch / JEV) as seen by this gateway process."""
+    from . import model_client
+    from .coordinator import api as _coord_api
+    return json.dumps({"gateway": "ok", "downstream": model_client.snapshot(), "router_invalid_answers": dict(_coord_api.JUDGE_STATS)},
+                      ensure_ascii=False).encode()
+
+
+def _health_body(query: str) -> bytes | None:
+    """The JSON body for ``/health?<query>`` when the query asks for ``detail=1``; None = plain liveness ("ok")."""
+    return _health_detail() if "detail=1" in query.split("&") else None
+
+
 class ASR:
     """Input transcript (GPT-Live sends session.input_transcript.delta; duplex clients build the delegated task from it)."""
 
@@ -746,7 +759,8 @@ class LiveSession:
         if tr is not None:
             tr.mark("route")
             tr.set(route=result.route, decision=result.control.op if result.control else ("NEW" if result.job else result.route),
-                   via=result.via, jev_ms=None if result.jev_ms is None else round(result.jev_ms))
+                   via=result.via, jev_ms=None if result.jev_ms is None else round(result.jev_ms),
+                   **({"judge_invalid": ",".join(result.judge_invalid)} if result.judge_invalid else {}))
         # CANCEL / REFINE: the old (task_id, version) must stop now; its result is never spoken.
         stale = getattr(result, "stale_task", None)
         if stale is not None:
@@ -775,7 +789,7 @@ class LiveSession:
             # FAST (thanks / ok): nothing to run, nothing to say. Close the delegation silently.
             await self._ack_delegation(did, "这句话不需要后台办事，不用再说什么。")
             return
-        with bind_task(TaskContext(task_id=job.task_id, version=job.version, utterance=job.objective, ledger=ledger)):
+        with bind_task(TaskContext(task_id=job.task_id, version=job.version, utterance=job.objective, ledger=ledger, explicit_save=job.explicit_save)):
             # the worker task copies this context: its memory writes go through memory_gate, its tool args become task slots
             worker = asyncio.ensure_future(
                 run_worker_job(job, instructions=self.instructions or "", history=getattr(self, "orch_history", None) or [])
@@ -812,8 +826,8 @@ class LiveSession:
                             orig_source=ev.get("orig_source"), age_s=ev.get("age_s"),
                             city=ev.get("city"), tmin=ev.get("tmin"), tmax=ev.get("tmax"), now=ev.get("now"))
         outcome = finish_job(ledger, job, result)    # the Coordinator decides what gets said; stale results are dropped
-        if tr is not None and job.require_tools:
-            tr.set(require=",".join(job.require_tools), **({"guard": outcome.rejected} if outcome.rejected else {}))
+        if tr is not None and (job.require_tools or outcome.rejected or job.tool_judgment != "model"):
+            tr.set(require=",".join(job.require_tools), judged=job.tool_judgment, **({"guard": outcome.rejected} if outcome.rejected else {}))
         if outcome.kind == "stale":                  # cancelled or superseded while running
             await self._ack_delegation(did, "这个任务已被取消或改口，不用再说什么。")
             return
@@ -1018,7 +1032,10 @@ def main() -> None:
             return Response(200, "OK", Headers([("Content-Type", "text/html; charset=utf-8"), ("Content-Length", str(len(body))),
                                                 ("Cache-Control", "no-cache")]), body)
         if path == "/health":
-            return conn.respond(200, "ok\n")
+            detail = _health_body(req.path.partition("?")[2])
+            if detail is not None:
+                return Response(200, "OK", Headers([("Content-Type", "application/json")]), detail)
+            return conn.respond(200, "ok\n")                      # plain liveness of this gateway, unchanged
         if path not in (args.path, "/v1/realtime"):
             return conn.respond(404, "Not Found\n")
         if path == "/v1/realtime" and realtime_keys:              # keyed access for external evaluators (e.g. Artificial Analysis)

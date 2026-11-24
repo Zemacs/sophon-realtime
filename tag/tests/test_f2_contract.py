@@ -16,10 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fork_harness import Call, Readouts, load_duplex
 
 ROOT = os.environ.get("DZH_CONTRACTS_ROOT")
-SKIP_REASON = (
-    "DZH_CONTRACTS_ROOT is not set: point it at the directory containing contracts/ "
-    "(examples and schemas from the internal contract snapshot)"
-)
+SKIP_REASON = "contract snapshot not available"
 NEEDS_ROOT = unittest.skipUnless(ROOT, SKIP_REASON)
 ADAPTER_FIELDS = (
     "schema_version",

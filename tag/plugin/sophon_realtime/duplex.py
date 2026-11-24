@@ -2,8 +2,10 @@
 
 Flow (per session):
   - The client streams microphone audio continuously (session.update: turn_detection=server_vad, extra_body.auto_response=true).
-  - After the user pauses, at checkpoints (default 0.2/0.35/0.5/0.8/1.3/2.0 s) a "turn question" request is sent to stage 0 (same wording as livekit-plugins-duplexjev:
-    user finished / not finished / backchannel / thinking); P(finished) is read and a reply is triggered if it exceeds that checkpoint's threshold; fallback reply at 2 s.
+  - After the user pauses, at checkpoints (default 0.2/0.35/0.5/0.8/1.3/2.0 s, env SOPHON_TURN_CHECKS) a "turn question" request is sent to stage 0 (same wording as livekit-plugins-duplexjev:
+    user finished / not finished / backchannel / thinking); P(finished) is read and compared with that checkpoint's threshold (env SOPHON_TURN_THRESHOLDS).
+    The readout only reports: one FrontPort F2 turn event per endpoint (take / no_take, see f2_event); it never starts a reply (speaking waits for the hub's guidance).
+    An endpoint no readout took is reported no_take at the fallback silence (env SOPHON_TURN_FALLBACK, default 2 s), or when the user resumes.
   - Once the turn is judged finished, the next audio append sends a "reply" request: system + multi-turn history (user speech; assistant speech as spoken, or text for interrupted turns) + this turn's user speech.
   - If the user starts talking while the assistant speaks, the framework VAD barges in (server_vad's barge_in_on_speech).
 Turn-question requests only emit one letter at stage 0 and never reach the talker (proc.py sees sophon_kind=check and forwards nothing; the talker finishes immediately with no text)."""
@@ -220,6 +222,13 @@ def turn_prob_http(audio: np.ndarray, lang: str, said: str) -> float:
     return float(z[perm.index(0)]), float(z[perm.index(2)])       # P(finished), P(backchannel)
 
 
+def f2_event(endpoint_id: str, turn_action: str, turn_check_ms: float) -> dict:
+    """FrontPort F2 turn event, fork side: only the fields the fork owns. No probability, no reject reason, no timestamp (the adapter adds at_ms and the common header)."""
+    if turn_action not in ("take", "no_take"):
+        raise ValueError(f"turn_action must be take or no_take, got {turn_action!r}")
+    return {"type": "turn_event", "endpoint_id": endpoint_id, "turn_action": turn_action, "turn_check_ms": max(0, int(round(turn_check_ms)))}
+
+
 # ---------------------------------------------------------------- input buffer / session state
 @dataclass
 class _Res(PcmAppendReservation):
@@ -269,6 +278,11 @@ class SophonBuffer(PcmAppendBuffer):
     silence_ms: float = 0.0
     next_check: int = 0
     pending_reply: bool = False
+    ep_n: int = 0                                            # endpoints minted so far in this session (fork-local ids)
+    ep_id: str | None = None                                 # the endpoint now open (a silence run being read out)
+    ep_closed: bool = False                                  # its F2 has been reported
+    ep_ms: int | None = None                                 # duration of the latest completed readout of this endpoint (fork monotonic clock)
+    owner_event: object = None                               # injected by the plugin: publish a fork-side event (buf, event dict)
     check_inflight: bool = False
     decision: tuple | None = None                            # (should reply?, decision time): takes effect after the framework has handled the turn question's listen event
     decision_ready: bool = False
@@ -317,6 +331,27 @@ class SophonBuffer(PcmAppendBuffer):
     def _reset_turn(self):
         self.pc_hit = False; self.seg_rms = []; self.tool_followup = False; self.max_pf = 0.0; self.last_pb = 0.0; self.spec_id = None; self.gen += 1; self.utt.clear(); self.speech_ms = 0.0; self.silence_ms = 0.0; self.next_check = 0; self.voiced_ms = 0.0
         self.pending_reply = False; self.check_inflight = False; self.decision = None; self.decision_ready = False; self.resume_pending = False
+        self._ep_end()
+
+    def _ep_open(self):
+        if self.ep_id is None:
+            self.ep_n += 1; self.ep_id = f"fork-ep-{self.ep_n}"; self.ep_closed = False; self.ep_ms = None
+
+    def _ep_report(self, action, check_ms=None):
+        """Report the open endpoint's F2 once (caller holds self.lock). Report only: nothing here starts a reply."""
+        if self.ep_id is None or self.ep_closed:
+            return
+        self.ep_closed = True
+        ms = self.ep_ms if check_ms is None else check_ms
+        if ms is None:
+            logger.warning("sophon turn event: endpoint %s closed without a completed readout, F2 not reported", self.ep_id); return
+        ev = f2_event(self.ep_id, action, ms)
+        logger.info("sophon turn event %s", json.dumps(ev))
+        if self.owner_event is not None: self.owner_event(self, ev)
+
+    def _ep_end(self):
+        """The endpoint is over (the user resumed, or the turn was reset): one no readout took is reported no_take."""
+        self._ep_report("no_take"); self.ep_id = None; self.ep_closed = False; self.ep_ms = None
 
     def _not_sent(self, payload):
         """An append never reached the engine (rolled back, or its reservation timed out)."""
@@ -417,11 +452,11 @@ class SophonBuffer(PcmAppendBuffer):
                     if PERIODIC_S > 0: self.seg_rms.append(r)
                     if r > thr:
                         if self.silence_ms > 0:
-                            self.gen += 1; self.check_inflight = False; self.pending_reply = False
+                            self.gen += 1; self.check_inflight = False; self.pending_reply = False; self._ep_end()
                             if self.spec_id is not None: self.owner_drop(self.spec_id); self.spec_id = None
                         self.speech_ms += 20; self.silence_ms = 0.0; self.next_check = 0
                     else:
-                        if self.silence_ms == 0: self.t_sil = time.monotonic()
+                        if self.silence_ms == 0: self.t_sil = time.monotonic(); self._ep_end()
                         self.silence_ms += 20
             now = time.monotonic()
             for r in list(self.reservations):                 # on framework errors commit/rollback may never be called: give up after RES_TIMEOUT and roll back
@@ -461,21 +496,21 @@ class SophonBuffer(PcmAppendBuffer):
                     self.check_inflight = True
                     if self.silence_ms == 0: self.t_sil = time.monotonic()
                     self._start_check(PERIODIC_THR, 0)
-            if not self.check_inflight and not self.pending_reply and self.next_check < len(CHECKS) and self.silence_ms >= CHECKS[self.next_check] * 1000:
+            if not self.check_inflight and not self.pending_reply and not self.ep_closed and self.next_check < len(CHECKS) and self.silence_ms >= CHECKS[self.next_check] * 1000:
                 thr = THRS[min(self.next_check, len(THRS) - 1)]; self.next_check += 1; self.check_inflight = True
                 self._start_check(thr, self.next_check)
-            if self.silence_ms >= (self.fb_s if self.fb_s is not None else FALLBACK_S) * 1000 and not self.pending_reply:
+            if self.silence_ms >= (self.fb_s if self.fb_s is not None else FALLBACK_S) * 1000 and not self.pending_reply and not self.ep_closed:
                 if IGNORE_SHORT and self.speech_ms < 1500 and (self.last_pb > 0.5 or self.max_pf < 0.05):
                     # just a backchannel / hesitation sound like "mm" or "uh" that the model kept judging unfinished: don't reply, treat it as unheard (otherwise we'd force an answer to a lone "mm", or even start repeating)
                     logger.info("sophon duplex: ignore short non-turn sound (speech %.0f ms, P(backchannel)=%.2f, max P(finished)=%.2f)",
                                 self.speech_ms, self.last_pb, self.max_pf)
                     if self.spec_id is not None: self.owner_drop(self.spec_id)
+                    self._ep_open(); self._ep_report("no_take", self.ep_ms or 0)
                     self._undo_merge(); self._reset_turn(); return None
                 if (BC_RESUME and self.cut is not None and time.monotonic() - self.cut["t"] < BC_WINDOW + FALLBACK_S
                         and self.speech_ms < 1500 and self.last_pb >= BC_THR and self.last_pb > self.max_pf):
                     self.resume_pending = True
-                else:
-                    self.pending_reply = True; self.fallback = True
+                self._ep_report("no_take")
             if self.resume_pending and allow_emit and not self.reservations and not self.inflight_t:
                 self.resume_pending = False; cut = self.cut; self.cut = None
                 if self.spec_id is not None: self.owner_drop(self.spec_id); self.spec_id = None
@@ -510,29 +545,33 @@ class SophonBuffer(PcmAppendBuffer):
             return None
 
     def _start_check(self, thr, idx):
-        audio = bytes(self.utt); said = self.last_said; lang = self.lang; gen = self.gen; t_emit = time.monotonic()
+        self._ep_open()
+        audio = bytes(self.utt); said = self.last_said; lang = self.lang; gen = self.gen; t_emit = time.monotonic(); ep = self.ep_id
         def run():
             pb = 0.0
+            t_read = time.monotonic()
             try:
                 p, pb = turn_prob_http(np.frombuffer(audio, dtype="<f4"), lang, said)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("sophon turn check failed: %r", exc); p = None
+            ms = int(round((time.monotonic() - t_read) * 1000))
+            act = "wait"
             with self.lock:
                 if self.gen != gen:
                     return                                    # user started talking again: discard this decision
                 self.check_inflight = False
                 if p is not None:
-                    self.max_pf = max(self.max_pf, p); self.last_pb = pb
+                    self.max_pf = max(self.max_pf, p); self.last_pb = pb; self.ep_ms = ms
                 if (BC_RESUME and p is not None and self.cut is not None and time.monotonic() - self.cut["t"] < BC_WINDOW
                         and self.speech_ms < 1500 and pb >= BC_THR and pb > p):
                     self.resume_pending = True                # just an "mm-hmm" / "yeah": continue what was being said
                     logger.info("sophon duplex: back-channel over a cut reply (P(backchannel)=%.2f) -> resume", pb)
+                    act = "no_take"; self._ep_report("no_take", ms)
                 elif p is not None and p >= thr:
-                    self.pending_reply = True
-                    if idx == 0: self.pc_hit = True               # periodic (noise-robust) check: reply without waiting for an energy pause
+                    act = "take"; self._ep_report("take", ms)
+            logger.info("sophon turn trace %s", json.dumps({"endpoint_id": ep, "check": idx, "p_finished": p, "p_backchannel": pb, "thr": thr, "turn_check_ms": ms, "act": act}))
             logger.info("sophon turn check #%d P(finished)=%s P(backchannel)=%.2f thr=%.2f -> %s (%.3fs, %.3fs after silence start)", idx,
-                        "na" if p is None else f"{p:.2f}", pb, thr, "reply" if (p is not None and p >= thr) else "wait",
-                        time.monotonic() - t_emit, time.monotonic() - self.t_sil)
+                        "na" if p is None else f"{p:.2f}", pb, thr, act, time.monotonic() - t_emit, time.monotonic() - self.t_sil)
         threading.Thread(target=run, daemon=True).start()
 
     def _accept_reply(self, audio_bytes):
@@ -714,7 +753,7 @@ class SophonRealtimeDuplexPlugin(DuplexModelPlugin):
 
     def create_session_state(self):
         buf = SophonBuffer(); self._bufs[id(buf)] = buf
-        buf.owner_release = self._release; buf.owner_drop = self._drop; buf.owner_active = self._active_reply
+        buf.owner_release = self._release; buf.owner_drop = self._drop; buf.owner_active = self._active_reply; buf.owner_event = self._send_event
         return _SophonSessionState(audio_buffer=buf)
 
     def validate_client_extra_body(self, extra_body):
@@ -923,6 +962,10 @@ class SophonRealtimeDuplexPlugin(DuplexModelPlugin):
         mm = {"audio": audios}
         if images: mm["image"] = images
         return DuplexAppendPlan(prompt={"prompt": self._render(msgs, tools), "multi_modal_data": mm, "additional_information": addl})
+
+    def _send_event(self, buf, ev):
+        """Publish a fork-side event (F2) to the session's gateway on the bridge event channel; a session without a bridge_key only logs it."""
+        if buf.bridge_key: self.bridge.push(buf.bridge_key, ev)
 
     def _active_reply(self, bid):
         for rid, info in list(self._reqs.items()):

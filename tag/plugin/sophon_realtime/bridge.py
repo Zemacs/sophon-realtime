@@ -5,7 +5,7 @@ Engine-agnostic contract (the same two calls are implemented by every engine ada
   POST /bridge/<key>/result            <- {"call_id": str|null, "output": str, "speak": bool}
   POST /bridge/<key>/say               <- {"text": str}   speak this text verbatim in the session voice (kept in history)
   POST /bridge/<key>/guide             <- a guidance payload (front/guidance.schema.json); structure-checked, then the reply is generated from its facts (not verbatim)
-                                          200 {"ok": true, "guidance_id", "version"} | 400 {"ok": false, "errors": [...]} | 409 stale version | 404 unknown key
+                                          200 {"ok": true, "guidance_id", "version"} | 400 {"ok": false, "errors": [...]} | 404 unknown key
 <key> is the session's extra_body.bridge_key. Enabled when SOPHON_BRIDGE_PORT is set; binds 127.0.0.1 only."""
 from __future__ import annotations
 

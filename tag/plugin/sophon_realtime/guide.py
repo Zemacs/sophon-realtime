@@ -166,17 +166,13 @@ def message_of(ctx) -> str:
 
 
 def accept(queue: list, payload, log=None) -> tuple[int, dict]:
-    """Entry point behind /guide. Invalid -> (400, errors), logged. An older or equal version of a queued guidance_id -> (409). Otherwise queued."""
+    """Entry point behind /guide. Invalid -> (400, errors), logged. Otherwise queued."""
     log = log or logging.getLogger(__name__)
     errs = validate(payload)
     if errs:
         log.warning("sophon guide: rejected, %d error(s): %s", len(errs), "; ".join(errs[:8]))
         return 400, {"ok": False, "errors": errs}
     gid, ver = payload["guidance_id"], payload["version"]
-    if any(q["guidance_id"] == gid and q["version"] >= ver for q in queue):
-        log.warning("sophon guide: %s v%d dropped, a same or newer version is queued", gid, ver)
-        return 409, {"ok": False, "errors": ["a same or newer version of this guidance_id is already queued"]}
-    queue[:] = [q for q in queue if q["guidance_id"] != gid]
     queue.append(context_of(payload))
     log.info("sophon guide: queued %s v%d (%d release item(s))", gid, ver, len(payload["release"]))
     return 200, {"ok": True, "guidance_id": gid, "version": ver}

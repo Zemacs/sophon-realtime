@@ -136,15 +136,6 @@ class Accept(unittest.TestCase):
         self.assertEqual(q[0]["release"], g["release"])
         self.assertNotIn("run_fingerprint", q[0])
 
-    def test_a_newer_version_replaces_the_queued_one_and_an_older_one_is_dropped(self):
-        q = []; guide.accept(q, good())
-        newer = good(); newer["version"] = 2
-        self.assertEqual(guide.accept(q, newer)[0], 200)
-        self.assertEqual([(c["guidance_id"], c["version"]) for c in q], [("g1", 2)])
-        with self.assertLogs("sophon_realtime.guide", "WARNING"):
-            self.assertEqual(guide.accept(q, good())[0], 409)
-        self.assertEqual(len(q), 1)
-
     def test_bridge_guide_route_answers_with_the_entry_result(self):
         q = []; br = bridge.Bridge(lambda *a: False, on_guide=lambda key, j: guide.accept(q, j))
         with socket_free_port() as port:

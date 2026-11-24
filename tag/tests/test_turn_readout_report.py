@@ -21,9 +21,9 @@ def f2(ev):
 
 
 class Defaults(unittest.TestCase):
-    """The take line is the W6a table (duplex.py:36-37, :43); no number changed."""
+    """The take line is the existing checkpoint table (duplex.py:36-37, :43)."""
 
-    def test_checkpoint_table_is_the_w6a_default(self):
+    def test_checkpoint_table_is_the_existing_default(self):
         self.assertEqual(dx.CHECKS, [0.2, 0.35, 0.5, 0.8, 1.3, 2.0])
         self.assertEqual(dx.THRS, [0.95, 0.85, 0.7, 0.5, 0.35, 0.25])
         self.assertEqual(dx.FALLBACK_S, 2.0)

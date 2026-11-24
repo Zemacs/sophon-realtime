@@ -44,7 +44,7 @@ def _examples(kind):
 
 
 @NEEDS_ROOT
-class R71Examples(unittest.TestCase):
+class ContractExamples(unittest.TestCase):
     """The validator is only trusted once it passes every valid example and rejects
     every invalid one."""
 

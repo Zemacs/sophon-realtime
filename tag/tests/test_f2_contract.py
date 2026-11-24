@@ -1,9 +1,9 @@
-"""Contract consistency of the fork's F2 turn event with duplex-zh r7.1 (FrontPort).
+"""Contract consistency of the fork's F2 turn event with the front-port contract.
 
-The contract files are NOT part of this repository. Point DZH_CONTRACTS_ROOT at the
-directory that contains contracts/ (a read-only copy of
-duplex-zh@233b2c415fabb16746f2a19400bda1a4714ab680: contracts/examples/front/
-{valid,invalid}, contracts/schemas/front). Without it the tests skip.
+The contract files are NOT part of this repository: they come from an internal
+snapshot (version in the private record). Point DZH_CONTRACTS_ROOT at the directory
+that contains contracts/ (contracts/examples/front/{valid,invalid} and
+contracts/schemas/front). Without it the tests skip and say why.
 Needs the jsonschema package (an import error is a failure, not a skip).
 Structure only: field presence, types, enums."""
 
@@ -18,7 +18,7 @@ from fork_harness import Call, Readouts, load_duplex
 ROOT = os.environ.get("DZH_CONTRACTS_ROOT")
 SKIP_REASON = (
     "DZH_CONTRACTS_ROOT is not set: point it at the directory containing contracts/ "
-    "(duplex-zh@233b2c41 r7.1 examples + schemas)"
+    "(examples and schemas from the internal contract snapshot)"
 )
 NEEDS_ROOT = unittest.skipUnless(ROOT, SKIP_REASON)
 ADAPTER_FIELDS = (

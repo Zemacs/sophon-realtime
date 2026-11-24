@@ -18,17 +18,45 @@ _ID_REST = _ALNUM | frozenset("._:-")
 _DIGITS = frozenset("0123456789")
 _HEX = frozenset("0123456789abcdef")
 
-TOP_REQUIRED = "schema_version guidance_id version session_id emitted_at readout_id snapshot_last_entry_id turn_kind release seq run_fingerprint host_id".split()
+TOP_REQUIRED = [
+    "schema_version",
+    "guidance_id",
+    "version",
+    "session_id",
+    "emitted_at",
+    "readout_id",
+    "snapshot_last_entry_id",
+    "turn_kind",
+    "release",
+    "seq",
+    "run_fingerprint",
+    "host_id",
+]
 TOP_OPTIONAL = ["current_turn", "opened_tasks", "disposition_facts"]
 TURN_KINDS = ["user_turn", "event_turn", "timer_turn"]
 H1 = ["to_system", "feedback", "not_to_system", "holding"]
 H4 = ["immediate", "after_playback", "next_user_turn", "only_when_asked"]
 H7 = ["silent", "answer", "ask"]
 H8 = ["normal", "refuse", "escalate"]
-ITEM_REQUIRED = "item_id item_version kind released_by facts".split()
-ITEM_KINDS = "result progress failure playback_remainder reminder_due question".split()
+ITEM_REQUIRED = ["item_id", "item_version", "kind", "released_by", "facts"]
+ITEM_KINDS = [
+    "result",
+    "progress",
+    "failure",
+    "playback_remainder",
+    "reminder_due",
+    "question",
+]
 NEEDS_EVIDENCE = ["result", "failure", "progress"]
-CONTEXT_KEYS = "guidance_id version turn_kind current_turn opened_tasks release disposition_facts".split()
+CONTEXT_KEYS = [
+    "guidance_id",
+    "version",
+    "turn_kind",
+    "current_turn",
+    "opened_tasks",
+    "release",
+    "disposition_facts",
+]
 SYS_GUIDE = {
     "zh": "对话里 tool 角色的 JSON 是执行中枢给你的指导：只含结构化事实，不含现成的句子。请据此用自然口语说给用户，不要念字段名、编号或 JSON，也不要编造指导里没有的事实。",
     "en": "A tool-role JSON in the conversation is guidance from the execution hub: structured facts only, no ready-made sentences. Say it to the user in natural spoken language; do not read out field names, ids or JSON, and do not invent facts that are not in it.",
@@ -145,7 +173,13 @@ def validate(g) -> list[str]:
     errs = _obj(g, "$", TOP_REQUIRED, TOP_OPTIONAL)
     if not isinstance(g, dict):
         return errs
-    ids = "guidance_id session_id host_id readout_id snapshot_last_entry_id".split()
+    ids = [
+        "guidance_id",
+        "session_id",
+        "host_id",
+        "readout_id",
+        "snapshot_last_entry_id",
+    ]
     spec = {k: _ID for k in ids} | {"version": _UINT, "seq": _UINT}
     spec["schema_version"] = (_is_semver, "bad semver")
     spec["emitted_at"] = (_is_time, "bad date-time")

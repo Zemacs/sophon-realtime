@@ -4,6 +4,8 @@ Engine-agnostic contract (the same two calls are implemented by every engine ada
   GET  /bridge/<key>/events?wait=<s>   -> {"events": [{"type": "tool_call", "call_id", "name", "arguments"}]}  (long poll)
   POST /bridge/<key>/result            <- {"call_id": str|null, "output": str, "speak": bool}
   POST /bridge/<key>/say               <- {"text": str}   speak this text verbatim in the session voice (kept in history)
+  POST /bridge/<key>/guide             <- a guidance payload (front/guidance.schema.json); structure-checked, then the reply is generated from its facts (not verbatim)
+                                          200 {"ok": true, "guidance_id", "version"} | 400 {"ok": false, "errors": [...]} | 409 stale version | 404 unknown key
 <key> is the session's extra_body.bridge_key. Enabled when SOPHON_BRIDGE_PORT is set; binds 127.0.0.1 only."""
 from __future__ import annotations
 
@@ -18,9 +20,10 @@ PORT = int(os.environ.get("SOPHON_BRIDGE_PORT", "0") or 0)
 
 
 class Bridge:
-    def __init__(self, on_result, on_say=None):
+    def __init__(self, on_result, on_say=None, on_guide=None):
         self.on_result = on_result                 # (key, call_id, output, speak) -> bool
         self.on_say = on_say                       # (key, text) -> bool
+        self.on_guide = on_guide                   # (key, payload) -> (http status, body)
         self.q: dict[str, list] = {}
         self.cv = threading.Condition()
         self.seen: dict[str, float] = {}
@@ -62,6 +65,8 @@ class Bridge:
                 if len(p) == 3 and p[0] == "bridge" and p[2] == "say" and br.on_say is not None:
                     ok = br.on_say(p[1], str(j.get("text", "")))
                     return self._send(200 if ok else 404, {"ok": ok})
+                if len(p) == 3 and p[0] == "bridge" and p[2] == "guide" and br.on_guide is not None:
+                    return self._send(*br.on_guide(p[1], j))
                 self._send(404, {"error": "not found"})
 
         self._srv = ThreadingHTTPServer(("127.0.0.1", PORT), H)

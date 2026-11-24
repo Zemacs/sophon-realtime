@@ -78,6 +78,7 @@ def _fence_floor_patch() -> None:
     append_fence._sophon_floor = True
     _h.append_fence = append_fence
 from . import bridge as _bridge
+from . import guide as _guide
 VISION = _vision()                                                   # thinker has a vision tower (DuplexJevVision): accept camera frames
 FRAME_TTL = float(os.environ.get("SOPHON_FRAME_TTL", "3.0"))        # camera frames older than this are no longer attached (seconds)
 IMG_MAX = int(os.environ.get("SOPHON_IMG_MAX", "448"))               # frames are downscaled to fit within this side length before going to the model (~200 vision tokens)
@@ -293,6 +294,7 @@ class SophonBuffer(PcmAppendBuffer):
     retry: dict | None = None                                # a reply append the framework did not accept: send it again as soon as appends are allowed
     tool_followup: bool = False                              # a tool result is in history: speak the answer as soon as the user is silent
     say_q: list = field(default_factory=list)                # texts to speak verbatim (bridge /say), each as its own reply once the user is silent
+    guide_q: list = field(default_factory=list)              # validated guidance contexts (bridge /guide), each generated into a reply once the user is silent
     tool_mode: str = "mock"                                   # "mock": run tool_mocks here; "client": hand calls to the gateway over the bridge
     bridge_key: str | None = None
     call_entry: dict = field(default_factory=dict)           # client mode: call_id -> history entry the call belongs to
@@ -435,6 +437,12 @@ class SophonBuffer(PcmAppendBuffer):
                 p = {"audio": base64.b64encode(np.zeros(SR // 10, np.float32).tobytes()).decode(), "format": "pcm_f32le", "sample_rate_hz": SR,
                      "is_speech": True, "sophon_kind": "reply", "sophon_buf": id(self), "lang": self.lang, "say": text}
                 logger.info("sophon say: emitted (%d chars)", len(text))
+                return self._res(operation_id, p)
+            if self.guide_q and self.speech_ms == 0 and allow_emit and not self.reservations and not self.inflight_t and self._quiet_out():
+                g = self.guide_q.pop(0); self.prev_user = None; self.t_reply = time.monotonic()
+                p = {"audio": base64.b64encode(np.zeros(SR // 10, np.float32).tobytes()).decode(), "format": "pcm_f32le", "sample_rate_hz": SR,
+                     "is_speech": True, "sophon_kind": "reply", "sophon_buf": id(self), "lang": self.lang, "guide": g}
+                logger.info("sophon guide: emitted %s v%s", g["guidance_id"], g["version"])
                 return self._res(operation_id, p)
             if self.tool_followup and self.speech_ms == 0 and allow_emit and not self.reservations and not self.inflight_t:
                 self.tool_followup = False; self.prev_user = None; self.t_reply = time.monotonic()
@@ -697,7 +705,7 @@ class SophonRealtimeDuplexPlugin(DuplexModelPlugin):
         self._spec_pending: dict[str, str] = {}              # speculative replies released/dropped before being planned: spec_id -> "release"/"drop"
         self._spec_lock = threading.Lock()
         self._keys: dict[str, SophonBuffer] = {}
-        self.bridge = _bridge.Bridge(self._bridge_result, self._bridge_say)
+        self.bridge = _bridge.Bridge(self._bridge_result, self._bridge_say, self._bridge_guide)
         global _WARM_STARTED
         if not _WARM_STARTED and os.environ.get("SOPHON_WARMUP", "1") != "0":
             _WARM_STARTED = True; threading.Thread(target=_warm_turn_check, daemon=True).start()
@@ -787,6 +795,8 @@ class SophonRealtimeDuplexPlugin(DuplexModelPlugin):
         """One history entry: user speech, assistant reply (audio, or text + tool calls), then any tool results and follow-up replies."""
         if h.get("user") is not None:                             # said entries (bridge /say) have no user speech
             msgs.append({"role": "user", "content": "<|audio|>"}); audios.append((h["user"], SR))
+        if h.get("guide") is not None:                            # guided entries (bridge /guide): the structured guidance the reply was generated from
+            msgs.append({"role": "tool", "content": _guide.message_of(h["guide"])})
         self._asst(h, msgs, audios)
         for st in h.get("chain", ()):
             for r in st["results"]: msgs.append({"role": "tool", "content": r})
@@ -858,6 +868,20 @@ class SophonRealtimeDuplexPlugin(DuplexModelPlugin):
             self._reqs[request_id] = info
             if buf is not None: buf.prev_rid = request_id
             logger.info("sophon say: request=%s hist=%d text=%r", request_id, len(buf.history) if buf else 0, text[:80])
+            return DuplexAppendPlan(prompt={"prompt": self._render(msgs), "multi_modal_data": {"audio": audios}, "additional_information": addl})
+        if payload.get("guide") is not None:
+            # guide: generate the reply (not verbatim) from history + this guidance's structured facts; guidance_id/version ride on the request, the model never writes them
+            g = payload["guide"]
+            msgs[0]["content"] += "\n\n" + _guide.SYS_GUIDE.get(lang, _guide.SYS_GUIDE["zh"])
+            for h in (buf.history if buf else []): self._hist(h, msgs, audios)
+            msgs.append({"role": "tool", "content": _guide.message_of(g)})
+            info = {"kind": "reply", "buf": buf, "user": None, "a_audio": [], "a_text": "", "t_plan": time.monotonic(),
+                    "spec": False, "released": True, "dropped": False, "held": [], "guide": g,
+                    "guidance_ref": {"guidance_id": g["guidance_id"], "version": g["version"]}}
+            self._reqs[request_id] = info
+            if buf is not None: buf.prev_rid = request_id
+            if dbg: info["ctx"] = (msgs, audios)
+            logger.info("sophon guide: request=%s guidance=%s v%s hist=%d", request_id, g["guidance_id"], g["version"], len(buf.history) if buf else 0)
             return DuplexAppendPlan(prompt={"prompt": self._render(msgs), "multi_modal_data": {"audio": audios}, "additional_information": addl})
         if payload.get("tool_followup"):
             # a tool result came back: the model answers from history (user speech, its call, the result) -- no new user speech
@@ -1029,6 +1053,7 @@ class SophonRealtimeDuplexPlugin(DuplexModelPlugin):
         if info.get("say") is not None and completed: info["a_text"] = info["say"]        # the text as given, not the detokenized stream
         entry = {"user": info["user"], "a_text": info["a_text"] + ("" if completed else "……（被用户打断）"),
                  "a_audio": a if completed and a is not None and a.size > SR // 10 else None}
+        if info.get("guide") is not None: entry["guide"] = info["guide"]       # keeps guidance_id/version with the reply that was generated from it
         cut = buf.cut
         if not completed and cut is not None and cut.get("rid") == rid:
             entry["a_text"] = cut["said"] + "……（被用户打断）"      # keep only what was actually spoken
@@ -1091,6 +1116,13 @@ class SophonRealtimeDuplexPlugin(DuplexModelPlugin):
         with buf.lock: buf.say_q.append(text.strip())
         logger.info("sophon say: queued %r", text[:120])
         return True
+
+    def _bridge_guide(self, key, payload):
+        """A guidance from the gateway: validate its structure, queue it, and generate a reply from it once the user is silent. Returns (http status, body)."""
+        buf = self._keys.get(key)
+        if buf is None:
+            return 404, {"ok": False, "errors": ["unknown bridge key"]}
+        with buf.lock: return _guide.accept(buf.guide_q, payload, logger)
 
     def _bridge_result(self, key, call_id, output, speak):
         """A result from the gateway: attach it to the call's history entry (or the latest one) and, if it should be spoken, queue a follow-up reply."""

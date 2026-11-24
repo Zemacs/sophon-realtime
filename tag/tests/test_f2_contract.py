@@ -1,7 +1,7 @@
 """Contract consistency of the fork's F2 turn event with the front-port contract.
 
-The contract files are NOT part of this repository: they come from an internal
-snapshot (version in the private record). Point DZH_CONTRACTS_ROOT at the directory
+The contract files are NOT part of this repository: they come from an external
+contract snapshot. Point DZH_CONTRACTS_ROOT at the directory
 that contains contracts/ (contracts/examples/front/{valid,invalid} and
 contracts/schemas/front). Without it the tests skip and say why.
 Needs the jsonschema package (an import error is a failure, not a skip).

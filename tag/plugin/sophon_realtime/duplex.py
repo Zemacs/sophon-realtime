@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import random
+import sys
 import threading
 import time
 from collections.abc import Mapping
@@ -50,6 +51,18 @@ from .proc import strip_tags as _strip_tags, tag_clean as _tag_clean
 
 def _display(s, final):
     return _strip_tags(_tag_clean(s, final))
+
+
+def _rule_log(rule, buf=None, **fields):
+    """One structured line for a hard-coded turn rule firing: rule, call site (file:line), mono/wall clocks, session buffer + turn ids, then the rule's own fields.
+    Observation only: reads state, never writes it, and never raises into the caller."""
+    try:
+        fr = sys._getframe(1)
+        extra = "".join(" %s=%s" % (k, ("%.4f" % v) if isinstance(v, float) else v) for k, v in fields.items())
+        logger.info("sophon rule: rule=%s src=%s:%d mono=%.6f wall=%.6f buf=%s turn=%s gen=%s%s", rule, os.path.basename(fr.f_code.co_filename), fr.f_lineno,
+                    time.monotonic(), time.time(), id(buf) if buf is not None else None, getattr(buf, "last_turn", None), getattr(buf, "gen", None), extra)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _fence_floor_patch() -> None:
@@ -299,6 +312,7 @@ class SophonBuffer(PcmAppendBuffer):
     early_calls: list = field(default_factory=list)          # client mode: calls already announced when the thinker finished (before the audio did)
     cut: dict | None = None                                  # last reply cut off by the user speaking: {"t", "said" (text actually heard), "rid"}
     resume_pending: bool = False                             # the model judged this as a back-channel: continue the cut reply
+    resume_path: str = ""                                    # log only: which rule first set resume_pending ("fallback" / "check"); never read by any decision
     owner_active: object = None                              # injected by the plugin: the reply now playing (rid, text, seconds generated, start time, prefix)
     reservations: list = field(default_factory=list)
     lock: threading.Lock = field(default_factory=threading.Lock)
@@ -317,6 +331,7 @@ class SophonBuffer(PcmAppendBuffer):
     def _reset_turn(self):
         self.pc_hit = False; self.seg_rms = []; self.tool_followup = False; self.max_pf = 0.0; self.last_pb = 0.0; self.spec_id = None; self.gen += 1; self.utt.clear(); self.speech_ms = 0.0; self.silence_ms = 0.0; self.next_check = 0; self.voiced_ms = 0.0
         self.pending_reply = False; self.check_inflight = False; self.decision = None; self.decision_ready = False; self.resume_pending = False
+        self.resume_path = ""
 
     def _not_sent(self, payload):
         """An append never reached the engine (rolled back, or its reservation timed out)."""
@@ -385,9 +400,12 @@ class SophonBuffer(PcmAppendBuffer):
                         self.voiced_ms += 20
                         if self.voiced_ms >= 100:
                             lp = self.last_play; self.last_play = None
+                            _playing = False; _barged = False
                             if lp is not None:
                                 played = time.monotonic() - lp["t0"] - 0.25     # onset detection lags ~0.1 s + client buffering ~60 ms, etc.
+                                _playing = isinstance(lp.get("dur"), (int, float)) and played + 0.25 < lp["dur"]
                                 if 0 <= played < lp["dur"] - 0.3:
+                                    _barged = True
                                     # user speaking while Sophon talks = barge-in: history keeps only what was actually spoken
                                     e = lp["entry"]; frac = max(0.0, played / lp["dur"]); n = int(len(lp["text"]) * frac)
                                     e["a_text"] = lp["text"][:n] + "……（被用户打断）"
@@ -399,8 +417,10 @@ class SophonBuffer(PcmAppendBuffer):
                             elif self.owner_active is not None:
                                 act = self.owner_active(id(self))         # cut while the reply is still being generated: estimate what was heard from playback time
                                 if act is not None:
+                                    _playing = True
                                     rid_a, text_a, gen_a, t_out_a, pre_a = act; played = time.monotonic() - t_out_a - 0.25
                                     if played > 0 and gen_a > 0 and text_a:
+                                        _barged = True
                                         n = int(len(text_a) * min(1.0, played / gen_a))
                                         self.cut = {"t": time.monotonic(), "said": _trim_said(pre_a + text_a[:n]), "rid": rid_a}
                                         logger.info("sophon duplex: user spoke at %.1fs into a reply still being generated (%.1fs so far)", played, gen_a)
@@ -410,6 +430,7 @@ class SophonBuffer(PcmAppendBuffer):
                                 logger.info("sophon duplex: user resumed %.2fs after reply -> merge & abort", time.monotonic() - self.t_reply)
                             self.prev_user = None
                             self.utt.extend(self.pre); self.pre.clear(); self.speech_ms = self.voiced_ms; self.silence_ms = 0.0; self.next_check = 0
+                            _rule_log("energy_onset", self, rms=r, thr=thr, noise=self.noise, playing=_playing, barge_in=_barged)
                     else:
                         self.voiced_ms = 0; self.noise = 0.98 * self.noise + 0.02 * min(r, 0.05)
                 else:
@@ -474,13 +495,16 @@ class SophonBuffer(PcmAppendBuffer):
                 if (BC_RESUME and self.cut is not None and time.monotonic() - self.cut["t"] < BC_WINDOW + FALLBACK_S
                         and self.speech_ms < 1500 and self.last_pb >= BC_THR and self.last_pb > self.max_pf):
                     self.resume_pending = True
+                    self.resume_path = self.resume_path or "fallback"
+                    _rule_log("bc_resume_fallback", self, silence_ms=self.silence_ms, speech_ms=self.speech_ms, p_backchannel=self.last_pb, max_p_finished=self.max_pf, cut_age_s=time.monotonic() - self.cut["t"])
                 else:
                     self.pending_reply = True; self.fallback = True
             if self.resume_pending and allow_emit and not self.reservations and not self.inflight_t:
                 self.resume_pending = False; cut = self.cut; self.cut = None
                 if self.spec_id is not None: self.owner_drop(self.spec_id); self.spec_id = None
                 p = self._payload("reply"); p["resume"] = cut["said"] if cut else ""
-                logger.info("sophon timing: resume emitted %.3fs after silence start (said %d chars)", time.monotonic() - self.t_sil, len(p["resume"]))
+                logger.info("sophon timing: resume emitted %.3fs after silence start (said %d chars) via=%s", time.monotonic() - self.t_sil, len(p["resume"]), self.resume_path or "unknown")
+                _rule_log("bc_resume_emitted", self, via=self.resume_path or "unknown", after_silence_s=time.monotonic() - self.t_sil, said_chars=len(p["resume"]))
                 self._reset_turn(); self.prev_user = None; self.t_reply = time.monotonic()
                 return self._res(operation_id, p)
             mr = self.minrel_s if self.minrel_s is not None else MIN_RELEASE
@@ -526,6 +550,8 @@ class SophonBuffer(PcmAppendBuffer):
                 if (BC_RESUME and p is not None and self.cut is not None and time.monotonic() - self.cut["t"] < BC_WINDOW
                         and self.speech_ms < 1500 and pb >= BC_THR and pb > p):
                     self.resume_pending = True                # just an "mm-hmm" / "yeah": continue what was being said
+                    self.resume_path = self.resume_path or "check"
+                    _rule_log("bc_resume_check", self, check_idx=idx, p_finished=p, p_backchannel=pb, thr=thr, speech_ms=self.speech_ms, cut_age_s=time.monotonic() - self.cut["t"])
                     logger.info("sophon duplex: back-channel over a cut reply (P(backchannel)=%.2f) -> resume", pb)
                 elif p is not None and p >= thr:
                     self.pending_reply = True

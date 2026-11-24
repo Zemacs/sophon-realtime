@@ -1,7 +1,10 @@
 """The turn readout only reports (FrontPort F2); it no longer starts a reply.
 
-Run from the repository root:  PYTHONDONTWRITEBYTECODE=1 python3 -m pytest tag/tests -p no:cacheprovider
-(also runs with python3 -m unittest discover -s tag/tests). No GPU, no vllm_omni: see fork_harness.py."""
+Run from the repository root:
+    PYTHONDONTWRITEBYTECODE=1 python3 -m pytest tag/tests -p no:cacheprovider
+(also runs with python3 -m unittest discover -s tag/tests).
+No GPU, no vllm_omni: see fork_harness.py."""
+
 import os
 import sys
 import unittest
@@ -18,7 +21,7 @@ def f2(ev):
 
 
 class Defaults(unittest.TestCase):
-    """The take line is W6a's existing checkpoint table (duplex.py:36-37, :43), env-configurable, no number changed."""
+    """The take line is the W6a table (duplex.py:36-37, :43); no number changed."""
 
     def test_checkpoint_table_is_the_w6a_default(self):
         self.assertEqual(dx.CHECKS, [0.2, 0.35, 0.5, 0.8, 1.3, 2.0])
@@ -59,7 +62,9 @@ class Take(unittest.TestCase):
         c.silence(2500)
         self.assertEqual(c.reply_appends(), [])
         self.assertEqual(len(c.events), 1, "one F2 per endpoint")
-        self.assertEqual(c.dx.turn_prob_http.calls, 1, "no more readouts once the endpoint is taken")
+        self.assertEqual(
+            c.dx.turn_prob_http.calls, 1, "no more readouts once the endpoint is taken"
+        )
 
     def test_threshold_is_per_checkpoint(self):
         c = Call(dx, Readouts((0.9, 0.0), (0.9, 0.0)))
@@ -67,11 +72,17 @@ class Take(unittest.TestCase):
         c.silence(200)
         self.assertEqual(c.events, [], "0.9 is below the first checkpoint's 0.95")
         c.silence(200)
-        self.assertEqual([e["turn_action"] for e in c.events], ["take"], "0.9 is above the second checkpoint's 0.85")
+        self.assertEqual(
+            [e["turn_action"] for e in c.events],
+            ["take"],
+            "0.9 is above the second checkpoint's 0.85",
+        )
 
 
 class NoTake(unittest.TestCase):
-    def test_no_take_is_reported_at_the_fallback_silence_and_never_starts_a_reply(self):
+    def test_no_take_is_reported_at_the_fallback_silence_and_never_starts_a_reply(
+        self,
+    ):
         c = Call(dx, Readouts((0.1, 0.0)))
         c.speech(500)
         seen = []

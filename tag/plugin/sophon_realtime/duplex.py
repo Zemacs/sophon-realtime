@@ -305,6 +305,8 @@ class SophonBuffer(PcmAppendBuffer):
     owner_release: object = None                             # injected by the plugin: release a speculative reply (returns False if it already finished generating and can't be released)
     owner_drop: object = None
     input_cut: bool = False                                  # the framework just cleared input for a barge-in / input cancel (no append since)
+    t_voice: float = 0.0                                     # last 20 ms frame above the energy gate
+    owner_retire: object = None                              # injected by the plugin: end this session's replies whose stream the framework closed
 
     @property
     def pending_byte_count(self): return len(self.utt)
@@ -368,9 +370,17 @@ class SophonBuffer(PcmAppendBuffer):
         raw = base64.b64decode(payload.get("audio", ""), validate=True)
         dur = len(raw) / 4 / SR * 1000.0
         self.input_cut = False
+        fb = self.fb_s if self.fb_s is not None else FALLBACK_S
+        if self.owner_retire is not None and self.speech_ms == 0 and not self.reservations and not self.inflight_t:
+            self.owner_retire(id(self), self.t_voice, fb)    # a reply cut by user speech that never became a turn: end it after FB of no voice (outside the lock)
         # silence timing uses a 20 ms energy VAD (adaptive noise floor, same rule as the testbench gateway); the framework's is_speech has a silence_duration tail and Silero probabilities also linger ~0.5 s
         x = np.frombuffer(raw, dtype="<f4")
         with self.lock:
+            if 0 < self.speech_ms < 120 and not self.pending_reply and not self.reservations and not self.inflight_t and time.monotonic() - self.t_voice >= fb:
+                # a sound too short to reach the turn checks, then no voice for FB: drop the turn (same as an ignored short sound) so nothing waits on it
+                logger.info("sophon duplex: short sound (%.0f ms) without a turn, discarded after %.1f s of silence", self.speech_ms, fb)
+                if self.spec_id is not None: self.owner_drop(self.spec_id)
+                self._undo_merge(); self._reset_turn()
             if self.rem.size: x = np.concatenate([self.rem, x])
             n = x.size // 320; self.rem = x[n * 320:].copy()
             for i in range(n):
@@ -384,7 +394,7 @@ class SophonBuffer(PcmAppendBuffer):
                     self.pre.extend(fb)
                     if len(self.pre) > int(0.6 * SR) * 4: del self.pre[: len(self.pre) - int(0.6 * SR) * 4]
                     if r > thr:
-                        self.voiced_ms += 20
+                        self.voiced_ms += 20; self.t_voice = time.monotonic()
                         if self.voiced_ms >= 100:
                             lp = self.last_play; self.last_play = None
                             if lp is not None:
@@ -421,7 +431,7 @@ class SophonBuffer(PcmAppendBuffer):
                         if self.silence_ms > 0:
                             self.gen += 1; self.check_inflight = False; self.pending_reply = False
                             if self.spec_id is not None: self.owner_drop(self.spec_id); self.spec_id = None
-                        self.speech_ms += 20; self.silence_ms = 0.0; self.next_check = 0
+                        self.speech_ms += 20; self.silence_ms = 0.0; self.next_check = 0; self.t_voice = time.monotonic()
                     else:
                         if self.silence_ms == 0: self.t_sil = time.monotonic()
                         self.silence_ms += 20
@@ -716,7 +726,7 @@ class SophonRealtimeDuplexPlugin(DuplexModelPlugin):
 
     def create_session_state(self):
         buf = SophonBuffer(); self._bufs[id(buf)] = buf
-        buf.owner_release = self._release; buf.owner_drop = self._drop; buf.owner_active = self._active_reply
+        buf.owner_release = self._release; buf.owner_drop = self._drop; buf.owner_active = self._active_reply; buf.owner_retire = self._retire_closed
         return _SophonSessionState(audio_buffer=buf)
 
     def validate_client_extra_body(self, extra_body):
@@ -938,10 +948,32 @@ class SophonRealtimeDuplexPlugin(DuplexModelPlugin):
         info = self._reqs.get(request_id) or self._match(request_id); rid = request_id
         if info is not None and request_id not in self._reqs:
             rid = next((k for k, v in list(self._reqs.items()) if v is info), None)
-        if info is None or rid is None or info.get("kind") != "reply" or info.get("buf") is None or info["buf"].input_cut:
+        if info is None or rid is None or info.get("kind") != "reply" or info.get("buf") is None:
             return
+        if info["buf"].input_cut:                    # cut by user speech: the next turn ends it; if none comes, _retire_closed does after FB
+            info["closed"] = True; info["t_closed"] = time.monotonic(); return
+        info["cut_note"] = self._cut_note(info, "被取消", time.monotonic())
         logger.info("sophon duplex: reply %s cancelled -> ended", rid[-24:])
         self._retire_reply(rid, info)
+
+    def _retire_closed(self, bid, t_voice, fb):
+        """End this session's replies that were cut by user speech once FB has passed with no voice since the cut (no new turn came)."""
+        now = time.monotonic()
+        for rid, info in list(self._reqs.items()):
+            if (info.get("closed") and info.get("kind") == "reply" and info.get("buf") is not None and id(info["buf"]) == bid
+                    and now - max(t_voice, info["t_closed"]) >= fb):
+                info["cut_note"] = self._cut_note(info, "被打断", info["t_closed"])
+                logger.info("sophon duplex: reply %s cut without a new turn -> ended after %.1f s", rid[-24:], fb)
+                self._retire_reply(rid, info)
+
+    @staticmethod
+    def _cut_note(info, how, t_end):
+        """History marker for a reply ended by a stream close: the generated text is kept whole; how much was heard is not known exactly.
+        With audio sent, give the server-side upper bound (time since the first audio was sent, at most the audio generated)."""
+        gen = sum(len(x) for x in info.get("a_audio") or ()) / SR
+        if info.get("t_out") and gen > 0:
+            return f"……（{how}，已播出约 {round(1000 * min(max(0.0, t_end - info['t_out']), gen))} ms（服务端上界））"
+        return f"……（{how}，听到多少未知）"
 
     def _active_reply(self, bid):
         for rid, info in list(self._reqs.items()):
@@ -1035,7 +1067,7 @@ class SophonRealtimeDuplexPlugin(DuplexModelPlugin):
             logger.info("sophon tool: reply %s %s -> calls %s", rid[-24:], "done" if completed else "cut (calls dropped)",
                         json.dumps([(c["name"], c["arguments"]) for c in calls], ensure_ascii=False))
         if info.get("step") is not None:                         # tool follow-up: fill the chain step instead of adding a history entry
-            st = info["step"]; st["a_text"] = info["a_text"].strip() + ("" if completed else "……（被用户打断）")
+            st = info["step"]; st["a_text"] = info["a_text"].strip() + ("" if completed else (info.get("cut_note") or "……（被用户打断）"))
             st["a_audio"] = a if completed and a is not None and a.size > SR // 10 else None
             if calls: st["tool_calls"] = calls
             logger.info("sophon reply text %s (tool follow-up, %s): %s", rid[-24:], "done" if completed else "cut", info["a_text"][:300].replace("\n", " "))
@@ -1046,10 +1078,10 @@ class SophonRealtimeDuplexPlugin(DuplexModelPlugin):
             self._run_tools(buf, info["entry"], calls)
             return
         if info.get("say") is not None and completed: info["a_text"] = info["say"]        # the text as given, not the detokenized stream
-        entry = {"user": info["user"], "a_text": info["a_text"] + ("" if completed else "……（被用户打断）"),
+        entry = {"user": info["user"], "a_text": info["a_text"] + ("" if completed else (info.get("cut_note") or "……（被用户打断）")),
                  "a_audio": a if completed and a is not None and a.size > SR // 10 else None}
         cut = buf.cut
-        if not completed and cut is not None and cut.get("rid") == rid:
+        if not completed and cut is not None and cut.get("rid") == rid and not info.get("cut_note"):
             entry["a_text"] = cut["said"] + "……（被用户打断）"      # keep only what was actually spoken
         if info.get("resume_entry") is not None:                   # resume: merge into the original history entry instead of adding one
             res = info["resume_entry"]; res["a_text"] = info["said"] + entry["a_text"]; res["a_audio"] = None

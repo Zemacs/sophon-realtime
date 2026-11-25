@@ -302,6 +302,8 @@ class SophonBuffer(PcmAppendBuffer):
     bridge_key: str | None = None
     call_entry: dict = field(default_factory=dict)           # client mode: call_id -> history entry the call belongs to
     early_calls: list = field(default_factory=list)          # client mode: calls already announced when the thinker finished (before the audio did)
+    known_calls: dict = field(default_factory=dict)          # client mode: call_id -> tool name of every call announced to the gateway (bounded)
+    early_results: dict = field(default_factory=dict)        # client mode: call_id -> [(output, speak)] that arrived before the announcing reply finished (no history entry yet)
     cut: dict | None = None                                  # last reply cut off by the user speaking: {"t", "said" (text actually heard), "rid"}
     resume_pending: bool = False                             # the model judged this as a back-channel: continue the cut reply
     owner_active: object = None                              # injected by the plugin: the reply now playing (rid, text, seconds generated, start time, prefix)
@@ -720,6 +722,8 @@ class SophonRealtimeDuplexPlugin(DuplexModelPlugin):
         self._spec_pending: dict[str, str] = {}              # speculative replies released/dropped before being planned: spec_id -> "release"/"drop"
         self._spec_lock = threading.Lock()
         self._keys: dict[str, SophonBuffer] = {}
+        self._session_keys: set[str] = set()                 # every bridge_key seen in a session config, bound to a buffer or not
+        self._open_key: str | None = None                    # key of the session being opened: manager.open runs prepare_runtime_config -> create_session_state with no await between
         self.bridge = _bridge.Bridge(self._bridge_result)
         global _WARM_STARTED
         if not _WARM_STARTED and os.environ.get("SOPHON_WARMUP", "1") != "0":
@@ -738,6 +742,9 @@ class SophonRealtimeDuplexPlugin(DuplexModelPlugin):
     def create_session_state(self):
         buf = SophonBuffer(); self._bufs[id(buf)] = buf
         buf.owner_release = self._release; buf.owner_drop = self._drop; buf.owner_active = self._active_reply
+        key, self._open_key = self._open_key, None
+        if key:                                              # register the bridge key now, not at the first reply plan: results are accepted from session start
+            buf.bridge_key = key; self._keys[key] = buf; self.bridge.start()
         return DefaultDuplexModelSessionState(audio_buffer=buf)
 
     def validate_client_extra_body(self, extra_body):
@@ -749,17 +756,20 @@ class SophonRealtimeDuplexPlugin(DuplexModelPlugin):
                 from transformers import AutoTokenizer
                 path = model_config.tokenizer if model_config is not None and getattr(model_config, "tokenizer", None) else model_config.model
                 self.tok = await asyncio.to_thread(AutoTokenizer.from_pretrained, path)
-        return self.runtime_config_for_update(config, {})
+        rc = self.runtime_config_for_update(config, {}); self._open_key = rc.get("bridge_key")
+        return rc
 
     def runtime_config_for_update(self, config, current):
         eb = config.extra_body if isinstance(config.extra_body, Mapping) else {}
         tools = eb.get("tools") if eb.get("tools") is not None else getattr(config, "tools", None)
+        bk = eb.get("bridge_key") if isinstance(eb.get("bridge_key"), str) else None
+        if bk: self._session_keys.add(bk)
         return {"instructions": config.instructions, "temperature": config.temperature, "max_tokens": config.max_tokens,
                 "tools": _tools.normalize_tools(tools), "tool_mocks": eb.get("tool_mocks") if isinstance(eb.get("tool_mocks"), Mapping) else {},
                 "voice": config.voice or "chelsie", "lang": str(eb.get("language") or "zh")[:2],
                 # per-session turn-taking knobs (optional): fallback after this much silence; minimum pause before speaking,
                 # applied only once the user has spoken at least min_release_after_s
-                "tool_mode": "client" if eb.get("tool_mode") == "client" else "mock", "bridge_key": eb.get("bridge_key") if isinstance(eb.get("bridge_key"), str) else None,
+                "tool_mode": "client" if eb.get("tool_mode") == "client" else "mock", "bridge_key": bk,
                 "history": eb.get("history") if isinstance(eb.get("history"), list) else [],
                 "turn_fallback_s": eb.get("turn_fallback_s"), "min_release_s": eb.get("min_release_s"), "min_release_after_s": eb.get("min_release_after_s")}
 
@@ -1067,7 +1077,11 @@ class SophonRealtimeDuplexPlugin(DuplexModelPlugin):
             return
         if buf.tool_mode == "client":
             with buf.lock:
-                for c in calls: buf.call_entry[c["id"]] = entry
+                for c in calls:
+                    buf.call_entry[c["id"]] = entry
+                    for out, speak in buf.early_results.pop(c["id"], ()):      # results that beat the reply's end
+                        entry.setdefault("chain", []).append({"results": [out]})
+                        if speak: buf.tool_followup = True
             return
         chain = entry.setdefault("chain", [])
         if len(chain) >= _tools.MAX_STEPS:
@@ -1086,23 +1100,38 @@ class SophonRealtimeDuplexPlugin(DuplexModelPlugin):
         if not calls or buf is None or buf.tool_mode != "client" or not buf.bridge_key:
             if calls and (buf is None or buf.tool_mode != "client"): info["announced"] = False   # mock mode: parse again at the end as before
             return
+        with buf.lock:
+            for c in calls: buf.known_calls[c["id"]] = c["name"]
+            while len(buf.known_calls) > 256: buf.known_calls.pop(next(iter(buf.known_calls)))
         for c in calls:
             logger.info("sophon tool: client call %s %s %s", c["id"], c["name"], json.dumps(c["arguments"], ensure_ascii=False)[:200])
             self.bridge.push(buf.bridge_key, {"type": "tool_call", "call_id": c["id"], "name": c["name"], "arguments": c["arguments"], "t": time.time()})
 
     def _bridge_result(self, key, call_id, output, speak):
+        ok, why = self._bridge_result_inner(key, call_id, output, speak)
+        (logger.info if ok else logger.warning)("sophon tool: result key=%s call=%s speak=%s -> %s (%s)", key, call_id, speak, "accepted" if ok else "REJECTED", why)
+        return ok, why
+
+    def _bridge_result_inner(self, key, call_id, output, speak):
         """A result from the gateway: attach it to the call's history entry (or the latest one) and, if it should be spoken, queue a follow-up reply."""
         buf = self._keys.get(key)
         if buf is None:
-            return False
+            return False, "session_not_ready" if key in self._session_keys else "unknown_session"
         with buf.lock:
+            inflight = [c for c in buf.known_calls if c not in buf.call_entry]
+            if call_id is None and len(inflight) == 1: call_id = inflight[0]
+            if call_id in buf.known_calls and call_id not in buf.call_entry:
+                # the reply that made the call has not finished, so its history entry does not exist yet (e.g. the user's first question): keep the result;
+                # _run_tools attaches it when the reply ends and the normal follow-up path (tool_followup, allow_emit) speaks it
+                buf.early_results.setdefault(call_id, []).append((output, speak))
+                return True, "queued"
             if not buf.history:
-                return False
+                return False, "turn_discarded" if call_id in buf.known_calls else "unknown_call_id" if call_id is not None else "no_pending_call"
             entry = buf.history[-1]          # the follow-up always answers from the latest turn (if the user spoke since the call, the result joins that turn)
             entry.setdefault("chain", []).append({"results": [output]})
             if speak: buf.tool_followup = True
         logger.info("sophon tool: client result call=%s speak=%s %s", call_id, speak, output[:200].replace("\n", " "))
-        return True
+        return True, "accepted"
 
     @staticmethod
     def _dump(dbg, rid, ctx, completed, text):

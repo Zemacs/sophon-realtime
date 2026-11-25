@@ -376,7 +376,9 @@ class BoundedWait(unittest.TestCase):
     def _speech_100(self, cut):
         with FakeClock(time.monotonic()) as c:
             plugin, buf = self._session(cut)
-            _feed(buf, c, 0.1, 0.0)
+            q, buf.say_q[:] = list(buf.say_q), []                 # warm-up silence runs with an empty queue: with nothing playing (cut=False)
+            _feed(buf, c, 0.1, 0.0)                               # it would emit the say right here and leave its reservation in flight
+            buf.say_q[:] = q; self.assertEqual(buf.reservations, [])
             self.assertIsNone(_feed(buf, c, 0.1, 0.1))            # exactly 5 voiced frames: onset with speech_ms = 100
             self.assertEqual(buf.speech_ms, 100)
             t_last = buf.t_voice
@@ -394,6 +396,48 @@ class BoundedWait(unittest.TestCase):
         plugin, buf = self._speech_100(cut=True)
         self.assertNotIn("resp-a", plugin._reqs)
         self.assertIn(UPPER, buf.history[0]["a_text"]); self.assertIn("被打断", buf.history[0]["a_text"])
+
+    def test_say_sent_during_warmup_then_speech_100_not_stuck(self):
+        """The original input: the queued say goes out during the warm-up silence (nothing playing). It then goes through the
+        framework's own path -- plan_append, reservation commit, stage-0 text and stage-2 audio outputs, finish -- and plays out
+        in real time. Only after that does the user make a 100 ms sound (not a barge-in). Driven by time and energy only."""
+        import numpy as np
+        with FakeClock(time.monotonic()) as c:
+            plugin, buf = self._session(cut=False)
+            plugin._render = lambda msgs, tools=None: ""
+            plugin.data_plane.encode_audio = lambda *a, **k: "AAAA"      # the framework's encoder: audio reaches the client
+            got = _feed(buf, c, 0.1, 0.0)                                 # warm-up silence: the say is emitted here (as in the original input)
+            self.assertIsNotNone(got); self.assertEqual(got.payload.get("say"), "排队的消息")
+            self.assertEqual(len(buf.reservations), 1); self.assertTrue(buf.inflight_t)
+            plugin.plan_append(request_id="say-1", fence=None, session_config=None, runtime_config={}, seq=1, turn_seq=1,
+                               payload=got.payload, final=True, sampling_params=None)
+            got.commit()                                                  # the framework accepted the append: the reservation is consumed
+            self.assertEqual(buf.reservations, [])
+            ctx = {"modalities": ("text", "audio"), "response_format": "pcm16"}
+            out0 = types.SimpleNamespace(request_id="say-1", stage_id=0, finished=True, multimodal_output=None,
+                                         outputs=[types.SimpleNamespace(text="排队的消息", multimodal_output={})])
+            list(plugin.data_plane.project({"data_plane_outputs": [out0]}, context=ctx))
+            self.assertEqual(buf.inflight_t, 0.0)                         # first output of the say clears the in-flight mark
+            c.t += 0.05
+            out2 = types.SimpleNamespace(request_id="say-1", stage_id=2, finished=True, outputs=[],
+                                         multimodal_output={"audio": np.full(D.SR, 0.1, np.float32), "sr": D.SR})
+            list(plugin.data_plane.project({"data_plane_outputs": [out2]}, context=ctx))   # 1.0 s of audio, generation finished
+            self.assertNotIn("say-1", plugin._reqs)
+            self.assertIsNotNone(buf.last_play); self.assertAlmostEqual(buf.last_play["dur"], 1.0, places=3)
+            self.assertIsNone(_feed(buf, c, 1.2, 0.0))                    # the client plays it out (1.0 s) and a bit of silence follows
+            self.assertTrue(buf._quiet_out())
+            self.assertIsNone(_feed(buf, c, 0.1, 0.1))                    # a 100 ms sound after playback ended: not a barge-in
+            self.assertEqual(buf.speech_ms, 100); self.assertIsNone(buf.cut)
+            t_last = buf.t_voice
+            buf.say_q.append("第二条消息")                                # another say arrives while the short sound is pending
+            self.assertIsNone(_feed(buf, c, D.FALLBACK_S - 0.2, 0.0))     # before FB: still waiting
+            got2 = _feed(buf, c, 0.5, 0.0)
+            self.assertIsNotNone(got2); self.assertEqual(got2.payload.get("say"), "第二条消息")
+            self.assertLessEqual(c.t - t_last, D.FALLBACK_S + 0.25)       # released within FB, not after RES_TIMEOUT
+            got2.commit()
+            self.assertEqual(buf.reservations, []); self.assertEqual(buf.say_q, []); self.assertEqual(buf.speech_ms, 0)
+            self.assertEqual(plugin._reqs, {})                            # no reply left behind
+            self.assertEqual(buf.history[-1]["a_text"], "排队的消息")
 
     def _long_sentence(self, fb_s, pause1, pause2):
         with FakeClock(time.monotonic()) as c:

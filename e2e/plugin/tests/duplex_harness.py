@@ -82,24 +82,35 @@ def new_buf(m):
     return b
 
 
-# ---------------------------------------------------------------- Silero as the framework reports it
-class Silero:
+# ---------------------------------------------------------------- the host framework's server VAD, as the plugin sees it
+class FrameworkVAD:
+    """Stand-in for the host's SileroStreamingVAD (vllm-omni 0.30.0, engine/duplex/vad.py, SileroStreamingVAD.process, default config: threshold 0.5,
+    min_speech 96 ms, silence 500 ms, negative threshold 0.35), run on the repo's real Silero ONNX. process() returns what the plugin receives as
+    payload['is_speech']: speech active at the start of the chunk or confirmed within it."""
     def __init__(self):
         import onnxruntime as ort
-        self.sess = ort.InferenceSession(str(SILERO), providers=["CPUExecutionProvider"]); self.reset()
+        self.sess = ort.InferenceSession(str(SILERO), providers=["CPUExecutionProvider"])
+        self.state = np.zeros((2, 1, 128), np.float32); self.ctx = np.zeros(64, np.float32); self.rem = np.zeros(0, np.float32)
+        self.active = False; self.cand = 0; self.sil = 0; self.max_p = 0.0
 
-    def reset(self):
-        self.state = np.zeros((2, 1, 128), np.float32); self.ctx = np.zeros(64, np.float32); self.rem = np.zeros(0, np.float32); self.last = 0.0
-
-    def chunk_prob(self, a):
-        """max speech probability over the 512-sample frames completed by this chunk (what payload['vad']['speech_probability'] carries)."""
-        x = np.concatenate([self.rem, a]); n = x.size // 512; self.rem = x[n * 512:].copy(); ps = []
+    def process(self, a):
+        x = np.concatenate([self.rem, a]); n = x.size // 512; self.rem = x[n * 512:].copy(); contained = self.active
         for i in range(n):
             fr = x[i * 512:(i + 1) * 512]
             p, self.state = self.sess.run(None, {"input": np.concatenate([self.ctx, fr])[None].astype(np.float32), "state": self.state, "sr": np.array(16000, np.int64)})
-            self.ctx = fr[-64:]; ps.append(float(p[0][0]))
-        self.last = max(ps) if ps else self.last
-        return self.last
+            self.ctx = fr[-64:]; p = float(p[0][0]); self.max_p = max(self.max_p, p)
+            if self.active:
+                contained = True
+                if p >= 0.5: self.sil = 0; continue
+                neg = p < 0.35
+                if not neg and self.sil == 0: continue
+                self.sil += 512
+                if neg and self.sil >= 8000: self.active = False; self.sil = 0
+            elif p >= 0.5:
+                self.cand += 512
+                if self.cand >= 1536: self.active = True; self.cand = self.sil = 0; contained = True
+            else: self.cand = 0
+        return contained
 
 
 _VOWELS = np.array([(730, 1090, 2440), (270, 2290, 3010), (300, 870, 2240), (530, 1840, 2480), (570, 840, 2410), (660, 1720, 2410), (440, 1020, 2240), (850, 1220, 2810)], float)
@@ -149,29 +160,25 @@ def noise(kind: str, n: int, rms: float, seed: int) -> np.ndarray:
 
 
 # ---------------------------------------------------------------- driving a buffer
-_PROBS: dict = {}
+def chunks(audio: np.ndarray, ms: int = 100):
+    """[(100 ms chunk, framework is_speech verdict)] for one stream."""
+    v = FrameworkVAD(); n = SR * ms // 1000; return [(audio[i:i + n], v.process(audio[i:i + n])) for i in range(0, len(audio), n)]
 
 
-def chunks(audio: np.ndarray, key=None, ms: int = 100):
-    """[(chunk, silero_prob)] for 100 ms appends; Silero runs once per distinct `key` and is cached."""
-    n = SR * ms // 1000; parts = [audio[i:i + n] for i in range(0, len(audio), n)]
-    if key is None or key not in _PROBS:
-        v = Silero(); ps = [v.chunk_prob(c) for c in parts]
-        if key is not None: _PROBS[key] = ps
-    else: ps = _PROBS[key]
-    return list(zip(parts, ps))
+def framework_heard_speech(audio: np.ndarray) -> bool:
+    return any(fw for _, fw in chunks(audio))
 
 
-def payload(chunk: np.ndarray, prob=None) -> dict:
+def payload(chunk: np.ndarray, fw=None) -> dict:
     p = {"audio": base64.b64encode(chunk.astype("<f4").tobytes()).decode(), "format": "pcm_f32le", "sample_rate_hz": SR}
-    if prob is not None: p["vad"] = {"speech_probability": prob, "backend": "silero"}
+    if fw is not None: p["is_speech"] = fw
     return p
 
 
-def append(m, buf, chunk, prob=None, *, ms=100):
+def append(m, buf, chunk, fw=None, *, ms=100):
     """One framework append at virtual time +ms; then runs the turn-question threads the plugin queued. Returns the reservation (committed)."""
     m.time.t += ms / 1000
-    r = buf.prepare_append(payload(chunk, prob), operation_id="op", chunk_period_ms=ms, allow_emit=True)
-    if r is not None: r.commit()
+    r = buf.prepare_append(payload(chunk, fw), operation_id="op", chunk_period_ms=ms, allow_emit=True)
+    if r is not None: r.commit(); buf.inflight_t = 0.0        # the engine accepted it and its first output cleared inflight (the data plane does this)
     while InlineThreads.Thread_queue: InlineThreads.Thread_queue.pop(0)()
     return r

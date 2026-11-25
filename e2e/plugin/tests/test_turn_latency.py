@@ -18,8 +18,8 @@ def measure(m, peak):
         orig = buf._start_check
         def wrapped(thr, idx, _o=orig, _r=rec): _r.setdefault("check", m.time.t - t0); _o(thr, idx)
         buf._start_check = wrapped; tr = buf.t_reply
-        for c, p in h.chunks(x, ("lat", s, peak, float(lead))):
-            h.append(m, buf, c, p)
+        for c, fw in h.chunks(x):
+            h.append(m, buf, c, fw)
             if buf.t_reply != tr: rec.setdefault("reply", m.time.t - t0); tr = buf.t_reply
         assert "check" in rec and "reply" in rec, (s, peak)
         check.append(rec["check"] - end); audio.append(rec["reply"] - end)

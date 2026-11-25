@@ -35,11 +35,12 @@ SR = 16000
 CHECKS = [float(x) for x in os.environ.get("SOPHON_TURN_CHECKS", "0.2,0.35,0.5,0.8,1.3,2.0").split(",")]
 THRS = [float(x) for x in os.environ.get("SOPHON_TURN_THRESHOLDS", "0.95,0.85,0.7,0.5,0.35,0.25").split(",")]
 SPEECH_PROB = float(os.environ.get("SOPHON_SPEECH_PROB", "0.5"))
-# Opening a user turn. When the framework's server VAD (Silero) is on, each append carries payload["vad"]["speech_probability"] (max over the chunk's
-# 32 ms frames) and a turn opens once that stays >= TURN_START_PROB for TURN_START_MS of 20 ms energy frames. Without it the energy rule is used.
-TURN_START_PROB = float(os.environ.get("SOPHON_TURN_START_PROB", "0.5"))    # Silero speech probability that counts a frame as voiced
+# Opening a user turn. The host framework runs Silero (its server VAD) and hands the plugin its verdict as payload["is_speech"] (Silero-confirmed speech: probability >= the
+# client's turn_detection.threshold for >= min_speech_duration_ms, held through silence_duration_ms; the probability itself is not forwarded). A turn opens on the rising
+# edge of that flag once it has stayed true for TURN_START_MS; threshold and minimum speech are the client's turn_detection settings. Without the flag (older host),
+# the energy rule below is the FALLBACK, not a fix: it is still an energy judgment.
 TURN_START_MS = float(os.environ.get("SOPHON_TURN_START_MS", "100"))        # voiced time needed to open a turn
-# Absolute RMS floor for the energy rule (and for the "voiced" test above). 0 = relative to the adaptive noise floor only (thr = 3.5 x noise); the old fixed floor was 0.012.
+# FALLBACK only (no framework verdict): absolute RMS floor of the energy rule. 0 = relative to the adaptive noise floor only (thr = 3.5 x noise); the old fixed floor was 0.012.
 ENERGY_FLOOR = float(os.environ.get("SOPHON_TURN_ENERGY_FLOOR", "0"))
 SPEC_AT = float(os.environ.get("SOPHON_SPEC_AT", "0.05"))       # after this much silence, speculatively start writing a reply (held silent until DuplexJev judges the turn finished); <=0 disables
 RES_TIMEOUT = float(os.environ.get("SOPHON_RES_TIMEOUT", "15"))  # an append not confirmed by the framework within this time is rolled back (and a reply resent)
@@ -302,13 +303,14 @@ class SophonBuffer(PcmAppendBuffer):
     lock: threading.Lock = field(default_factory=threading.Lock)
     owner_release: object = None                             # injected by the plugin: release a speculative reply (returns False if it already finished generating and can't be released)
     owner_drop: object = None
+    fw_prev: bool = False                                    # previous append's framework is_speech
+    fw_armed: bool = False                                   # a rising edge of is_speech has been seen since the last turn reset
     session_id: str | None = None                            # set from the append fence; labels the turn-check spans
     turn_id: int = 0                                         # user turns opened so far
     span_sink: object = None                                 # optional callable(record) that also receives every span record
     _root_span: str = field(default_factory=lambda: os.urandom(8).hex())
     _turn_span: str | None = None
     _cand_span: str | None = None
-    _gate_logged: bool = False
 
     @property
     def pending_byte_count(self): return len(self.utt)
@@ -330,7 +332,7 @@ class SophonBuffer(PcmAppendBuffer):
         return sid
 
     def _reset_turn(self):
-        self.pc_hit = False; self.seg_rms = []; self.tool_followup = False; self.max_pf = 0.0; self.last_pb = 0.0; self.spec_id = None; self.gen += 1; self.utt.clear(); self.speech_ms = 0.0; self.silence_ms = 0.0; self.next_check = 0; self.voiced_ms = 0.0
+        self.fw_armed = False; self.pc_hit = False; self.seg_rms = []; self.tool_followup = False; self.max_pf = 0.0; self.last_pb = 0.0; self.spec_id = None; self.gen += 1; self.utt.clear(); self.speech_ms = 0.0; self.silence_ms = 0.0; self.next_check = 0; self.voiced_ms = 0.0
         self.pending_reply = False; self.check_inflight = False; self.decision = None; self.decision_ready = False; self.resume_pending = False
 
     def _not_sent(self, payload):
@@ -374,8 +376,9 @@ class SophonBuffer(PcmAppendBuffer):
             with self.lock: self.frame = vf[0]; self.frame_t = time.monotonic()
         raw = base64.b64decode(payload.get("audio", ""), validate=True)
         dur = len(raw) / 4 / SR * 1000.0
-        vad = payload.get("vad"); prob = vad.get("speech_probability") if isinstance(vad, Mapping) else None
-        prob = float(prob) if isinstance(prob, (int, float)) else None     # None: no server VAD on this session -> energy rule
+        fw = payload.get("is_speech") if isinstance(payload.get("is_speech"), bool) else None       # None: host sends no verdict -> energy fallback
+        if fw and not self.fw_prev: self.fw_armed = True                                           # rising edge = Silero speech start
+        self.fw_prev = bool(fw)
         # silence timing uses a 20 ms energy VAD (adaptive noise floor, same rule as the testbench gateway); the framework's is_speech has a silence_duration tail and Silero probabilities also linger ~0.5 s
         x = np.frombuffer(raw, dtype="<f4")
         with self.lock:
@@ -387,20 +390,20 @@ class SophonBuffer(PcmAppendBuffer):
                     self._rms_hist.append(r)
                     nm = min(self._rms_hist)
                     self.noise = nm if nm < self.noise else 0.97 * self.noise + 0.03 * nm
-                if prob is not None and r < self.noise: self.noise = 0.9 * self.noise + 0.1 * r      # with no 0.012 floor, a stale 0.003 start value would swallow quiet speech: let the floor fall fast
+                if fw is not None and r < self.noise: self.noise = 0.9 * self.noise + 0.1 * r      # with no 0.012 floor, a stale 0.003 start value would swallow quiet speech: let the floor fall fast
                 thr = max(ENERGY_FLOOR, max(self.noise, 1e-4) * 3.5)
                 if self.speech_ms == 0:
                     self.pre.extend(fb)
                     if len(self.pre) > int(0.6 * SR) * 4: del self.pre[: len(self.pre) - int(0.6 * SR) * 4]
-                    if prob is not None: voiced = prob >= TURN_START_PROB and r > ENERGY_FLOOR; why = "prob_below_threshold" if prob < TURN_START_PROB else "energy_below_floor"
+                    if fw is not None: voiced = fw and (self.fw_armed or r > thr); why = "framework_not_speech" if not fw else "energy_below_threshold"   # disarmed: the flag may be the previous utterance's tail
                     else: voiced = r > thr; why = "energy_below_threshold"
-                    sp = dict(speech_prob=prob, rms=round(r, 6), noise_floor=round(self.noise, 6), thr_prob=TURN_START_PROB, thr_energy=round(thr, 6),
-                              energy_floor=ENERGY_FLOOR, min_voiced_ms=TURN_START_MS, path="silero" if prob is not None else "energy")
+                    sp = dict(framework_is_speech=fw, armed=self.fw_armed, rms=round(r, 6), noise_floor=round(self.noise, 6), thr_energy=round(thr, 6),
+                              energy_floor=ENERGY_FLOOR, min_voiced_ms=TURN_START_MS, source="framework_vad" if fw is not None else "energy")
                     if voiced:
                         if self.voiced_ms == 0: self._cand_span = self._span("turn_check.start", "started", "voiced_candidate", turn=self.turn_id + 1, **sp)
                         self.voiced_ms += 20
                         if self.voiced_ms >= TURN_START_MS:
-                            self.turn_id += 1; self._span("turn_check.accepted", "accepted", "voiced_min_duration_met", span_id=self._cand_span, voiced_ms=self.voiced_ms, **sp)
+                            self.turn_id += 1; self._span("turn_started", "started", "voiced_min_duration_met", span_id=self._cand_span, voiced_ms=self.voiced_ms, **sp)
                             self._turn_span = self._cand_span
                             lp = self.last_play; self.last_play = None
                             if lp is not None:
@@ -430,9 +433,6 @@ class SophonBuffer(PcmAppendBuffer):
                             self.utt.extend(self.pre); self.pre.clear(); self.speech_ms = self.voiced_ms; self.silence_ms = 0.0; self.next_check = 0
                     else:
                         if self.voiced_ms > 0: self._span("turn_check.rejected", "rejected", "voiced_ms_below_min", span_id=self._cand_span, turn=self.turn_id + 1, voiced_ms=self.voiced_ms, broken_by=why, **sp)
-                        elif prob is not None and prob >= TURN_START_PROB:        # Silero says speech but the energy floor blocks it: log once per run, not per frame
-                            if not self._gate_logged: self._gate_logged = True; self._span("turn_check.rejected", "rejected", why, turn=self.turn_id + 1, **sp)
-                        else: self._gate_logged = False
                         self.voiced_ms = 0; self.noise = 0.98 * self.noise + 0.02 * min(r, 0.05)
                 else:
                     self.utt.extend(fb)

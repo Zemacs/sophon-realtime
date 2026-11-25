@@ -304,6 +304,7 @@ class SophonBuffer(PcmAppendBuffer):
     lock: threading.Lock = field(default_factory=threading.Lock)
     owner_release: object = None                             # injected by the plugin: release a speculative reply (returns False if it already finished generating and can't be released)
     owner_drop: object = None
+    input_cut: bool = False                                  # the framework just cleared input for a barge-in / input cancel (no append since)
 
     @property
     def pending_byte_count(self): return len(self.utt)
@@ -312,7 +313,7 @@ class SophonBuffer(PcmAppendBuffer):
         # The framework calls clear() at reply end, barge-in, etc.: drop only unconfirmed appends, keep this turn's user speech --
         # the user may already be talking (what they said while barging in is the start of the next utterance); clearing it would lose that and cause a false "finished"
         for r in self.reservations: r._active = False
-        self.reservations.clear(); self.check_inflight = False; self.decision = None
+        self.reservations.clear(); self.check_inflight = False; self.decision = None; self.input_cut = True
 
     def _reset_turn(self):
         self.pc_hit = False; self.seg_rms = []; self.tool_followup = False; self.max_pf = 0.0; self.last_pb = 0.0; self.spec_id = None; self.gen += 1; self.utt.clear(); self.speech_ms = 0.0; self.silence_ms = 0.0; self.next_check = 0; self.voiced_ms = 0.0
@@ -342,7 +343,7 @@ class SophonBuffer(PcmAppendBuffer):
             logger.info("sophon duplex: discarded turn -> previous reply kept (merge undone)")
         self.mute_rid = None; self.merge_pending = False
 
-    def clear_force_listen(self): pass
+    def clear_force_listen(self): self.input_cut = True          # the framework calls this when overlapping user speech barges in
     def has_pending(self): return bool(self.utt)
     def has_reserved(self): return bool(self.reservations)
 
@@ -366,6 +367,7 @@ class SophonBuffer(PcmAppendBuffer):
             with self.lock: self.frame = vf[0]; self.frame_t = time.monotonic()
         raw = base64.b64decode(payload.get("audio", ""), validate=True)
         dur = len(raw) / 4 / SR * 1000.0
+        self.input_cut = False
         # silence timing uses a 20 ms energy VAD (adaptive noise floor, same rule as the testbench gateway); the framework's is_speech has a silence_duration tail and Silero probabilities also linger ~0.5 s
         x = np.frombuffer(raw, dtype="<f4")
         with self.lock:
@@ -563,7 +565,7 @@ class SophonDataPlane(DuplexDataPlane):
     def begin_request(self, request_id): self.terminal.discard(request_id)
     def is_terminal(self, request_id): return request_id in self.terminal
     def mark_terminal(self, request_id): self.terminal.add(request_id)
-    def close_stream(self, request_id): pass
+    def close_stream(self, request_id): self.plugin._stream_closed(request_id)
     def close_session(self, session_id, *, active_request_id=None): pass
 
     def project(self, result, *, context=None):
@@ -821,8 +823,7 @@ class SophonRealtimeDuplexPlugin(DuplexModelPlugin):
                     buf.history.pop(); buf.last_said = buf.history[-1]["a_text"] if buf.history else ""
             for rid0, info0 in list(self._reqs.items()):   # a previous reply still pending = interrupted: record the text spoken so far in history (unreleased speculative replies are simply dropped)
                 if info0.get("kind") == "reply" and info0.get("buf") is buf:
-                    if info0.get("released"): self._finish_reply(rid0, completed=False)
-                    else: self._reqs.pop(rid0, None)
+                    self._retire_reply(rid0, info0)
         voice = str(runtime_config.get("voice") or "chelsie")
         addl = {"speaker": [voice], "language": [lang], "sophon_kind": [kind]}
         dbg = os.environ.get("SOPHON_DEBUG_DIR")
@@ -923,6 +924,24 @@ class SophonRealtimeDuplexPlugin(DuplexModelPlugin):
         mm = {"audio": audios}
         if images: mm["image"] = images
         return DuplexAppendPlan(prompt={"prompt": self._render(msgs, tools), "multi_modal_data": mm, "additional_information": addl})
+
+    def _retire_reply(self, rid, info):
+        """End a reply that will produce no more output: a released one goes to history as interrupted, an unreleased speculative one is dropped.
+        Safe to call more than once and concurrently with _finish_reply: whoever pops the request first finishes it."""
+        if info.get("released"): self._finish_reply(rid, completed=False)
+        else: self._reqs.pop(rid, None)
+
+    def _stream_closed(self, request_id):
+        """The framework closed a reply's stream (response cancelled). Its remaining output is dropped by the framework, so the reply would
+        otherwise stay "active" until the next user turn and block queued says. A client cancel ends it now; a cut by user speech
+        (barge-in, input cancel) is still ended when the user's next turn is planned, as before, so the heard-part estimate is unchanged."""
+        info = self._reqs.get(request_id) or self._match(request_id); rid = request_id
+        if info is not None and request_id not in self._reqs:
+            rid = next((k for k, v in list(self._reqs.items()) if v is info), None)
+        if info is None or rid is None or info.get("kind") != "reply" or info.get("buf") is None or info["buf"].input_cut:
+            return
+        logger.info("sophon duplex: reply %s cancelled -> ended", rid[-24:])
+        self._retire_reply(rid, info)
 
     def _active_reply(self, bid):
         for rid, info in list(self._reqs.items()):

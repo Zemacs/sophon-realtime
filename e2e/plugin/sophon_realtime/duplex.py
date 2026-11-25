@@ -36,6 +36,13 @@ SR = 16000
 CHECKS = [float(x) for x in os.environ.get("SOPHON_TURN_CHECKS", "0.2,0.35,0.5,0.8,1.3,2.0").split(",")]
 THRS = [float(x) for x in os.environ.get("SOPHON_TURN_THRESHOLDS", "0.95,0.85,0.7,0.5,0.35,0.25").split(",")]
 SPEECH_PROB = float(os.environ.get("SOPHON_SPEECH_PROB", "0.5"))
+# Opening a user turn. The host framework runs Silero (its server VAD) and hands the plugin its verdict as payload["is_speech"] (Silero-confirmed speech: probability >= the
+# client's turn_detection.threshold for >= min_speech_duration_ms, held through silence_duration_ms; the probability itself is not forwarded). A turn opens on the rising
+# edge of that flag once it has stayed true for TURN_START_MS; threshold and minimum speech are the client's turn_detection settings. Without the flag (older host),
+# the energy rule below is the FALLBACK, not a fix: it is still an energy judgment.
+TURN_START_MS = float(os.environ.get("SOPHON_TURN_START_MS", "100"))        # voiced time needed to open a turn
+# FALLBACK only (no framework verdict): absolute RMS floor of the energy rule. 0 = relative to the adaptive noise floor only (thr = 3.5 x noise); the old fixed floor was 0.012.
+ENERGY_FLOOR = float(os.environ.get("SOPHON_TURN_ENERGY_FLOOR", "0"))
 SPEC_AT = float(os.environ.get("SOPHON_SPEC_AT", "0.05"))       # after this much silence, speculatively start writing a reply (held silent until DuplexJev judges the turn finished); <=0 disables
 RES_TIMEOUT = float(os.environ.get("SOPHON_RES_TIMEOUT", "15"))  # an append not confirmed by the framework within this time is rolled back (and a reply resent)
 SPEC_MIN_SPEECH = float(os.environ.get("SOPHON_SPEC_MIN_SPEECH", "0.3"))   # only draft speculatively once the user has spoken this long (s)
@@ -297,6 +304,8 @@ class SophonBuffer(PcmAppendBuffer):
     bridge_key: str | None = None
     call_entry: dict = field(default_factory=dict)           # client mode: call_id -> history entry the call belongs to
     early_calls: list = field(default_factory=list)          # client mode: calls already announced when the thinker finished (before the audio did)
+    known_calls: dict = field(default_factory=dict)          # client mode: call_id -> tool name of every call announced to the gateway (bounded)
+    early_results: dict = field(default_factory=dict)        # client mode: call_id -> [(output, speak)] that arrived before the announcing reply finished (no history entry yet)
     cut: dict | None = None                                  # last reply cut off by the user speaking: {"t", "said" (text actually heard), "rid"}
     resume_pending: bool = False                             # the model judged this as a back-channel: continue the cut reply
     owner_active: object = None                              # injected by the plugin: the reply now playing (rid, text, seconds generated, start time, prefix)
@@ -304,6 +313,15 @@ class SophonBuffer(PcmAppendBuffer):
     lock: threading.Lock = field(default_factory=threading.Lock)
     owner_release: object = None                             # injected by the plugin: release a speculative reply (returns False if it already finished generating and can't be released)
     owner_drop: object = None
+    say_out: bool = False                                    # the last reply emitted is a say that has not ended yet
+    fw_prev: bool = False                                    # previous append's framework is_speech
+    fw_armed: bool = False                                   # a rising edge of is_speech has been seen since the last turn reset
+    session_id: str | None = None                            # set from the append fence; labels the turn-check spans
+    turn_id: int = 0                                         # user turns opened so far
+    span_sink: object = None                                 # optional callable(record) that also receives every span record
+    _root_span: str = field(default_factory=lambda: os.urandom(8).hex())
+    _turn_span: str | None = None
+    _cand_span: str | None = None
 
     @property
     def pending_byte_count(self): return len(self.utt)
@@ -314,8 +332,18 @@ class SophonBuffer(PcmAppendBuffer):
         for r in self.reservations: r._active = False
         self.reservations.clear(); self.check_inflight = False; self.decision = None
 
+    def _span(self, name, status, reason, *, span_id=None, turn=None, **attrs):
+        """One structured turn-check record (OTel-like span fields), logged as JSON; a candidate's start / accepted / rejected records share one span_id."""
+        sid = span_id or os.urandom(8).hex()
+        rec = {"name": name, "status": status, "reason": reason, "session_id": self.session_id or f"buf-{id(self):x}",
+               "turn_id": self.turn_id if turn is None else turn, "span_id": sid, "parent_span_id": self._turn_span or self._root_span,
+               "t_mono": time.monotonic(), "t_wall": time.time(), **attrs}
+        logger.info("sophon.span %s", json.dumps(rec, sort_keys=True))
+        if self.span_sink is not None: self.span_sink(rec)
+        return sid
+
     def _reset_turn(self):
-        self.pc_hit = False; self.seg_rms = []; self.tool_followup = False; self.max_pf = 0.0; self.last_pb = 0.0; self.spec_id = None; self.gen += 1; self.utt.clear(); self.speech_ms = 0.0; self.silence_ms = 0.0; self.next_check = 0; self.voiced_ms = 0.0
+        self.fw_armed = False; self.pc_hit = False; self.seg_rms = []; self.tool_followup = False; self.max_pf = 0.0; self.last_pb = 0.0; self.spec_id = None; self.gen += 1; self.utt.clear(); self.speech_ms = 0.0; self.silence_ms = 0.0; self.next_check = 0; self.voiced_ms = 0.0
         self.pending_reply = False; self.check_inflight = False; self.decision = None; self.decision_ready = False; self.resume_pending = False
 
     def _not_sent(self, payload):
@@ -353,6 +381,13 @@ class SophonBuffer(PcmAppendBuffer):
         lp = self.last_play
         return lp is None or time.monotonic() >= lp["t0"] + lp["dur"]
 
+    def _say_busy(self):
+        """A say is being generated or still playing: a tool follow-up waits for it (a non-interruptible say must not be cut by our own reply)."""
+        lp = self.last_play
+        if lp is not None and lp.get("say") and time.monotonic() < lp["t0"] + lp["dur"]:
+            return True
+        return self.say_out and self.owner_active is not None and self.owner_active(id(self)) is not None
+
     def _res(self, op, payload):
         r = _Res(self, op, payload); r.t0 = time.monotonic(); self.reservations.append(r)
         if payload is not None: self.inflight_t = r.t0
@@ -366,6 +401,9 @@ class SophonBuffer(PcmAppendBuffer):
             with self.lock: self.frame = vf[0]; self.frame_t = time.monotonic()
         raw = base64.b64decode(payload.get("audio", ""), validate=True)
         dur = len(raw) / 4 / SR * 1000.0
+        fw = payload.get("is_speech") if isinstance(payload.get("is_speech"), bool) else None       # None: host sends no verdict -> energy fallback
+        if fw and not self.fw_prev: self.fw_armed = True                                           # rising edge = Silero speech start
+        self.fw_prev = bool(fw)
         # silence timing uses a 20 ms energy VAD (adaptive noise floor, same rule as the testbench gateway); the framework's is_speech has a silence_duration tail and Silero probabilities also linger ~0.5 s
         x = np.frombuffer(raw, dtype="<f4")
         with self.lock:
@@ -377,13 +415,21 @@ class SophonBuffer(PcmAppendBuffer):
                     self._rms_hist.append(r)
                     nm = min(self._rms_hist)
                     self.noise = nm if nm < self.noise else 0.97 * self.noise + 0.03 * nm
-                thr = max(0.012, self.noise * 3.5)
+                if fw is not None and r < self.noise: self.noise = 0.9 * self.noise + 0.1 * r      # with no 0.012 floor, a stale 0.003 start value would swallow quiet speech: let the floor fall fast
+                thr = max(ENERGY_FLOOR, max(self.noise, 1e-4) * 3.5)
                 if self.speech_ms == 0:
                     self.pre.extend(fb)
                     if len(self.pre) > int(0.6 * SR) * 4: del self.pre[: len(self.pre) - int(0.6 * SR) * 4]
-                    if r > thr:
+                    if fw is not None: voiced = fw and (self.fw_armed or r > thr); why = "framework_not_speech" if not fw else "energy_below_threshold"   # disarmed: the flag may be the previous utterance's tail
+                    else: voiced = r > thr; why = "energy_below_threshold"
+                    sp = dict(framework_is_speech=fw, armed=self.fw_armed, rms=round(r, 6), noise_floor=round(self.noise, 6), thr_energy=round(thr, 6),
+                              energy_floor=ENERGY_FLOOR, min_voiced_ms=TURN_START_MS, source="framework_vad" if fw is not None else "energy")
+                    if voiced:
+                        if self.voiced_ms == 0: self._cand_span = self._span("turn_check.start", "started", "voiced_candidate", turn=self.turn_id + 1, **sp)
                         self.voiced_ms += 20
-                        if self.voiced_ms >= 100:
+                        if self.voiced_ms >= TURN_START_MS:
+                            self.turn_id += 1; self._span("turn_started", "started", "voiced_min_duration_met", span_id=self._cand_span, voiced_ms=self.voiced_ms, **sp)
+                            self._turn_span = self._cand_span
                             lp = self.last_play; self.last_play = None
                             if lp is not None:
                                 played = time.monotonic() - lp["t0"] - 0.25     # onset detection lags ~0.1 s + client buffering ~60 ms, etc.
@@ -411,6 +457,7 @@ class SophonBuffer(PcmAppendBuffer):
                             self.prev_user = None
                             self.utt.extend(self.pre); self.pre.clear(); self.speech_ms = self.voiced_ms; self.silence_ms = 0.0; self.next_check = 0
                     else:
+                        if self.voiced_ms > 0: self._span("turn_check.rejected", "rejected", "voiced_ms_below_min", span_id=self._cand_span, turn=self.turn_id + 1, voiced_ms=self.voiced_ms, broken_by=why, **sp)
                         self.voiced_ms = 0; self.noise = 0.98 * self.noise + 0.02 * min(r, 0.05)
                 else:
                     self.utt.extend(fb)
@@ -431,12 +478,12 @@ class SophonBuffer(PcmAppendBuffer):
             if self.inflight_t and now - self.inflight_t > 3.0:
                 self.inflight_t = 0.0
             if self.say_q and self.speech_ms == 0 and allow_emit and not self.reservations and not self.inflight_t and self._quiet_out():
-                text = self.say_q.pop(0); self.prev_user = None; self.t_reply = time.monotonic()
+                text = self.say_q.pop(0); self.prev_user = None; self.t_reply = time.monotonic(); self.say_out = True
                 p = {"audio": base64.b64encode(np.zeros(SR // 10, np.float32).tobytes()).decode(), "format": "pcm_f32le", "sample_rate_hz": SR,
                      "is_speech": True, "sophon_kind": "reply", "sophon_buf": id(self), "lang": self.lang, "say": text}
                 logger.info("sophon say: emitted (%d chars)", len(text))
                 return self._res(operation_id, p)
-            if self.tool_followup and self.speech_ms == 0 and allow_emit and not self.reservations and not self.inflight_t:
+            if self.tool_followup and self.speech_ms == 0 and allow_emit and not self.reservations and not self.inflight_t and not self._say_busy():
                 self.tool_followup = False; self.prev_user = None; self.t_reply = time.monotonic()
                 p = {"audio": base64.b64encode(np.zeros(SR // 10, np.float32).tobytes()).decode(), "format": "pcm_f32le", "sample_rate_hz": SR,
                      "is_speech": True, "sophon_kind": "reply", "sophon_buf": id(self), "lang": self.lang, "tool_followup": True}
@@ -511,6 +558,7 @@ class SophonBuffer(PcmAppendBuffer):
 
     def _start_check(self, thr, idx):
         audio = bytes(self.utt); said = self.last_said; lang = self.lang; gen = self.gen; t_emit = time.monotonic()
+        self._span("turn_check.question", "started", "silence_checkpoint" if idx else "periodic", checkpoint=idx, thr_finished=thr, silence_ms=self.silence_ms, speech_ms=self.speech_ms)
         def run():
             pb = 0.0
             try:
@@ -697,6 +745,8 @@ class SophonRealtimeDuplexPlugin(DuplexModelPlugin):
         self._spec_pending: dict[str, str] = {}              # speculative replies released/dropped before being planned: spec_id -> "release"/"drop"
         self._spec_lock = threading.Lock()
         self._keys: dict[str, SophonBuffer] = {}
+        self._session_keys: set[str] = set()                 # every bridge_key seen in a session config, bound to a buffer or not
+        self._open_key: str | None = None                    # key of the session being opened: manager.open runs prepare_runtime_config -> create_session_state with no await between
         self.bridge = _bridge.Bridge(self._bridge_result, self._bridge_say)
         global _WARM_STARTED
         if not _WARM_STARTED and os.environ.get("SOPHON_WARMUP", "1") != "0":
@@ -715,6 +765,9 @@ class SophonRealtimeDuplexPlugin(DuplexModelPlugin):
     def create_session_state(self):
         buf = SophonBuffer(); self._bufs[id(buf)] = buf
         buf.owner_release = self._release; buf.owner_drop = self._drop; buf.owner_active = self._active_reply
+        key, self._open_key = self._open_key, None
+        if key:                                              # register the bridge key now, not at the first reply plan: results are accepted from session start
+            buf.bridge_key = key; self._keys[key] = buf; self.bridge.start()
         return _SophonSessionState(audio_buffer=buf)
 
     def validate_client_extra_body(self, extra_body):
@@ -726,17 +779,20 @@ class SophonRealtimeDuplexPlugin(DuplexModelPlugin):
                 from transformers import AutoTokenizer
                 path = model_config.tokenizer if model_config is not None and getattr(model_config, "tokenizer", None) else model_config.model
                 self.tok = await asyncio.to_thread(AutoTokenizer.from_pretrained, path)
-        return self.runtime_config_for_update(config, {})
+        rc = self.runtime_config_for_update(config, {}); self._open_key = rc.get("bridge_key")
+        return rc
 
     def runtime_config_for_update(self, config, current):
         eb = config.extra_body if isinstance(config.extra_body, Mapping) else {}
         tools = eb.get("tools") if eb.get("tools") is not None else getattr(config, "tools", None)
+        bk = eb.get("bridge_key") if isinstance(eb.get("bridge_key"), str) else None
+        if bk: self._session_keys.add(bk)
         return {"instructions": config.instructions, "temperature": config.temperature, "max_tokens": config.max_tokens,
                 "tools": _tools.normalize_tools(tools), "tool_mocks": eb.get("tool_mocks") if isinstance(eb.get("tool_mocks"), Mapping) else {},
                 "voice": config.voice or "chelsie", "lang": str(eb.get("language") or "zh")[:2],
                 # per-session turn-taking knobs (optional): fallback after this much silence; minimum pause before speaking,
                 # applied only once the user has spoken at least min_release_after_s
-                "tool_mode": "client" if eb.get("tool_mode") == "client" else "mock", "bridge_key": eb.get("bridge_key") if isinstance(eb.get("bridge_key"), str) else None,
+                "tool_mode": "client" if eb.get("tool_mode") == "client" else "mock", "bridge_key": bk,
                 "history": eb.get("history") if isinstance(eb.get("history"), list) else [],
                 "turn_fallback_s": eb.get("turn_fallback_s"), "min_release_s": eb.get("min_release_s"), "min_release_after_s": eb.get("min_release_after_s")}
 
@@ -798,7 +854,7 @@ class SophonRealtimeDuplexPlugin(DuplexModelPlugin):
         buf = self._bufs.get(payload.get("sophon_buf"))
         kind = payload.get("sophon_kind") or "reply"
         if buf is not None and fence is not None:
-            with buf.lock: buf.last_turn = max(buf.last_turn or 0, int(getattr(fence, "turn_id", 0)))
+            with buf.lock: buf.session_id = buf.session_id or str(getattr(fence, "session_id", "") or "") or None; buf.last_turn = max(buf.last_turn or 0, int(getattr(fence, "turn_id", 0)))
         lang = runtime_config.get("lang") or "zh"
         if buf is not None:
             buf.lang = lang; buf.tool_mocks = runtime_config.get("tool_mocks") or {}
@@ -1047,7 +1103,8 @@ class SophonRealtimeDuplexPlugin(DuplexModelPlugin):
         with buf.lock:
             if completed and a is not None:
                 # the server generates much faster than real time: when generation "finishes" here the client is usually still playing. Record playback start and duration so history can be truncated at the actual playback position if the user cuts in
-                buf.last_play = {"t0": info.get("t_out") or time.monotonic(), "dur": a.size / SR, "entry": entry, "text": info["a_text"]}
+                buf.last_play = {"t0": info.get("t_out") or time.monotonic(), "dur": a.size / SR, "entry": entry, "text": info["a_text"], "say": info.get("say") is not None}
+            if info.get("say") is not None: buf.say_out = False
             if calls: entry["tool_calls"] = calls; entry["a_text"] = entry["a_text"].strip()
             buf.history.append(entry); buf.last_said = info["a_text"]
             while len(buf.history) > HIST_TURNS or (len(buf.history) > 1 and sum(h["user"].size for h in buf.history if h.get("user") is not None) / SR > HIST_SEC):
@@ -1060,7 +1117,11 @@ class SophonRealtimeDuplexPlugin(DuplexModelPlugin):
             return
         if buf.tool_mode == "client":
             with buf.lock:
-                for c in calls: buf.call_entry[c["id"]] = entry
+                for c in calls:
+                    buf.call_entry[c["id"]] = entry
+                    for out, speak in buf.early_results.pop(c["id"], ()):      # results that beat the reply's end
+                        entry.setdefault("chain", []).append({"results": [out]})
+                        if speak: buf.tool_followup = True
             return
         chain = entry.setdefault("chain", [])
         if len(chain) >= _tools.MAX_STEPS:
@@ -1079,6 +1140,9 @@ class SophonRealtimeDuplexPlugin(DuplexModelPlugin):
         if not calls or buf is None or buf.tool_mode != "client" or not buf.bridge_key:
             if calls and (buf is None or buf.tool_mode != "client"): info["announced"] = False   # mock mode: parse again at the end as before
             return
+        with buf.lock:
+            for c in calls: buf.known_calls[c["id"]] = c["name"]
+            while len(buf.known_calls) > 256: buf.known_calls.pop(next(iter(buf.known_calls)))
         for c in calls:
             logger.info("sophon tool: client call %s %s %s", c["id"], c["name"], json.dumps(c["arguments"], ensure_ascii=False)[:200])
             self.bridge.push(buf.bridge_key, {"type": "tool_call", "call_id": c["id"], "name": c["name"], "arguments": c["arguments"], "t": time.time()})
@@ -1093,18 +1157,30 @@ class SophonRealtimeDuplexPlugin(DuplexModelPlugin):
         return True
 
     def _bridge_result(self, key, call_id, output, speak):
+        ok, why = self._bridge_result_inner(key, call_id, output, speak)
+        (logger.info if ok else logger.warning)("sophon tool: result key=%s call=%s speak=%s -> %s (%s)", key, call_id, speak, "accepted" if ok else "REJECTED", why)
+        return ok, why
+
+    def _bridge_result_inner(self, key, call_id, output, speak):
         """A result from the gateway: attach it to the call's history entry (or the latest one) and, if it should be spoken, queue a follow-up reply."""
         buf = self._keys.get(key)
         if buf is None:
-            return False
+            return False, "session_not_ready" if key in self._session_keys else "unknown_session"
         with buf.lock:
+            inflight = [c for c in buf.known_calls if c not in buf.call_entry]
+            if call_id is None and len(inflight) == 1: call_id = inflight[0]
+            if call_id in buf.known_calls and call_id not in buf.call_entry:
+                # the reply that made the call has not finished, so its history entry does not exist yet (e.g. the user's first question): keep the result;
+                # _run_tools attaches it when the reply ends and the normal follow-up path (tool_followup, allow_emit) speaks it
+                buf.early_results.setdefault(call_id, []).append((output, speak))
+                return True, "queued"
             if not buf.history:
-                return False
+                return False, "turn_discarded" if call_id in buf.known_calls else "unknown_call_id" if call_id is not None else "no_pending_call"
             entry = buf.history[-1]          # the follow-up always answers from the latest turn (if the user spoke since the call, the result joins that turn)
             entry.setdefault("chain", []).append({"results": [output]})
             if speak: buf.tool_followup = True
         logger.info("sophon tool: client result call=%s speak=%s %s", call_id, speak, output[:200].replace("\n", " "))
-        return True
+        return True, "accepted"
 
     @staticmethod
     def _dump(dbg, rid, ctx, completed, text):

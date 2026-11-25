@@ -39,6 +39,25 @@ CJK = re.compile(r"[㐀-鿿]")
 EMOJI = re.compile("[\U0001F000-\U0001FAFF☀-➿️‍～~*#`_>]+")
 
 
+_SENT_END = "。！？.!?，,～…；;：:"
+_CLOSERS = "\"'“”‘’」』）)】》〉]}› \t"
+
+
+def lead_for(prev: str, lang: str) -> str:
+    """Separator put in front of a response when the previous one did not end a sentence (keeps the transcript readable).
+
+    A reply that ends with a closing quote / bracket after its sentence mark (``…腰带啊！”``, ``…消失。"``) HAS ended its
+    sentence: looking at the raw last character made every such reply leak a stray ``。`` into the next reply's text
+    (体验版 v1 / 3: 5 of 9 multi-turn runs). Look through the closers to the real last character."""
+    p = (prev or "").rstrip()
+    core = p.rstrip(_CLOSERS)
+    if not core:
+        return ""                                # nothing but quotes / brackets: not a dangling sentence either
+    if core[-1] in _SENT_END:
+        return ""
+    return "。" if lang == "zh" else ". "
+
+
 def clean_text(t: str, lang: str) -> str:
     """Transcript as spoken: no emoji / markdown symbols, no line breaks."""
     t = EMOJI.sub("", t).replace("\r", "")
@@ -48,17 +67,26 @@ def clean_text(t: str, lang: str) -> str:
 DELEGATE = {
     "zh": {"type": "function", "name": "delegate",
            "description": "把需要后端完成的事交给后端助手：查实时或外部信息（时间、日期、天气、新闻、搜索）、查用户的记忆和资料、控制设备或调用任何功能、"
-                          "看图。调用前先用一句很短的口语告诉用户你去处理一下。闲聊、常识和你自己就知道的知识直接回答，不要调用。",
+                          "看图。调用前的过渡语按类型说：查天气、新闻、搜索、记忆这类查询，说一句「我帮你查一下」；控制设备，说「好的，马上」；"
+                          "问时间日期、讲笑话这类很快的事，不要说过渡语，直接调用。闲聊、常识和你自己就知道的知识直接回答，不要调用。",
            "parameters": {"type": "object", "properties": {"task": {"type": "string", "description": "一句话写清楚用户要什么"}}, "required": ["task"]}},
     "en": {"type": "function", "name": "delegate",
            "description": "Hand work that needs the backend to the backend assistant: live or external information (time, date, weather, news, search), "
-                          "the user's memories and profile, controlling devices or calling any function, looking at images. Before calling, say one very short spoken phrase that you're on it. Answer chit-chat, general "
+                          "the user's memories and profile, controlling devices or calling any function, looking at images. Before calling, say a very short lead-in that fits the request: for lookups (weather, news, search, memory) \"Let me check\"; for device control \"Sure, on it\"; "
+                          "for quick things (the time or date, a joke) say nothing and call it right away. Answer chit-chat, general "
                           "knowledge and anything you already know yourself without calling it.",
            "parameters": {"type": "object", "properties": {"task": {"type": "string", "description": "What the user wants, in one sentence"}}, "required": ["task"]}},
 }
 SPOKEN_RULE = {"zh": "\n\n你的回复会被直接合成为语音说出来：用自然的口语，一般一两句；只写要说出口的话，不要写括号说明、表情或格式符号。",
                "en": "\n\nYour reply is spoken aloud: use natural spoken language, usually one or two sentences; write only the words to be "
                      "spoken, no parenthetical notes, emoji or markdown."}
+# The Tag plugin's built-in tool preamble (vLLM :8000, not ours to change) says "say 我帮你查一下 first" for every tool, which is
+# why the lead-in was the same for jokes and the time. The session system prompt is ours: it overrides that per request type.
+FILLER_RULE = {"zh": "\n\n调用 delegate 之前只说一句很短的过渡语，并且按类型：查天气、新闻、搜索、记忆，说「我帮你查一下」；控制设备，说「好的，马上」；"
+                     "问时间或日期、讲笑话，不要说任何过渡语，直接调用 delegate（这条优先于其他关于过渡语的举例）。",
+               "en": "\n\nBefore calling delegate say at most one very short lead-in, chosen by type: for weather, news, search, memory \"Let me check\"; "
+                     "for device control \"Sure, on it\"; for the time or date, or a joke, say nothing and call delegate right away "
+                     "(this overrides any other example of a lead-in)."}
 RESULT_FMT = {"zh": ("后端结果（只能根据这段内容回答，用你自己的口语自然地告诉用户，不要提到后端或工具；内容里没有的信息绝对不要自己编。"
                      "如果它说没查到、想不起来或请用户再说一遍，就照这个意思告诉用户）：\n{c}",
                      "背景信息（不要照读，只在需要时用自己的话简短回应；不要编造其中没有的事实）：\n{c}"),
@@ -81,8 +109,11 @@ UPDATE_FMT = {
            "progress, background, or repeats what you already said: if you spoke less than 6 s ago, output only <wait> and say nothing; if the "
            "user has been waiting a while, you may say one very short, natural line (not a repeat) asking them to hold on."),
 }
+ASK_PREFIX = {"zh": "（这是要向用户追问的问题，请直接把这个问题问出口，不要改成陈述句）", "en": "(This is a question to ask the user: ask it out loud, do not turn it into a statement) "}
 UPDATE_PARTS = {"zh": ("要转达给用户的内容：", "后端的进度 / 思考（不用照读）：", "（还没有新内容）"),
                 "en": ("Content to pass on to the user: ", "Backend progress / thinking (don't read it out): ", "(nothing new yet)")}
+PAD_GRACE_S = float(os.environ.get("SOPHON_LIVE_PAD_GRACE", "0.8"))            # Coordinator pad (SpeakPlan kind=pad): posted this long after a worker starts, if the answer is not in yet
+PAD_FRONT_QUIET_S = float(os.environ.get("SOPHON_LIVE_PAD_FRONT_QUIET", "4.0"))  # ...and the voice front has not just spoken its own lead-in (it was heard within this window)
 RESULT_MIN_CHARS = int(os.environ.get("SOPHON_LIVE_RESULT_MIN_CHARS", "15"))    # shorter commentary = a progress line
 PROGRESS_AFTER_S = float(os.environ.get("SOPHON_LIVE_PROGRESS_AFTER", "5.0"))  # speak held progress once if no result by then
 RESULT_MERGE_S = float(os.environ.get("SOPHON_LIVE_RESULT_MERGE", "1.6"))     # multi-stage backends: merge result pieces arriving this close together
@@ -229,7 +260,7 @@ class LiveSession:
         return True
 
     def _sys(self) -> str:
-        return (self.instructions or "") + SPOKEN_RULE[self.lang]
+        return (self.instructions or "") + SPOKEN_RULE[self.lang] + FILLER_RULE[self.lang]
 
     # ------------------------------------------------------------- client events
     async def on_event(self, ev: dict) -> None:
@@ -290,8 +321,20 @@ class LiveSession:
             return
         await self._post_update(did, chunks)
 
-    async def _post_update(self, did: str, chunks: list) -> None:
+    async def _post_update(self, did: str, chunks: list, *, pad: bool = False) -> bool:
         d = self.deleg[did]
+        # One delegation posts one update at a time, in order. A pad takes its turn only while no result has been handed
+        # over and it has not been cancelled; checked HERE, under the lock, right before the engine call (Critic I-6), so a
+        # Worker that finishes while the pad waits or posts can never put the pad behind the result.
+        async with d.setdefault("post_lock", asyncio.Lock()):
+            if pad and (d.get("said_result") or d.get("pad_cancelled")):
+                return False
+            await self._post_update_locked(did, d, chunks, pad=pad)
+            if pad:
+                d["pad_sent"] = True
+            return True
+
+    async def _post_update_locked(self, did: str, d: dict, chunks: list, *, pad: bool) -> None:
         if d.get("idle_timer") is not None:
             d["idle_timer"].cancel(); d["idle_timer"] = None
         pc, pt, pn = UPDATE_PARTS[self.lang]
@@ -303,7 +346,9 @@ class LiveSession:
         out = UPDATE_FMT[self.lang].format(t=time.monotonic() - d["t0"], gap=gap_s, body=body, last=(self.last_said or "")[-80:])
         d["posted_any"] = True
         ok = await self.engine.tool_result(d["call_id"], out, speak=True)
-        log.info("delegation %s -> update posted ok=%s (%d commentary chars, %d thinking chars)", did, ok, len(com), len(thk))
+        if ok and not pad:
+            self._delivery_armed(did)          # a pad is not the result: no receipt is armed and the trace's "posted" stays for the answer
+        log.info("delegation %s -> %s posted ok=%s (%d commentary chars, %d thinking chars)", did, "pad" if pad else "update", ok, len(com), len(thk))
 
     async def _idle_update(self, did: str) -> None:
         d = self.deleg.get(did)
@@ -400,6 +445,8 @@ class LiveSession:
         else:
             out = "\n\n".join(x for x in (fmt_c.format(c=com) if com else "", fmt_t.format(c=thk) if thk else "") if x)
         ok = await self.engine.tool_result(d["call_id"], out, speak=True)
+        if ok:
+            self._delivery_armed(did)
         log.info("delegation %s -> %s posted ok=%s (%d commentary chars, %d thinking chars)", did, "progress" if progress else "result", ok, len(com), len(thk))
 
     # ------------------------------------------------------------- input transcript
@@ -432,10 +479,45 @@ class LiveSession:
                 self.bi_voiced = 0
                 self._drop_playback("barge-in (gateway VAD)")
 
+    # ------------------------------------------------------------- delivery receipts (D layer glue; logic in coordinator/delivery.py)
+    def _delivery(self):
+        from .coordinator import DeliveryTracker
+        if not hasattr(self, "delivery"):
+            self.delivery = DeliveryTracker()
+        return self.delivery
+
+    def _trace(self):
+        from .coordinator.trace import TraceBook
+        if not hasattr(self, "trace_book"):
+            self.trace_book = TraceBook(self.id)
+        return self.trace_book
+
+    def _apply_receipts(self, receipts) -> None:
+        from .coordinator import on_playback_receipt
+        ledger = getattr(self, "coord_ledger", None)
+        for rc in receipts:
+            ok = on_playback_receipt(ledger, rc) if ledger is not None else False
+            log.info("session %s receipt %s task=%s v%s applied=%s", self.id, rc.outcome, rc.task_id, rc.version, ok)
+
+    def _receipt_played(self, rid: str) -> None:
+        rc = self._delivery().on_played(rid)
+        if rc is not None:
+            self._apply_receipts([rc])
+
+    def _delivery_armed(self, did: str) -> None:
+        """A tracked result was just handed to the front: the next response that starts carries it."""
+        self._trace().posted(did)                    # handed to the front: from here the next response carries it
+        d = self.deleg.get(did)
+        track = d.pop("track", None) if d else None
+        if track:
+            self._delivery().arm(*track)
+
     def _drop_playback(self, why: str) -> None:
         self.play.clear(); self.play_buf = np.zeros(0, np.int16)
         for r in self.resp.values():
             r["text"] = r["text"][: r["released"]]; r["done"] = True; r["dropped"] = True
+        self._apply_receipts(self._delivery().on_interrupted())     # 打断 ≠ 取消：只记回执，任务与结果原样保留
+        self._trace().cut()
         log.info("session %s %s: playback dropped", self.id, why)
 
     def _cut_user(self) -> asyncio.Task | None:
@@ -452,6 +534,7 @@ class LiveSession:
             return None
         a = a[max(0, voiced[0] * 320 - 3200): min(a.size, (voiced[-1] + 1) * 320 + 3200)]
         start = t0 + int(voiced[0] * 20); end = t0 + int((voiced[-1] + 1) * 20)
+        self._trace().note_vad_end(time.monotonic() - max(0, self.timeline_ms - end) / 1000)   # TRACE vad_end (体验版 v1 / 6)
         self.asr_task = asyncio.create_task(self._asr(a, start, end))
         return self.asr_task
 
@@ -468,6 +551,7 @@ class LiveSession:
         for i, p in enumerate(pieces):
             await self.send({"type": "session.input_transcript.delta", "delta": p, "start_ms": start + i * step, "end_ms": start + (i + 1) * step})
         log.info("session %s user: %s", self.id, text)
+        self.last_user = (text, time.monotonic())  # the user's own words, for the Coordinator's refine guard
 
     # ------------------------------------------------------------- engine events
     async def _engine_events(self) -> None:
@@ -479,9 +563,10 @@ class LiveSession:
                 if rid != self.cur_rid or rid not in self.resp:
                     self.cur_rid = rid
                     task = self._cut_user()
-                    prev = self.last_text.rstrip()
-                    lead = ("。" if self.lang == "zh" else ". ") if prev and prev[-1] not in "。！？.!?，,～…" else ""
+                    lead = lead_for(self.last_text, self.lang)
                     self.resp[rid] = {"text": lead, "released": 0, "audio_s": 0.0, "played_s": 0.0, "start_ms": None, "done": False, "asr": task}
+                    self._delivery().attach(rid)
+                    self._trace().response_started(rid)
                 r = self.resp[rid]
                 if r.get("dropped"):
                     continue
@@ -519,11 +604,279 @@ class LiveSession:
         did = "item_" + uuid.uuid4().hex[:16]
         what = (e.get("arguments") or {}).get("task")
         self.deleg[did] = {"call_id": e["call_id"], "chunks": [], "timer": None, "task": what, "t0": time.monotonic()}
-        if DELEG_MODE == "model":
+        tr = self._trace().start(did)
+        tr.set(task=(what or "")[:40], asr_ago_ms=round((time.monotonic() - self.last_user[1]) * 1000) if getattr(self, "last_user", None) else None)
+        use_coord = os.environ.get("SOPHON_LIVE_COORD", "").strip().lower() in ("1", "true", "yes", "on")
+        use_orch = (not use_coord) and os.environ.get("SOPHON_LIVE_ORCH", "").strip().lower() in ("1", "true", "yes", "on")
+        use_builtin = (not use_coord) and (not use_orch) and os.environ.get("SOPHON_LIVE_BUILTIN_TOOLS", "").strip().lower() in ("1", "true", "yes", "on")
+        # Orch/coord returns one final spoken result; skip the 7s empty idle nudge (it races long tools).
+        if DELEG_MODE == "model" and not use_orch and not use_coord:
             self.deleg[did]["idle_timer"] = asyncio.get_running_loop().call_later(IDLE_UPDATE_S, lambda: asyncio.ensure_future(self._idle_update(did)))
-        await self.send({"type": "session.delegation.created", "offset_ms": self.timeline_ms,
-                         "delegation": {"id": did, "type": "delegation", "target": "client", "task": what}})
-        log.info("session %s delegation %s task=%r", self.id, did, what)
+        deleg_body = {"id": did, "type": "delegation", "target": "client", "task": what}
+        if use_coord:
+            deleg_body["backend"] = "coord"
+        elif use_orch:
+            deleg_body["backend"] = "orch"
+        elif use_builtin:
+            deleg_body["backend"] = "builtin"
+        await self.send({"type": "session.delegation.created", "offset_ms": self.timeline_ms, "delegation": deleg_body})
+        log.info(
+            "session %s delegation %s task=%r coord=%s orch=%s builtin=%s",
+            self.id, did, what, use_coord, use_orch, use_builtin,
+        )
+        if use_coord:
+            asyncio.create_task(self._coord_resolve(did, what))
+        elif use_orch:
+            asyncio.create_task(self._orch_resolve(did, what))
+        elif use_builtin:
+            asyncio.create_task(self._builtin_resolve(did, what))
+
+    async def _ack_delegation(self, did: str, note: str) -> None:
+        """Close a delegation without speaking: the model gets a result, but is told to stay silent."""
+        d = self.deleg.get(did)
+        if d is None or getattr(self, "engine", None) is None:
+            return
+        self._cancel_pad(d)
+        try:
+            async with d.setdefault("post_lock", asyncio.Lock()):      # after any pad already on its way
+                await self.engine.tool_result(d["call_id"], note, speak=False)
+        except Exception as e:  # noqa: BLE001
+            log.warning("session %s ack delegation %s failed: %s", self.id, did, e)
+        self._trace().silent(did)
+
+    async def _coord_say(self, did: str, text: str, track: tuple[str, int] | None = None, ask: bool = False) -> None:
+        d = self.deleg.get(did)
+        if d is None:
+            return
+        d["said_result"] = True
+        self._cancel_pad(d)                          # the real thing is here: a filler would only delay it
+        if ask:                                      # a C-layer question: the front must voice the question itself, not paraphrase it away
+            text = ASK_PREFIX[self.lang] + text
+        tr = self._trace().get(did)
+        if tr is not None:
+            tr.mark("say")
+            tr.set(say_chars=len(text))
+        if track is not None:
+            d["track"] = track                       # armed for a delivery receipt once the result is handed to the front
+        await self.send({"type": "session.commentary.appended", "start_ms": self.timeline_ms, "end_ms": self.timeline_ms,
+                         "client_event_id": "coord"})
+        d["chunks"].append(("commentary", text))
+        if d.get("timer"):
+            d["timer"].cancel()
+        await self._flush_deleg(did)
+
+    @staticmethod
+    def _cancel_pad(d: dict) -> None:
+        """No pad from now on. Also stops a pad still sleeping; one already inside its post is left to finish (cancelling a
+        half-sent request is worse) and, because posts are serialized, the result goes out after it, never before."""
+        d["pad_cancelled"] = True
+        t = d.get("pad_task")
+        if t is not None and not d.get("pad_posting"):
+            d.pop("pad_task", None)
+            if not t.done():
+                t.cancel()
+
+    async def _coord_pad(self, did: str, text: str) -> None:
+        """Deliver the Coordinator's SpeakPlan(kind="pad") while the Worker runs (Critic I-2).
+
+        The voice front usually says its own lead-in before it calls delegate (see DELEGATE); the pad is the Coordinator's
+        guarantee for when it did not. So: wait PAD_GRACE_S, and only if the answer is still not in and the front has not
+        just spoken, post the pad as a backend update (the model words it, or stays silent with <wait>). It is not the
+        result: no delivery receipt is armed, the trace's "posted" is left for the answer. A result arriving first cancels it."""
+        try:
+            await asyncio.sleep(PAD_GRACE_S)
+        except asyncio.CancelledError:
+            return
+        d = self.deleg.get(did)
+        if d is None or getattr(self, "engine", None) is None or d.get("said_result"):
+            return
+        if DELEG_MODE != "model":
+            self._trace_pad(did, text, "rules_mode")      # rules mode words its own progress lines (PROGRESS_AFTER_S)
+            return
+        heard = getattr(self, "last_voice_t", None)
+        if heard and time.monotonic() - heard < PAD_FRONT_QUIET_S:
+            self._trace_pad(did, text, "front_spoke")
+            return
+        d["pad_posting"] = True                        # from here cancel() leaves the task alone; _post_update re-checks under its lock
+        try:
+            sent = await self._post_update(did, [("commentary", text)], pad=True)
+        finally:
+            d["pad_posting"] = False
+            d.pop("pad_task", None)
+        self._trace_pad(did, text, "posted" if sent else "skipped_result_first")
+
+    def _trace_pad(self, did: str, text: str, outcome: str) -> None:
+        tr = self._trace().get(did)
+        if tr is not None:
+            tr.set(pad=outcome, pad_text=text)
+
+    def _recent_user_text(self, max_age_s: float = 20.0) -> str:
+        last = getattr(self, "last_user", None)
+        if last and time.monotonic() - last[1] <= max_age_s:
+            return str(last[0] or "")
+        return ""
+
+    async def _coord_resolve(self, did: str, what: str | None) -> None:
+        """Path-1 Coordinator: Karpo/JEV route + ledger, then Worker orch for TOOL jobs."""
+        from .coordinator import AdmitRequest, Ledger, TaskContext, admit, bind_task, finish_job
+        from .assistant_tools import run_worker_job
+
+        if not hasattr(self, "coord_ledger"):
+            self.coord_ledger = Ledger()
+        if not hasattr(self, "coord_workers"):
+            self.coord_workers = {}                  # task_id -> in-flight worker asyncio.Task
+        ledger: Ledger = self.coord_ledger
+        d = self.deleg.get(did)
+        if d is None:
+            return
+        try:
+            result = await admit(
+                AdmitRequest(
+                    session_id=self.id,
+                    utterance_id=did,
+                    text=what or "",
+                    delegate_task=what,
+                    playback_active=bool(getattr(self, "playing", False)),
+                    raw_text=self._recent_user_text(),
+                ),
+                ledger,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("session %s coord admit error: %s", self.id, e)
+            result = None
+        if result is None:
+            await self._orch_resolve(did, what)
+            return
+        tr = self._trace().get(did)
+        if tr is not None:
+            tr.mark("route")
+            tr.set(route=result.route, decision=result.control.op if result.control else ("NEW" if result.job else result.route),
+                   via=result.via, jev_ms=None if result.jev_ms is None else round(result.jev_ms))
+        # CANCEL / REFINE: the old (task_id, version) must stop now; its result is never spoken.
+        stale = getattr(result, "stale_task", None)
+        if stale is not None:
+            worker = self.coord_workers.pop(stale[0], None)
+            if worker is not None and not worker.done():
+                worker.cancel()
+        if result.speak.kind == "stop_speaking":
+            self._drop_playback("coord stop_speaking")
+            await self._ack_delegation(did, "已停止播报，不需要再说什么。")
+            return
+        if result.speak.kind in ("clarify", "answer") and result.speak.text and result.job is None:
+            replay = (
+                result.speak.kind == "answer"
+                and result.control is not None
+                and result.control.op == "STATUS"
+                and result.speak.task_id is not None
+                and result.speak.version is not None
+                and ledger.tasks.get(result.speak.task_id) is not None
+                and result.speak.text == ledger.tasks[result.speak.task_id].spoken_answer
+            )
+            await self._coord_say(did, result.speak.text, (result.speak.task_id, result.speak.version) if replay else None,  # type: ignore[arg-type]
+                                  ask=result.speak.kind == "clarify")
+            return
+        job = result.job
+        if job is None:
+            # FAST (thanks / ok): nothing to run, nothing to say. Close the delegation silently.
+            await self._ack_delegation(did, "这句话不需要后台办事，不用再说什么。")
+            return
+        with bind_task(TaskContext(task_id=job.task_id, version=job.version, utterance=job.objective, ledger=ledger)):
+            # the worker task copies this context: its memory writes go through memory_gate, its tool args become task slots
+            worker = asyncio.ensure_future(
+                run_worker_job(job, instructions=self.instructions or "", history=getattr(self, "orch_history", None) or [])
+            )
+        self.coord_workers[job.task_id] = worker
+        pad = result.speak.text if result.speak.kind == "pad" else ""
+        if pad and d is not None:
+            d["pad_task"] = asyncio.ensure_future(self._coord_pad(did, pad))
+        if tr is not None:
+            tr.mark("worker_start")
+            tr.set(task_id=job.task_id, version=job.version)
+        try:
+            result = await worker                    # a WorkerResult: status + answer or missing slots, nothing else
+        except asyncio.CancelledError:
+            if worker.cancelled():                   # cancelled by a later CANCEL/REFINE, not by us shutting down
+                log.info("session %s worker for %s v%s cancelled", self.id, job.task_id, job.version)
+                await self._ack_delegation(did, "这个任务已被取消或改口，不用再说什么。")
+                return
+            worker.cancel()
+            raise
+        except Exception as e:  # noqa: BLE001
+            log.warning("session %s coord worker error: %s", self.id, e)
+            from .coordinator import WorkerResult
+            result = WorkerResult(task_id=job.task_id, version=job.version, status="failed", spoken_answer="后台编排出错了，请稍后再试。")
+        finally:
+            self._cancel_pad(d) if d is not None else None   # the Worker is done: a filler now would only get in the answer's way
+            if self.coord_workers.get(job.task_id) is worker:
+                self.coord_workers.pop(job.task_id, None)
+        if tr is not None:
+            tr.mark("worker_done")
+            tr.set(worker=result.status)
+            for ev in result.evidence:
+                tr.add_tool(ev.get("tool", "?"), ev.get("ms"), bool(ev.get("ok")), source=ev.get("source"), fallbacks=ev.get("fallbacks"),
+                            orig_source=ev.get("orig_source"), age_s=ev.get("age_s"),
+                            city=ev.get("city"), tmin=ev.get("tmin"), tmax=ev.get("tmax"), now=ev.get("now"))
+        outcome = finish_job(ledger, job, result)    # the Coordinator decides what gets said; stale results are dropped
+        if tr is not None and job.require_tools:
+            tr.set(require=",".join(job.require_tools), **({"guard": outcome.rejected} if outcome.rejected else {}))
+        if outcome.kind == "stale":                  # cancelled or superseded while running
+            await self._ack_delegation(did, "这个任务已被取消或改口，不用再说什么。")
+            return
+        if outcome.kind == "clarify":                # Worker reported missing slots; C layer words the question
+            await self._coord_say(did, outcome.text, ask=True)
+            return
+        text = outcome.text
+        if not hasattr(self, "orch_history"):
+            self.orch_history = []
+        self.orch_history.append({"task": job.objective, "answer": text})
+        if len(self.orch_history) > 12:
+            self.orch_history = self.orch_history[-12:]
+        await self._coord_say(did, text, (job.task_id, job.version))
+
+    async def _orch_resolve(self, did: str, what: str | None) -> None:
+        """Path-1 co-located orchestrator: local text LLM selects tools; tools run on this host."""
+        try:
+            from .assistant_tools import resolve_task_orch
+            hist = getattr(self, "orch_history", None) or []
+            text = await resolve_task_orch(what or "", instructions=self.instructions or "", history=hist)
+        except Exception as e:  # noqa: BLE001
+            log.warning("session %s orch error: %s", self.id, e)
+            text = "后台编排出错了，请稍后再试。"
+        text = (text or "").strip() or "好的，我这边查过了。"
+        if not hasattr(self, "orch_history"):
+            self.orch_history = []
+        self.orch_history.append({"task": what or "", "answer": text})
+        if len(self.orch_history) > 12:
+            self.orch_history = self.orch_history[-12:]
+        d = self.deleg.get(did)
+        if d is None:
+            return
+        await self.send({"type": "session.commentary.appended", "start_ms": self.timeline_ms, "end_ms": self.timeline_ms,
+                         "client_event_id": "orch"})
+        d["chunks"].append(("commentary", text))
+        if d.get("timer"):
+            d["timer"].cancel()
+        await self._flush_deleg(did)
+    async def _builtin_resolve(self, did: str, what: str | None) -> None:
+        """Legacy heuristic tool pack (demo). Prefer SOPHON_LIVE_ORCH for production Path-1."""
+        try:
+            from .assistant_tools import run_task
+            text = await run_task(what or "")
+        except Exception as e:  # noqa: BLE001
+            log.warning("session %s builtin tools error: %s", self.id, e)
+            return
+        if not text:
+            log.info("session %s builtin tools: no match for %r", self.id, what)
+            return
+        d = self.deleg.get(did)
+        if d is None:
+            return
+        await self.send({"type": "session.commentary.appended", "start_ms": self.timeline_ms, "end_ms": self.timeline_ms,
+                         "client_event_id": "builtin"})
+        d["chunks"].append(("commentary", text))
+        if d.get("timer"):
+            d["timer"].cancel()
+        await self._flush_deleg(did)
 
     # ------------------------------------------------------------- output pump (continuous, real time)
     async def _pump(self) -> None:
@@ -541,6 +894,7 @@ class LiveSession:
                 r = self.resp.get(rid)
                 if r is not None and r["start_ms"] is None:
                     r["start_ms"] = self.timeline_ms
+                    self._trace().note_voice_start(time.monotonic())   # TRACE pad_start (体验版 v1 / 6)
                 self.play_buf = np.concatenate([self.play_buf, x]) if self.play_buf.size else x
                 self._play_rid = rid
             frame = self.play_buf[:n]; self.play_buf = self.play_buf[n:]
@@ -563,6 +917,9 @@ class LiveSession:
             if r["start_ms"] is None or r["released"] >= len(r["text"]):
                 if r["done"] and r["start_ms"] is not None and r["released"] >= len(r["text"]) and not self.play and self.play_buf.size == 0:
                     self.resp.pop(rid, None)
+                    if not r.get("dropped"):
+                        self._receipt_played(rid)                # heard to the end
+                        self._trace().response_played(rid)
                 continue
             if r.get("asr") is not None and not r["asr"].done():
                 continue                                          # the user's words go out before the reply's
@@ -591,6 +948,10 @@ class LiveSession:
         if self.closed:
             return
         self.closed = True
+        self._apply_receipts(self._delivery().on_close())
+        self._trace().cut(close=True)
+        for w in list(getattr(self, "coord_workers", {}).values()):
+            w.cancel()
         for t in self.tasks:
             t.cancel()
         try:
@@ -602,6 +963,24 @@ class LiveSession:
         if self.engine is not None:
             await self.engine.close()
         log.info("session %s closed (%s)", self.id, reason)
+
+
+def _flag(name: str, env=None) -> bool:  # noqa: ANN001
+    return (env if env is not None else os.environ).get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def runtime_banner(env=None) -> tuple[str, bool]:  # noqa: ANN001
+    """One startup line saying which delegation path this process will run, and whether that is the intended one.
+
+    SOPHON_LIVE_COORD defaults to OFF in code (Critic S-6): a restart without it silently falls back to the legacy orch path.
+    The line makes that visible in the log (and in the runbook's post-start check)."""
+    coord = _flag("SOPHON_LIVE_COORD", env)
+    orch = _flag("SOPHON_LIVE_ORCH", env)
+    jev = os.environ.get("SOPHON_LIVE_JEV", "1") if env is None else env.get("SOPHON_LIVE_JEV", "1")
+    if coord:
+        return f"SOPHON_LIVE_COORD on (Coordinator path) JEV={jev} ORCH={int(orch)}", True
+    return ("SOPHON_LIVE_COORD OFF: legacy path (no Ledger / REFINE / CANCEL / tool-evidence guard). "
+            f"Set SOPHON_LIVE_COORD=1 (see docs/runbook-path1-coord.md); ORCH={int(orch)}"), False
 
 
 def main() -> None:
@@ -694,6 +1073,8 @@ def main() -> None:
     async def run():
         async with websockets.serve(handler, args.host, args.port, max_size=None, compression=None, process_request=process_request):
             log.info("Sophon Live gateway on ws://%s:%d%s -> %s", args.host, args.port, args.path, args.engine)
+            banner, intended = runtime_banner()
+            (log.info if intended else log.warning)("%s", banner)
             await asyncio.Future()
     asyncio.run(run())
 
